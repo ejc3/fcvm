@@ -10,6 +10,7 @@ mod bots;
 mod drive;
 mod map;
 mod palette;
+mod plan;
 mod pumpkin;
 mod server;
 mod tile;
@@ -31,7 +32,7 @@ struct Common {
     /// Bots to run
     #[arg(long, env = "MCTILE_BOTS", default_value_t = 3)]
     bots: usize,
-    /// The map's side in blocks, around the spawn
+    /// The map's side in blocks, around the spawn (32 to 512, in whole chunks)
     #[arg(long, env = "MCTILE_REGION", default_value_t = 128)]
     region: u32,
     /// Bot names start with this

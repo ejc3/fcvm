@@ -126,6 +126,17 @@ fn table_paths(
     Ok(paths)
 }
 
+/// The paths a serialized inode table names below the mount's root, as
+/// [`RemapFs::restore_from_table`] would look them up in the directory a restore serves. Paths
+/// a table records as gone are not among them: a restore never looks those up.
+pub fn inode_table_paths(json: &str) -> Vec<Vec<u8>> {
+    RemapFs::<super::PassthroughFs>::parse_table(json)
+        .1
+        .into_values()
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
 impl<T: FilesystemHandler> RemapFs<T> {
     /// Create a new RemapFs wrapping the given handler.
     ///

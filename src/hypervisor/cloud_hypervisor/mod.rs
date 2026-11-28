@@ -104,12 +104,16 @@ pub struct CloudHypervisorBackend {
 impl CloudHypervisorBackend {
     /// Create a backend that will manage a Cloud Hypervisor process whose REST API
     /// listens on `api_socket`.
-    pub fn new(vm_id: String, api_socket: PathBuf, log_path: Option<PathBuf>) -> Self {
+    /// `decision` comes from the caller's [`crate::confine::resolve`]; confinement supports
+    /// the Firecracker backend only, so `spawn` refuses a confined one.
+    pub fn new(
+        vm_id: String,
+        api_socket: PathBuf,
+        log_path: Option<PathBuf>,
+        decision: crate::confine::Decision,
+    ) -> Self {
         Self {
-            namespace: NamespaceParams {
-                vm_id: vm_id.clone(),
-                ..Default::default()
-            },
+            namespace: NamespaceParams::new(vm_id.clone(), decision),
             vm_id,
             vm_name: None,
             api_socket,
@@ -344,10 +348,7 @@ impl CloudHypervisorBackend {
                 .pending
                 .net
                 .iter()
-                .map(|n| NetConfig {
-                    tap: n.tap.clone(),
-                    mac: n.mac.clone(),
-                })
+                .map(|n| NetConfig::new(n.tap.clone(), n.mac.clone()))
                 .collect(),
             vsock: self.pending.vsock.as_ref().map(|v| VsockConfig {
                 cid: v.cid,
@@ -377,6 +378,10 @@ impl Hypervisor for CloudHypervisorBackend {
     }
 
     async fn spawn(&mut self, spec: &ProcessSpec) -> Result<()> {
+        anyhow::ensure!(
+            self.namespace.decision.confinement().is_none(),
+            "confinement supports the Firecracker backend only"
+        );
         self.stop_reboot_monitor().await;
         // A reboot relaunch re-enters spawn() with a minimal spec (binary + args). Update
         // retained state only when the spec provides a value, so the namespace isolation
@@ -618,10 +623,10 @@ impl Hypervisor for CloudHypervisorBackend {
     }
 
     async fn add_network_interface(&mut self, iface: &NetIfaceSpec) -> Result<()> {
-        self.pending.net.push(NetConfig {
-            tap: iface.host_dev_name.clone(),
-            mac: iface.guest_mac.clone(),
-        });
+        self.pending.net.push(NetConfig::new(
+            iface.host_dev_name.clone(),
+            iface.guest_mac.clone(),
+        ));
         Ok(())
     }
 
@@ -1282,6 +1287,7 @@ mod tests {
             "vm-test".to_string(),
             PathBuf::from("/tmp/ch-test.sock"),
             None,
+            crate::confine::Decision::for_test(None),
         )
     }
 
@@ -1320,6 +1326,7 @@ mod tests {
             "vm-test".to_string(),
             PathBuf::from("/tmp/ch-test.sock"),
             Some(PathBuf::from("/vm/firecracker.log")),
+            crate::confine::Decision::for_test(None),
         )
     }
 
@@ -1408,6 +1415,23 @@ mod tests {
             "vm.create memory config: {}",
             config["memory"]
         );
+    }
+
+    /// Cloud Hypervisor offers a guest no virtio-net offload unless `vm.create` asks (its
+    /// default since v54.0), so an absent field would cost the guest TSO.
+    #[test]
+    fn vm_config_asks_for_the_net_offloads() {
+        let mut be = backend();
+        be.pending.kernel = Some(PathBuf::from("/boot/Image"));
+        be.pending
+            .net
+            .push(NetConfig::new("tap-test".to_string(), None));
+        let config = serde_json::to_value(be.build_vm_config().unwrap()).unwrap();
+        let net = &config["net"][0];
+        assert_eq!(net["tap"], "tap-test", "{net}");
+        for offload in ["offload_csum", "offload_tso", "offload_ufo"] {
+            assert_eq!(net[offload], serde_json::Value::Bool(true), "{net}");
+        }
     }
 
     /// Codex #632 P1 #1: a reboot relaunches with a minimal spec (binary + args only).

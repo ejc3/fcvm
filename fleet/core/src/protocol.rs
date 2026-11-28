@@ -28,9 +28,13 @@ pub enum ClientMsg {
     Verify {
         token: String,
     },
-    /// Whether the page is visible; a hidden page is not an active viewer.
+    /// Whether the page is visible; a hidden page is not an active viewer. `minecraft`: the
+    /// page shows Minecraft mode and takes the servers' status rows (`minecraft_status`), which
+    /// no other page is sent.
     Visibility {
         visible: bool,
+        #[serde(default)]
+        minecraft: bool,
     },
     /// The seat ticket a page kept from an earlier connection, as its first message (a URL
     /// would carry it into proxy and access logs). Later ones are ignored. `returning`: the
@@ -76,6 +80,18 @@ pub enum ServerMsg {
     },
     /// The answer to `verify`.
     Verified { ok: bool, reason: Option<String> },
+    /// Minecraft mode, to a page whose `visibility` said `minecraft`: one host's servers as
+    /// its agent last read them. `host` is the key the snapshot's `minecraft.field` lists the
+    /// host under; a row belongs to the server at the same place in that host's `servers`.
+    /// `received_at` is the coordinator's clock (unix ms) when the report reached it: the
+    /// rows' age is the coordinator's time now less this, and past
+    /// [`crate::minecraft::STATUS_EXPIRE_MS`] they say nothing of the servers.
+    MinecraftStatus {
+        host: String,
+        received_at: u64,
+        #[serde(flatten)]
+        status: crate::minecraft::MinecraftStatus,
+    },
     /// The viewer's own GPU, to the claiming connection only, whenever it changes and once
     /// more when it ends.
     Claim { claim: ClaimMsg },
@@ -221,6 +237,17 @@ pub fn place_label(region: &str) -> Option<String> {
     ok.then(|| format!("EC2 in {region}"))
 }
 
+/// A VM's CPU use, read on the host. The agent leaves `at` out; the coordinator
+/// stamps its receipt time (Unix ms) when it stores the reading.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VmStats {
+    /// CPU use as a percent of the VM's vCPUs, 0..100.
+    pub cpu_pct: f64,
+    pub vcpus: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealthReport {
     pub id: String,
@@ -242,6 +269,15 @@ pub struct HealthReport {
     /// The renderer process's `boot_id`, so a grant names the renderer it was given to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<String>,
+    /// Minecraft mode: the state of every server on the host, about once a second, in a report
+    /// whose `id` is [`crate::minecraft::STATUS_ID`]. The coordinator passes it to the pages
+    /// that asked and keeps none of it: it is not part of the fleet's state, so it moves no
+    /// version and is never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minecraft: Option<crate::minecraft::MinecraftStatus>,
+    /// The VM's CPU and memory, from the host. An agent that cannot read them sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_stats: Option<VmStats>,
 }
 
 impl HealthReport {
@@ -259,6 +295,8 @@ impl HealthReport {
             render_ms_max: num(h.get("frames_2s").and_then(|f| f.get("render_ms_max"))),
             budget_every_pixel: num(h.get("budget_every_pixel")).filter(|v| *v > 0.0),
             boot_id: boot_id(h),
+            minecraft: None,
+            vm_stats: None,
         }
     }
 }
@@ -299,6 +337,15 @@ pub enum AgentMsg {
         /// The most potato players the host runs (potato mode); 0 runs none.
         #[serde(default, skip_serializing_if = "is_zero")]
         potato_players: u32,
+        /// The CPU allotment of the potato ring: the agent never has more machines not asleep
+        /// than this. 0: none (an agent built before the allotment caps nothing).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        potato_cpus: u32,
+        /// Whether the ring's machines, and the fcvm commands that save and restore them, run
+        /// in a cpuset of exactly `potato_cpus` host CPUs. False: the allotment only counts
+        /// machines.
+        #[serde(default, skip_serializing_if = "is_false")]
+        potato_confined: bool,
         /// The Windows sandboxes the host runs (Windows mode); 0 runs none.
         #[serde(default, skip_serializing_if = "is_zero")]
         windows: u32,
@@ -312,12 +359,19 @@ pub enum AgentMsg {
         /// The servers' name and version, as the page's header shows it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         minecraft_server: Option<String>,
+        /// The pages the host renders and its CPUs a side (pages mode); none runs none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        renders: Option<crate::renders::RendersHost>,
     },
     /// Windows mode: the host's Windows image, its age and the gold snapshot's state, sent
     /// after the hello and whenever any of it changes.
     WindowsImage(crate::windows::WindowsImage),
     /// Potato mode: something that happened to one of the host's players.
     Potato(crate::potato::PotatoEvent),
+    /// Pages mode: the host's summary of both sides. A host sends it only after its first
+    /// `renders` order: a coordinator built before the mode never sends one, and would close
+    /// the connection on this message.
+    Renders(crate::renders::RendersReport),
     Slot(SlotReport),
     Health(HealthReport),
     /// The host got a spot interruption notice (or is otherwise going away).
@@ -544,6 +598,16 @@ pub enum CoordMsg {
     Potato {
         round: Option<crate::potato::PotatoRound>,
     },
+    /// Pages mode: whether to render, and the overlay to put into every page. Sent only to
+    /// a host whose hello carried `renders`: an agent built before the mode ends its
+    /// connection on a message it cannot parse.
+    Renders {
+        order: crate::renders::RendersOrder,
+    },
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -661,6 +725,50 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pages_mode_messages_have_the_documented_shapes() {
+        // A hello without the field is a host that does not run the mode.
+        let m: AgentMsg = serde_json::from_value(
+            json!({"type":"hello","host":"h","arch":"aarch64","gpus":[],"capacity":0}),
+        )
+        .unwrap();
+        assert!(matches!(m, AgentMsg::Hello { renders: None, .. }));
+        assert!(!serde_json::to_string(&m).unwrap().contains("renders"));
+        let m: AgentMsg = serde_json::from_value(json!({
+            "type":"hello","host":"h","arch":"aarch64","gpus":[],"capacity":0,
+            "renders":{"cpus":40,"pages":[{"id":"example","url":"https://example.com/"}]}
+        }))
+        .unwrap();
+        assert!(matches!(m, AgentMsg::Hello { renders: Some(ref r), .. } if r.cpus == 40));
+        // A report holding only its time parses: every other part is optional.
+        let m: AgentMsg = serde_json::from_value(json!({"type":"renders","at":5})).unwrap();
+        assert!(matches!(m, AgentMsg::Renders(ref r) if r.at == 5 && r.sides.is_empty()));
+        let m: AgentMsg = serde_json::from_value(json!({
+            "type":"renders","at":5,"sides":{"fcvm":{"search":{"in_flight":16,"phase":"holding",
+            "limit":16,"backed_off":{"from":18,"cause":"cpu_pressure","pressure":0.16,"at":4}},
+            "renders_per_s":23.0,"cpus_busy":32.5,"done":9,"failed":0,"since":1}}
+        }))
+        .unwrap();
+        let AgentMsg::Renders(r) = m else { panic!() };
+        let back = r.sides["fcvm"].search.backed_off.as_ref().unwrap();
+        assert_eq!(back.cause, crate::renders::SpikeCause::CpuPressure);
+        let order = CoordMsg::Renders {
+            order: crate::renders::RendersOrder {
+                run: true,
+                overlay: Some(crate::renders::OrderOverlay {
+                    text: Some("hello".into()),
+                    transform: None,
+                    chromium_only: false,
+                    seq: 3,
+                }),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&order).unwrap(),
+            json!({"type":"renders","order":{"run":true,"overlay":{"text":"hello","seq":3}}})
+        );
+    }
 
     #[test]
     fn messages_have_the_documented_shapes() {

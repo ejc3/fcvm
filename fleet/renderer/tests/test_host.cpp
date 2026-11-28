@@ -1,5 +1,6 @@
 // Host-side tests: no GPU needed. Scene contract parsing, camera interpolation
 // and holds, tile geometry, wire formats.
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -408,12 +409,36 @@ struct ServerTest {
     for (int i = 0; i < 4; i++) idle.push_back(connect_lo(r.port));
     CHECK(within(2000, [&] { return r.server.pending_.size() == 4; }), "4 idle connections are pending (%zu)",
           r.server.pending_.size());
+    // The hook runs between a refusal's count and its close, and stalls there so a client that sees
+    // the close is read at the worst moment. It pins the order: the count already includes this
+    // refusal, and the descriptor is still open. Any other order of count, hook and close fails.
+    static std::atomic<int> hooked, misordered;
+    static const std::atomic<unsigned long long>* counter;
+    hooked = 0;
+    misordered = 0;
+    counter = &r.server.refused_pending_;
+    r.server.refuse_hook_ = [](int fd, unsigned long long counted) {
+      int k = ++hooked;
+      if (counted != (unsigned long long)k || counter->load() != (unsigned long long)k || fcntl(fd, F_GETFD) == -1)
+        misordered++;
+      usleep(100 * 1000);
+    };
     int refused = 0;
+    unsigned long long lagged = 0;
     for (int i = 0; i < 6; i++) {
       int fd = connect_lo(r.port);
-      if (fd >= 0 && closed_within(fd, 1000)) refused++;
+      if (fd >= 0 && closed_within(fd, 1000)) {
+        refused++;
+        if (r.server.refused_pending_ < (unsigned long long)refused) lagged++;
+      }
       if (fd >= 0) close(fd);
     }
+    // Every close seen means every hook has returned (the close follows the hook); on a timeout
+    // the checks below fail anyway.
+    r.server.refuse_hook_ = nullptr;
+    CHECK(lagged == 0, "a refusal is counted before its close is visible (%llu closes seen before their count)", lagged);
+    CHECK(hooked == 6 && misordered == 0, "each refusal is counted, then hooked, then closed (%d hooked, %d out of order)",
+          hooked.load(), misordered.load());
     CHECK(refused == 6 && r.server.refused_pending_ == 6 && r.server.pending_.size() == 4,
           "6 more past the cap are closed at once (%d closed, %llu counted, %zu pending)", refused,
           (unsigned long long)r.server.refused_pending_, r.server.pending_.size());

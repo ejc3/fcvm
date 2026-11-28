@@ -400,7 +400,7 @@ Uses veth pairs + IPv6 routing for kernel line-rate networking without userspace
 - Requires root and a host with a global IPv6 /64 subnet (or `--ipv6-prefix` to specify one explicitly)
 - Native IPv6 routing through the kernel stack (no userspace L4 translation)
 - Each VM gets a unique IPv6 derived from the host's /64 prefix, or the address `--ipv6-address` names inside the prefix in use (not its address 0 or 1)
-- A VM leases its address before using it: an exclusive `flock` on `/run/fcvm/routed-ipv6/<address>.lock`, held until its network is torn down and released by the kernel if the process dies. Of two VMs that ask for one address together, exactly one gets it. If the lease is free but the host already has a /128 route for the address, in any routing table, the route belongs to something other than a live fcvm VM (the host itself, a VM that died without cleanup, another program), so a given address is refused and a derived one is re-derived
+- A VM leases its address before using it: an exclusive `flock` on `/run/fcvm/routed-ipv6/<address>.lock`, held until its network is torn down and released by the kernel if the process dies. A killed VM's lease file is removed by a sweep of the directory, which a start runs at most once per 5 s (`src/sweep.rs`); a start holds the directory's `flock` shared while it opens and locks its own file, and the sweep tries the files' locks only under that lock held exclusively. Of two VMs that ask for one address together, exactly one gets it. If the lease is free but the host already has a /128 route for the address, in any routing table, the route belongs to something other than a live fcvm VM (the host itself, a VM that died without cleanup, another program), so a given address is refused and a derived one is re-derived
 - Port forwarding via built-in TCP proxy (`setns` + tokio relay): a mapping listens on its HOSTIP, or on the VM's loopback IP (same allocation as rootless) when it names none
 - Parallel-safe: per-VM routes, proxy NDP, ip6tables rules
 
@@ -490,14 +490,15 @@ Each VM has:
 ├── initrd/
 │   └── fc-agent-{sha}.initrd  # fc-agent injection initrd (SHA of binary)
 ├── vm-disks/
-│   └── vm-{id}/
-│       └── disks/rootfs.raw   # CoW reflink copy per VM
+│   └── {bucket}/              # first byte of sha256(vm-id), two hex digits
+│       └── vm-{id}/
+│           └── disks/rootfs.raw   # CoW reflink copy per VM
 ├── snapshots/
 │   └── {snapshot-name}/
 │       ├── vmstate.snap       # VM memory snapshot
 │       ├── disk.snap          # Disk snapshot
 │       └── config.json        # VM configuration
-├── state/                     # VM state JSON files
+├── state/                     # markers: which runtime directory holds the VM states
 ├── image-cache/               # Container image layers (sha256:{digest}/)
 └── cache/                     # Downloaded cloud images
 ```
@@ -517,7 +518,7 @@ Each VM has:
 
 2. **btrfs reflinks** (current implementation)
    ```bash
-   cp --reflink=always /mnt/fcvm-btrfs/rootfs/layer2-{sha}.raw /mnt/fcvm-btrfs/vm-disks/{id}/disks/rootfs.raw
+   cp --reflink=always /mnt/fcvm-btrfs/rootfs/layer2-{sha}.raw /mnt/fcvm-btrfs/vm-disks/{bucket}/{id}/disks/rootfs.raw
    ```
 
 **Benefits**:
@@ -548,6 +549,156 @@ Each VM has:
 - Update hostname in guest
 - Regenerate machine IDs
 - Update MMDS with new config
+
+### A Restore Gives Runnable vCPUs a PV Kick (x86_64)
+
+On x86_64, a guest with paravirtual spinlocks waits for a lock by checking the lock word and
+then executing HLT (`kvm_wait()`), with interrupts off when it took the lock in interrupt
+context. When the lock holder's kick (`KVM_HC_KICK_CPU`) lands between the check and the HLT,
+KVM holds it in `vcpu->arch.pv.pv_unhalted` and the HLT returns at once. No ioctl reads that
+flag for a runnable vCPU (`KVM_GET_MP_STATE` folds it in only for a halted one), so a snapshot
+taken at that moment does not hold the kick. Restored without it, the vCPU halts with
+interrupts off and only an NMI, an SMI or an INIT wakes it, the next vCPU to send it an IPI
+and wait spins, and every clone of that snapshot hangs the same way (#2131).
+
+The Firecracker fork therefore ends a snapshot load, after every vCPU's state is set and
+before the guest runs, by giving one kick to each vCPU the snapshot holds as runnable, in a
+guest whose CPUID offers `KVM_FEATURE_PV_UNHALT` (`KvmVm::kick_runnable_vcpus`). It is
+delivered as KVM delivers a guest's: an interrupt with the reserved "remote read" delivery
+mode, sent with `KVM_SIGNAL_MSI` to the vCPU's APIC id. Firecracker does nothing between the
+load and the guest's next instruction that clears it, so loading paused (`resume_vm: false`)
+and resuming later needs no second one. Firecracker's log says how many vCPUs it kicked.
+
+Which vCPUs get one:
+
+- A halted vCPU gets none: KVM reports a halted vCPU with a kick pending as runnable, so one
+  saved as halted had none to lose.
+- A vCPU that waits for INIT or SIPI gets none. With a kick recorded KVM takes it for
+  runnable, and its `KVM_RUN` returns at once or spins in the kernel where it would block.
+- A guest whose CPUID does not offer `KVM_FEATURE_PV_UNHALT` gets none: a Linux guest
+  without it has no paravirtual spinlocks.
+- A vCPU whose local APIC is off, or has the id 0xff, gets none: a kick cannot reach the
+  first, and the second is the address of every local APIC.
+- The source VM needs nothing: saving reads its state, and its flag stays in the kernel.
+- arm64 has no such kick. Its queued spinlocks spin, and a vCPU in WFI wakes on an interrupt
+  that the vGIC state in the snapshot holds.
+
+What the kick does to a vCPU that was not waiting for one:
+
+- Its next HLT returns early once. The spinlock wait and the idle loop check again and halt
+  again.
+- If it receives an INIT before that HLT, a vCPU other than the boot CPU enters the
+  wait for SIPI with the flag still set, and its `KVM_RUN` spins in the kernel until the SIPI
+  arrives, which clears it. KVM does the same after a guest's own kick. The restore puts
+  the flag on every runnable vCPU, where before only a kicked one carried it.
+- A vCPU saved while it ran a nested guest holds the flag as the L1 vCPU. The first exit
+  from L2 to L1 clears it. An L2 that executes HLT first, with HLT not intercepted by L1,
+  has that HLT return early once.
+
+**The host kernel has to keep the kick.** From Linux 6.15 on, `kvm_arch_async_page_present()`
+clears a pending kick, and a restored vCPU runs that function on its first `KVM_RUN`, before
+it runs an instruction: restoring `MSR_KVM_ASYNC_PF_EN` with async page faults enabled queues
+a completion that wakes every waiter in the guest (#2132). A Linux guest enables them unless
+it was booted with `no-kvmapf` or was not offered `KVM_FEATURE_ASYNC_PF_INT`, and fcvm's
+guests enable them. The completion runs inside `KVM_RUN`, so no order of the restore's ioctls
+avoids it. One case keeps the kick without help: a vCPU whose page-ready slot was still
+occupied at the snapshot, because KVM holds the completion back until the guest frees the
+slot. Otherwise, on such a kernel, the kick reaches the HLT only when KVM carries
+`0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch` (#2125,
+kernel/README.md). A kernel on 6.14 or earlier keeps the kick as it is.
+
+Which kernels carry that patch:
+
+| KVM that runs the restored guest | carries the patch |
+|---|---|
+| fcvm's x86_64 host kernel (`[kernel_profiles.nested.amd64.host_kernel]`, `kernel/patches-x86-host`), on the x64 runners and the fleet's GPU hosts once their images are rebuilt from a main that has it | yes |
+| KVM inside an fcvm guest, for a VM restored inside that guest: `nested.amd64` (6.18.60, a port in `kernel/patches-x86`), `phone.amd64` (7.3.3, a link to the host's patch in `kernel/patches-phone-7.3`) and the `mountinfo` pair (6.16.1, a port in `kernel/patches-mountinfo`, to which the control's `kernel/patches-mountinfo-base` links) | yes |
+| a distribution's or any other kernel from 6.15 on that fcvm did not build | no |
+
+`every_x86_kernel_that_builds_kvm_carries_the_pv_kick_patch`
+(`tests/test_kernel_patch_invariants.rs`) takes the first two rows from rootfs-config.toml:
+it fails when an x86_64 host kernel, or a guest kernel whose config builds KVM, is on 6.15 or
+later and its patch set lacks the patch. Under a kernel of the last row the kick is given and
+then cleared, #2131 stays as it was, and the same kernel loses the guest's own kicks to
+#2125 until the patch is upstream. Measured on Linux 7.0.0 with a vCPU set up as Linux sets
+one up: with the distribution's KVM the restored vCPU was still halted after 10 s, and with
+the same KVM rebuilt with that one change it ran on.
+
+A snapshot restores on the Firecracker binary that took it while that file exists, so a
+snapshot taken before this build restores without the kick until it is taken again, or is
+run with `--firecracker-bin` naming the current build.
+
+`every_x86_64_firecracker_pin_kicks_runnable_vcpus_on_restore` (`src/setup/rootfs.rs`) is a
+tripwire: it fails when an x86_64 pin moves to a commit nobody has listed as carrying the
+kick. It cannot tell whether a commit does. The fork's own tests do that
+(`cargo test -p vmm --lib -- arch::x86_64::vm::tests`, on KVM); fcvm's CI does not run them,
+and nothing at run time tells a kernel that keeps the kick from one that clears it. On
+x86_64 the direct snapshot run tests require the kick line in the clone's Firecracker log,
+which shows the `[firecracker]` build ran the step, not that the kick lasted.
+
+### Cloud Hypervisor: the build and its snapshots
+
+fcvm's Cloud Hypervisor is upstream's main branch at the commit `[cloud_hypervisor]` in
+`rootfs-config.toml` names, with no patch of fcvm's own. Until 2026-11 it was a fork branch
+49 commits past v52.0 carrying a restore mode of fcvm's (`memory_restore_mode=map`). Upstream
+has had the same mechanism since v54.0 as `copyonwrite`, and in the 2,412 commits between
+the two it fixed three defects in arm64 snapshot and restore that fcvm hit on the fork
+(#2155).
+
+- **One build.** `fcvm setup --cloud-hypervisor` clones the repository, checks out the
+  configured commit, refuses a checkout whose HEAD is anything else, and builds it with
+  `--locked` and the toolchain in fcvm's `rust-toolchain.toml`. It installs the binary only
+  if its `--version` ends in `-g` and the commit's first twelve digits, the form
+  `git describe` gives it. The binary is
+  `cloud-hypervisor-<hash>.bin` in the store, the hash over the repository, the commit, the
+  architecture and the libc. Launch computes that name from the config and runs that file.
+  When it is absent the launch fails and names the setup command: no other build in the
+  store and nothing on PATH stands in. `FCVM_CLOUD_HYPERVISOR_BIN` names another binary on
+  purpose.
+- **What a restore passes** (`ch_restore_args`, `src/commands/common.rs`):
+  - `memory_restore_mode=copyonwrite` maps the snapshot's memory file `MAP_PRIVATE` over
+    guest RAM, so clones of one snapshot share its clean pages through the page cache.
+    Upstream falls back to reading the whole file, with one line in its log, when it
+    judges the guest's RAM unsuitable. fcvm configures nothing that triggers it, and reads
+    the VMM's `/proc/<pid>/maps` after the resume: a restore whose VMM does not map the
+    memory file fails.
+  - `clock_restore_mode=preserve` resumes the guest's clock at its value when the source
+    was paused. Upstream's default (`advance`) adds the wall time since the snapshot, so a
+    clone of a day-old snapshot would start a day ahead on CLOCK_MONOTONIC with every armed
+    timer expired. The guest's wall clock is fcvm's to set: fc-agent's restore handler
+    steps it from the host's time, and a raw guest's agent sets it from the clock line its
+    namespace serves. `preserve` is on upstream's main (2026-11-23) and in no release.
+- **A snapshot belongs to the build that wrote it.** The snapshot's metadata records what
+  its VMM printed for `--version`, and a restore on a build that prints anything else, or of
+  a snapshot that records none, is refused before it creates anything, with both builds
+  named. A create whose VMM's build cannot be named (its binary was replaced after it
+  started) fails before the pause. Cloud Hypervisor's `state.json` is that build's device
+  state, and upstream promises compatibility for live migration from the two previous
+  releases only. The snapshot cache key holds the binary's path, which holds the commit for
+  the configured build, so a cached snapshot is taken again after the pin moves. A binary
+  named by `FCVM_CLOUD_HYPERVISOR_BIN` and replaced in place keeps its path: `podman run`
+  then meets the refusal, deletes the cached entry and boots fresh. The fleet's Windows gold
+  snapshot is keyed by the build too (`gold_key`, `src/fleet/agent/windows.rs`).
+- **The config section is `repo` and `commit`.** A config written by an older fcvm has
+  `branch` and no `commit` there and does not parse; `make build` and
+  `fcvm setup --generate-config --force` write the current one.
+- **A source resumed in place keeps the host's time.** `snapshot create` without `--stop`
+  pauses the VM, saves it and resumes it. On x86_64 the fork set the guest's clock back to
+  its value at the pause, so the guest fell behind by every pause; upstream sets it with
+  the wall time that passed. On arm64 the counter runs through the pause on both (#2173).
+  Measured in docs/fleet/windows-sandboxes.md, "The fork against upstream".
+- **A snapshot of a clone** is written by cloning the extents of the memory file the clone
+  maps (FICLONERANGE) and then writing the pages the clone changed. The result holds every
+  page: `test_cloud_hypervisor_snapshot_of_a_clone_outlives_its_parent_snapshot` deletes the
+  parent snapshot and reads back memory from both generations.
+- **`vm.create`** asks for the virtio-net offloads (checksum, TSO, UFO), which upstream
+  stopped offering by default in v54.0.
+
+**Moving the pin.** Change `commit`, read upstream's release notes and the commits since
+the old one for the options and defaults above, then run the Cloud Hypervisor tests
+(`make test-root FILTER="-E 'test(/cloud_hypervisor/) | test(/^gym_pairs_/)'"`) on arm64 and
+`fleet/windows/measure-restore.sh` on an x86_64 host. Every Cloud Hypervisor snapshot is
+created again afterwards.
 
 ### Disk-Only Snapshots & Cold-Boot Clones
 
@@ -720,12 +871,15 @@ Host (127.0.0.x:8080) → pasta → pasta0 → br0 (L2) → tap-fc → Guest (10
 | | |
 |---|---|
 | Owner | One pool process per data directory and user (`<data_dir>/netpool/<user>/`, `pool.lock` held for life, `pool.sock`). Holders and pastas are its children with `PR_SET_PDEATHSIG`, forked from its main thread. |
-| Claim | `PastaNetwork::setup` of a restored clone with no published port connects to `pool.sock` and sends the key of its network (`PastaNetwork::pool_key`: the links, pasta's command line with the host's IPv6 address, the ids the holder's user namespace maps, and a digest of `/etc/resolv.conf`, which pasta reads at its start). The pool answers with the user and network namespace descriptors, a channel to the holder for sockets, the TAP's name, the slot and its generation. The claimer checks that the socket is served by its own user (`SO_PEERCRED`). A claim that fails in any way (no answer in 2 s, a pool that is stopping, a wrong reply) is logged and the clone builds its own namespace: a clone is never worse off because a pool exists. A pool whose key no clone asks for says so in its log, and whether the host has changed since it started. |
+| Claim | `PastaNetwork::setup` of a restored clone with no published port connects to `pool.sock` and sends the key of its network (`PastaNetwork::pool_key`: the links, pasta's command line with the host's IPv6 address, the ids the holder's user namespace maps with digests of `/etc/subuid` and `/etc/subgid`, which decide their layout, and a digest of `/etc/resolv.conf`, which pasta reads at its start). The pool answers with the user and network namespace descriptors, a channel to the holder for sockets, the TAP's name, the slot and its generation. The claimer checks that the socket is served by its own user (`SO_PEERCRED`). A claim that fails in any way (no answer in 2 s, a pool that is stopping, a wrong reply) is logged and the clone builds its own namespace: a clone is never worse off because a pool exists. A pool whose key no clone asks for says so in its log, and whether the host has changed since it started. |
 | Lease | The connection. The VMM inherits it across its exec (`NamespaceParams::keep_fds`), so it reads end-of-file only when the clone and its VMM have both exited. |
-| Reset | First the pool waits, up to 2 s, until nothing is attached to the VMM's TAP (`carrier`): a process still on it can send frames, and what a frame leaves in pasta is in no fingerprint, so the pasta that serves the next VM starts only after the last writer is gone. A TAP still attached after 2 s gets the namespace destroyed. Then pasta is restarted; the holder destroys every TCP socket, deletes every resolved neighbour and every address the bridge learned, and removes and re-adds the namespace's addresses, which makes their routes anew and drops a path MTU or redirect a guest's ICMP left on them (`netns_agent::reset`). No `/proc/sys` path is opened. |
+| TAP | The holder makes the VMM's TAP attached and keeps the queue open (`rtnl::add_attached_tap`): the device has a carrier from its build on. The grant carries a copy of the queue, the VMM inherits it beside the lease, and Firecracker uses the device through it (`host_dev_fd` in the snapshot load's network override and in `PUT /network-interfaces`; ejc3/firecracker builds whose version says `tap-fd`). No VMM attaches or detaches, so a clone's start and stop take no `rtnl_mutex` hold for a link event or a grace period (an attach and detach by name hold it 1.5 ms or more per clone life on a host with 2000 namespaces, `bench/start-rate/pieces/RESULTS.md`). The kernel purges a queue only when it is closed, so the holder empties it before each lessee (`rtnl::drain_tap`, at `adopt`). A clone whose VMM does not take a queue is not pooled (`vmm_takes_a_tap_queue`). |
+| Reset | The lease's end is all that says the VMM is gone: the TAP stays attached by its holder, so its carrier says nothing, and the wait for it that a by-name TAP allowed is not made. The VMM alone is given the queue, with the lease, and both are close-on-exec everywhere else. pasta is told over its control socket to forget the guest (`src/network/pesto.rs`: every flow closed, the guest MAC and addresses it learned put back; a patch fcvm carries on passt, as is `--no-neigh-notify`, which these pastas run with), so pasta is not restarted and its TAP never changes carrier; the holder destroys every TCP socket, deletes every resolved neighbour and every address the bridge learned, and removes and re-adds the namespace's addresses, which makes their routes anew and drops a path MTU or redirect a guest's ICMP left on them (`netns_agent::reset`). No `/proc/sys` path is opened. |
 | Verify | The holder's fingerprint of the namespace (`src/network/fingerprint.rs`: links with their carrier, addresses, routes, policy rules, neighbours, bridge table, extra qdiscs, per-link settings, cached routes, nftables tables, sockets in use by protocol; its module doc lists what it does not read and why) must equal the one taken at build. It is retried for 2 s, for the state that trails a link change. A dump the kernel interrupted or failed is an error, never a shorter listing, and so is a fingerprint too long for one message. A namespace that still differs is destroyed and built again. |
 | Destroy | One namespace at a time, 50 ms apart. The kernel destroys the namespaces that died since its cleanup worker last ran as one batch under `rtnl_mutex`, and each bridge in a batch costs an `rcu_barrier()` under it on kernels before Linux 25ae123db10b (14 ms on 192 CPUs, measured). |
 | Not pooled | A clone with a published port, an isolated namespace, a cold boot, a clone whose network key is not the pool's, and any clone when no pool runs or no namespace is free. They build their own namespace through the same builder. |
+
+**Who is trusted with a pooled TAP's queue.** A TAP a VMM attached by name showed every process attached to it as its carrier, which the kernel keeps: the pool could wait for the carrier to drop, and destroy a namespace whose TAP still had one. With the queue kept open by the holder the TAP always has a carrier, and that check does not exist. What says the last tenant is gone is its lease reading end-of-file, and what makes that enough is where the queue goes: fcvm has it close-on-exec, and it is left open across one exec, the VMM's, together with the lease (`the_queue_is_kept_open_only_where_the_lease_is`; `clones_run_in_recycled_namespaces` walks the clone's process tree and finds the queue in fcvm and the VMM alone). The queue is therefore shared among the VMMs the pool's own user runs, one after another. A VMM that its guest has taken over, and that passes the descriptor to another process before it exits, is not detected: that process can read the next tenant's frames and write frames to it. The same VMM already runs as the pool's user on the host. No cheap check closes this: comparing the queue against every descriptor of the user's processes (`kcmp`) costs a walk of `/proc` per reset, and it misses a descriptor in flight in a Unix socket's queue or held in another PID namespace.
 
 The slot table (`src/netpool/slots.rs`) is pure state: Building, Ready, Leased(lease), Resetting, Destroying. A lease's end is refused for any lease but the one the namespace has, so a connection seen closing late cannot take a namespace from its next tenant.
 
@@ -1197,14 +1351,14 @@ command runs, and every child (Firecracker, holder, pasta) and every in-process 
 
 | | |
 |---|---|
-| where | `fcvm.slice/fcvm-<pid>-<starttime>.scope` at the cgroup2 root, written to cgroupfs directly (`FCVM_CGROUP_PARENT` names another parent, `none` disables it) |
+| where | for root, `fcvm.slice/fcvm-<pid>-<starttime>.scope` at the cgroup2 root, written to cgroupfs directly (`FCVM_CGROUP_PARENT` names another parent, `none` disables it); unprivileged with `FCVM_CGROUP_PARENT` unset, `fcvm.slice` inside the cgroup delegated to the caller |
 | why not systemd | `systemd-run --scope` cannot place a running process; `StartTransientUnit` needs a bus client and a running systemd, which containers and nested guests do not all have. A caller that wants a systemd unit starts fcvm in one (`systemd-run --scope ... env FCVM_CGROUP_PARENT=none fcvm ...`) |
 | oomd | outside the user slice, so a rule that kills a session scope does not kill the VM; a slice oomd watches is one `FCVM_CGROUP_PARENT` away |
 | confined callers | a cgroup namespace still confines (the root is the namespace's); a root caller in a sandbox slice leaves it unless `FCVM_CGROUP_PARENT` names that slice |
-| unprivileged | stays in its own cgroup, one log line |
+| unprivileged | a scope inside the cgroup delegated to it: a system unit run for the user with `Delegate=yes` and `DelegateSubgroup=`, or a subtree handed to the user outside any systemd tree. The kernel lets a process move only inside a subtree whose root it can write, and systemd forbids cgroups below ones it manages unless delegated, so `user@<uid>.service` is never used, and a user manager unit counts only once systemd marks it (`user.delegate`, after systemd commit 70a8c5eb; systemd 255 to 262 mark none). Anywhere else (an SSH session, a service, a CI runner) it stays in its own cgroup, one log line |
 | `--no-swap` | `memory.swap.max=0` on the scope before the VMM starts; refused when there is no scope with a memory controller |
 | lifetime | pdeathsig is per process and survives the move: a VM dies with its launcher where the launcher armed it; a foreground fcvm dies with its terminal's SIGHUP; a detached one outlives the session |
-| removal | at exit fcvm moves back to the cgroup it came from and removes the scope; each entry sweeps scopes whose (pid, start time) is gone, and empty `fcvm-<pid>.scope`s of earlier releases, under an `flock` on the parent that covers the empty window between a scope's `mkdir` and its owner's entry. The name is the owner record, not a `reclaim` record, because reclaim records are per data_dir and per user and a cgroup is per kernel |
+| removal | at exit fcvm moves back to the cgroup it came from and removes the scope; a start sweeps the parent when a sweep is due (`src/sweep.rs`: at most once per 5 s and parent, behind a stamp under `<data_dir>/cgroup-sweep/`), removing the scopes whose (pid, start time) is gone and the empty `fcvm-<pid>.scope`s of earlier releases. A start holds the parent's `flock` shared across the empty window between its scope's `mkdir` and its entry, and a sweep removes only under that lock held exclusively, which it waits for at most 100 ms. The name is the owner record, not a `reclaim` record, because reclaim records are per data_dir and per user and a cgroup is per kernel |
 
 ---
 
@@ -1478,6 +1632,7 @@ One async session per connection:
 | `fcvm exec` | Execute command in running VM/container |
 | `fcvm balloon` | Print a VM's balloon target and size; with MIB, set the target first |
 | `fcvm ls` | List running VMs |
+| `fcvm paths` | Print the state and data directories this binary uses |
 | `fcvm snapshot create` | Create snapshot from running VM |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
 | `fcvm snapshot run` | Spawn clone from memory server |
@@ -1525,6 +1680,8 @@ fcvm snapshot create [--pid <PID> | <VM_NAME>] [--tag <TAG>]
 ```
 --pid <PID>               fcvm process PID to snapshot
 --tag <TAG>               Snapshot name (defaults to VM name)
+--await-restore <SECONDS> Wait this long for a restored VM's restore to be acknowledged
+                          before refusing to snapshot it (default 0: refuse at once)
 <VM_NAME>                 VM name to snapshot (alternative to --pid)
 ```
 
@@ -1536,6 +1693,22 @@ fcvm snapshot create --pid 12345 --tag my-snapshot
 # Create snapshot by name
 fcvm snapshot create my-vm --tag warm-nginx
 ```
+
+**A restored VM is snapshotted only after its restore is acknowledged**: a VM restored from a memory snapshot
+(`snapshot run`, or `podman run` on a snapshot cache hit) resumes behind its snapshot's network gate with its
+container frozen, and its guest acknowledges the restore only after it has retired the source's connections, run the
+restore hook and opened the gate. A snapshot taken before that would open the gate early and capture a restore part
+way through, so `snapshot create` refuses such a VM, `--stop` included, and leaves it as it was. The test is the VM's
+state: `process_type` is `clone` and `restore_acknowledged` is not set. `snapshot run` records the acknowledgement on
+the state and then prints its restored record, so once the record is printed a create is taken; `fcvm ls --json --pid
+<PID>` shows `"restore_acknowledged": true`. Taken is not yet run: `snapshot run` still has its own checks of the clone
+to do (the guest's output connection, the port check) and holds the VM's snapshot lock until it has published
+`lifecycle_ready`, so a create asked for in that stretch (7 ms measured) waits for it and does not pause the guest
+under those checks; it gives up after 60 s if the clone is never published. A clone whose state says `failed` is
+refused, whether its restore failed before the acknowledgement or after it; the state says so until the VM's teardown
+removes it. A caller that learns a clone is up from the clone's own ports can be a few
+milliseconds ahead of the record; `--await-restore <SECONDS>` waits for it, and ends early when the restore fails,
+the VM's fcvm exits or its state is removed. A VM that was booted is not checked.
 
 **Zero pages are holes**: with the default Firecracker build (`[firecracker]` in `rootfs-config.toml`, used by every
 kernel profile that does not set its own `firecracker_repo`), a Full snapshot written to a new memory file leaves
@@ -1691,6 +1864,17 @@ state file, or network exists. The clone's state (`config.port_mappings`) record
 mappings it uses, a disk-only clone sets its network up from the same list, and no
 snapshot key includes the flag. `fcvm podman run` restoring from its snapshot cache
 passes its own `--publish` through the same path.
+
+`--map HOST:GUEST:ro` moves the host side of a read-only volume the snapshot mapped
+(`clone_volumes`); a read-write one is refused, since the guest keeps its sizes, times and
+pages through the writeback cache. The moved directory must hold every file the snapshot's
+guest held in that volume (the paths in its inode table): a restore answers EIO for one it
+cannot find, so `snapshot run` refuses such a directory before anything starts. The
+pre-start snapshot key holds a read-only map by its guest path and mode only, and `fcvm
+podman run` restoring from it passes its own read-only maps through the same path, so runs
+that map one guest path from different directories share it (#2239). If the run's
+directory lacks a file the snapshot's guest held, the run boots cold and takes no snapshot.
+A startup snapshot's name keeps the host path: its container already read the files.
 
 **Examples**:
 ```bash
@@ -1939,6 +2123,25 @@ my-nginx       12345   running   healthy   bridged   nginx:alpine
 clone-1        12350   running   healthy   rootless  (clone)
 ```
 
+#### `fcvm paths`
+
+**Purpose**: Name the directories this binary keeps VM state and data in, for tools
+outside fcvm that read state files (the benchmark harnesses under `bench/`).
+
+**Usage**:
+```bash
+fcvm paths [--json]
+```
+
+With `--json` it prints one JSON object on one line, for example
+`{"state_dir":"/mnt/fcvm-btrfs/state","data_dir":"/mnt/fcvm-btrfs"}`; without, one
+`name<TAB>path` line per directory. Each value is what `paths::state_dir()` and
+`paths::data_dir()` return for this config and `FCVM_DATA_DIR`, so a tool that asks
+follows the binary wherever it keeps its state. Fields are added, never renamed or
+removed. It reads no VM state and creates nothing. A tool asks with the binary and
+environment its VMs run with: `sudo` without `-E` drops FCVM_DATA_DIR, and the answer
+under it is then the configured directory, as it is for the VMs.
+
 #### `fcvm balloon`
 
 **Purpose**: Read or set the balloon target of a running VM.
@@ -2076,6 +2279,7 @@ fcvm/
 │   │   ├── common.rs       # Shared utilities
 │   │   ├── exec.rs         # fcvm exec
 │   │   ├── ls.rs           # fcvm ls
+│   │   ├── paths.rs        # fcvm paths
 │   │   ├── podman.rs       # fcvm podman run
 │   │   ├── setup.rs        # fcvm setup
 │   │   ├── snapshot.rs     # fcvm snapshot {create,serve,run} + UFFD server
@@ -2235,10 +2439,9 @@ Override with `FCVM_BASE_DIR` environment variable.
 ├── initrd/            # fc-agent injection initrds
 │   └── fc-agent-{sha}.initrd
 ├── vm-disks/          # Per-VM CoW disk copies
-│   └── {vm-id}/disks/rootfs.raw
+│   └── {bucket}/{vm-id}/disks/rootfs.raw
 ├── snapshots/         # Firecracker snapshots
-├── state/             # VM state JSON files
-│   └── {vm-id}.json
+├── state/             # markers: layout, runtime (the directory that holds the VM states)
 └── cache/             # Downloaded images and packages
     ├── ubuntu-24.04-arm64-{sha}.img  # Cloud image cache
     └── packages-{sha}/               # Downloaded .deb files
@@ -2254,7 +2457,7 @@ This ensures automatic cache invalidation when any component changes.
 
 ### State Persistence
 
-**VM State** (`/mnt/fcvm-btrfs/state/{vm-id}.json`):
+**VM State** (`<runtime_dir>/state/vms/<b>/{vm-id}.json`, `<b>` the first hex digit of the vm-id's SHA-256; the runtime directory is `/run/fcvm-<uid>/<key of the data directory>/boot-<boot id>` when root has made that base (`sudo fcvm setup`) or the caller is root, else `<data_dir>/runtime/boot-<boot id>`, unless `paths.runtime_dir` names a base; the data directory records which one it is bound to in `state/runtime`, and `fcvm ls --runtime-dir` prints it):
 ```json
 {
   "schema_version": 1,

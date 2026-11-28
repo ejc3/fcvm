@@ -173,8 +173,10 @@ bool Server::start_connection(int fd, const sockaddr* peer, socklen_t peer_len, 
   std::string source = pending_source(peer, peer_len);
   if (!pending_.take(source)) {
     // past MAX_PENDING_CONNECTIONS, or MAX_PENDING_PER_SOURCE from this source: no thread, no byte
-    close(fd);
+    // Counted before the close: a client that sees the close must find it in the count.
     unsigned long long n = ++refused_pending_;
+    if (refuse_hook_) refuse_hook_(fd, n);
+    close(fd);
     if ((n & (n - 1)) == 0)
       fprintf(stderr, "fleet-renderer: refused a connection past the pending limits (in all or from its source); refused %llu so far\n",
               n);

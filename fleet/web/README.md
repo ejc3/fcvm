@@ -140,9 +140,12 @@ the top of `mock/main.ts`.
 
 `/?mode=minecraft` shows the Minecraft servers (PROTOCOL.md, "Minecraft mode"; design in
 docs/fleet/minecraft.md). Each tile opens its own WebSocket to the server's view socket, sends
-the page's direct token first, and draws the world from above on a canvas: one flat colour per
-material (`MATERIAL_COLORS` in core/minecraft.ts, no asset of the game), lighter the higher a
-column stands, with each player as a marker, a facing tick and its name. A tile is labelled with
+the page's direct token first, and draws the world in 3D (core/minecraft3d.ts, drawn by
+app/_wall/minecraft-stage.ts on one WebGL2 canvas under the tiles; docs/fleet/minecraft.md, "The
+page in 3D"): plain boxes, one flat colour per material (`MATERIAL_COLORS` in core/minecraft.ts,
+no asset of the game), each player a block figure with its name, from a camera that flies through
+the world. Without WebGL2 it draws the map from above on the tile's own canvas and says so. A
+tile is labelled with
 its slot, the ticks per second its server reports, "Up in X.XX s" (click to first chunk) and, for
 a copy, "Forked from mc-N in X.XX s", with Reset, Fork and Take over. The header gives the
 servers up, the server's name and version, the median and slowest restore, the last fork with
@@ -152,7 +155,10 @@ Q then drive its first bot over the tile's socket (on-screen buttons on a touch 
 panel shows the time from a key to the first change it made. Escape or Give back returns it. The
 mock has none unless `FLEET_MOCK_MINECRAFT=<n>` is set, with `FLEET_MOCK_MINECRAFT_PORT` for the
 view sockets (`<block+3>` in `.env.ports`); the other `FLEET_MOCK_MINECRAFT_*` knobs are listed
-at the top of `mock/main.ts`.
+at the top of `mock/main.ts`. With more than 16 servers the snapshot lists the first 16 as tiles
+and names every server in `minecraft.field`, and the page draws the field: every server a cell,
+six of them in 3D tiles. `POST /mock/minecraft {"servers": 512, "per_host": 512}` runs that many
+in place of the ones there, and `{"status_off": true}` stops the hosts' status rows.
 
 `/?mode=potato` shows the hot potato game (PROTOCOL.md, "Potato mode"): a ring of CPU-only
 player VMs, each drawn in its colour, bright while awake, dim while asleep and with a bar while it

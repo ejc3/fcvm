@@ -362,7 +362,8 @@ pub(crate) fn nfs_remounts(shares: &[crate::types::NfsMount]) -> Vec<crate::type
 /// network phases, so the rebind proceeds concurrently with the boundary work
 /// instead of serializing behind it. Chrony re-convergence and the journald
 /// restart have no bearing on the readiness contract, so both run in the
-/// background, off the host's ACK path.
+/// background, off the host's ACK path, the fresh chronyd only after the
+/// publication (`FreshChronyd`).
 ///
 /// FUSE volumes are NOT remounted here. The reconnectable multiplexer
 /// detects the dead vsock and auto-reconnects to the clone's VolumeServer.
@@ -562,6 +563,10 @@ pub async fn handle_clone_restore(
         *carried_listeners.lock().unwrap() = Some(carried);
         Ok(())
     };
+    // failpoint: the restore is under way and has not taken the boundary lock. The exec
+    // server was asked to re-register at the top, so a test can ask things of a clone
+    // held here: what a snapshot create finds when it arrives before the boundary.
+    failpoint::hit_async("restore.pre_boundary").await;
     let restored = crate::snapshot_network::restore_snapshot_network(move_to_clone_address)
         .await
         .context("restore phase tcp-cleanup")?;
@@ -596,16 +601,9 @@ pub async fn handle_clone_restore(
         );
         crate::bootplan::set_system_clock(host_time, restore_started.elapsed());
     }
-    // A fresh chronyd, whose every measurement is taken against the stepped
-    // clock. Its convergence is not part of the readiness contract (the clock
-    // is already stepped), so it must not hold the host's ACK.
-    match chronyd_retired {
-        Ok(retired) => spawn_restore_side_job(crate::agent::restart_chronyd_after_restore(
-            retired,
-            restore_epoch.to_string(),
-        )),
-        Err(e) => eprintln!("[fc-agent] ERROR: retiring the snapshot's chronyd panicked: {e}"),
-    }
+    // A fresh chronyd is due from here and starts after the publication: see
+    // `FreshChronyd`.
+    let fresh_chronyd = FreshChronyd::after_the_clock_step(chronyd_retired, restore_epoch);
     phases.clock_ms = elapsed_ms(clock_started);
 
     // Restart journald in the background without ever holding the ACK. The
@@ -615,7 +613,10 @@ pub async fn handle_clone_restore(
     // (container output travels over vsock), so a synchronous restart, which is
     // a full systemd job, would only add latency. After the clock step so the
     // fresh journal opens with correct timestamps, and registered so the
-    // shutdown path can settle it rather than race it.
+    // shutdown path can settle it rather than race it. Not held back for the
+    // hook as the fresh chronyd is: the agent's own stderr and the guest's
+    // /dev/log go to journald, and what the hook phase writes there must not
+    // wait on a journald that is stuck.
     spawn_restore_side_job(restart_journald());
 
     // Remount NFS shares: their kernel TCP connections to the host's NFS
@@ -814,10 +815,11 @@ pub async fn handle_clone_restore(
         }
         Ok(())
     };
-    let boundary = restored
-        .publish(restore_hook, reconcile_after_hook)
-        .await
-        .context("restore phase publish")?;
+    let boundary = restored.publish(restore_hook, reconcile_after_hook).await;
+    // The hook has run and ingress is open (or the publication failed): nothing
+    // left on the way to the ACK starts a process the daemon would compete with.
+    fresh_chronyd.start();
+    let boundary = boundary.context("restore phase publish")?;
     phases.record_boundary(&boundary);
     // And after publication, for as long as any translation remains.
     if let Some(carried) = carried_listeners.lock().unwrap().take() {
@@ -830,6 +832,74 @@ pub async fn handle_clone_restore(
         restore_epoch, phases.total_ms
     );
     Ok(phases)
+}
+
+/// The fresh chronyd a restore owes once its clock is stepped, held until
+/// publication. Every measurement the daemon takes is against the stepped
+/// clock, and its convergence is not part of the readiness contract (the clock
+/// is already stepped), so neither the hook nor the publication waits for it.
+/// Started at the clock step, as it was, it ran beside the restore hook, and a
+/// 1 vCPU guest gave it the vCPU the hook's `crun` needed.
+///
+/// A restore that fails between the clock step and publication starts it on
+/// its way out (`Drop`): the clone keeps a chronyd for as long as its host lets
+/// it live.
+struct FreshChronyd {
+    /// What retiring the snapshot's chronyd returned; None once started.
+    retired: Option<std::result::Result<crate::agent::RetiredChronyd, tokio::task::JoinError>>,
+    epoch: String,
+}
+
+impl FreshChronyd {
+    fn after_the_clock_step(
+        chronyd_retired: std::result::Result<crate::agent::RetiredChronyd, tokio::task::JoinError>,
+        epoch: &str,
+    ) -> Self {
+        Self {
+            retired: Some(chronyd_retired),
+            epoch: epoch.to_string(),
+        }
+    }
+
+    /// Start the daemon, registered so the shutdown path can settle the job
+    /// rather than race it.
+    fn start(mut self) {
+        self.start_once();
+    }
+
+    fn start_once(&mut self) {
+        match self.retired.take() {
+            None => {}
+            Some(Ok(retired)) => {
+                spawn_restore_side_job(crate::agent::restart_chronyd_after_restore(
+                    retired,
+                    std::mem::take(&mut self.epoch),
+                ))
+            }
+            Some(Err(e)) => {
+                eprintln!("[fc-agent] ERROR: retiring the snapshot's chronyd panicked: {e}")
+            }
+        }
+    }
+}
+
+impl Drop for FreshChronyd {
+    fn drop(&mut self) {
+        if self.retired.is_none() {
+            return;
+        }
+        // A restore that is dropped as the runtime goes away has nowhere to run
+        // the job, and the VM is going with it.
+        if tokio::runtime::Handle::try_current().is_err() {
+            eprintln!(
+                "[fc-agent] chronyd is not restarted after the restore (epoch={}): the \
+                 runtime is gone",
+                self.epoch
+            );
+            return;
+        }
+        self.start_once();
+    }
 }
 
 /// Background jobs a restore started that must not outlive the VM.
@@ -1256,6 +1326,7 @@ mod tests {
             reassert_ms: 0.0,
             barrier_ms: 20.0,
             destroy_ms: 600.0,
+            listing_ms: 0.0,
             egress_open_ms: 30.0,
             hook_ms: 0.0,
             reopen_ms: 0.0,
@@ -1560,12 +1631,16 @@ mod tests {
         let clock = body
             .find("crate::bootplan::sync_clock_from_host()")
             .expect("the restore path no longer steps the clock");
+        // The fresh chronyd is one of the side jobs, which take the retired daemon
+        // and the restore's epoch after the step and start it.
         let restart = body
-            .find(
-                "crate::agent::restart_chronyd_after_restore(\n            retired,\n            \
-                 restore_epoch.to_string(),",
-            )
+            .find("FreshChronyd::after_the_clock_step(chronyd_retired, restore_epoch)")
             .expect("the restore no longer starts a fresh chronyd that names its restore");
+        assert!(
+            include_str!("restore.rs")
+                .contains("crate::agent::restart_chronyd_after_restore(retired, "),
+            "the held chronyd is never started"
+        );
         assert!(
             retire < retired && retired < clock && clock < restart,
             "retire={retire} retired={retired} clock={clock} restart={restart}"
@@ -1574,6 +1649,63 @@ mod tests {
             !body.contains("\"makestep\""),
             "the restore asks the snapshot's chronyd to apply its leftover correction"
         );
+    }
+
+    /// The fresh chronyd starts once the hook has run and ingress is open, not at
+    /// the clock step it is due from: on a 1 vCPU guest it took the vCPU from the
+    /// hook's `crun`. Nothing between the publication and its start can leave the
+    /// function, so a failed hook starts it too. The journald restart stays where
+    /// it was, right after the clock step: until it has run, what the agent and
+    /// the guest log goes to a journald that is stuck on its journal file.
+    ///
+    /// RED BEFORE THE FIX: the chronyd was spawned right after the clock step,
+    /// ahead of the NFS remount, the proxy waits and the hook.
+    #[test]
+    fn the_fresh_chronyd_starts_after_the_hook_and_journald_restarts_before_it() {
+        let body = handle_clone_restore_source();
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{needle} is not in handle_clone_restore"))
+        };
+        let clock = at("crate::bootplan::sync_clock_from_host()");
+        let due = at("FreshChronyd::after_the_clock_step(");
+        let journald = at("spawn_restore_side_job(restart_journald());");
+        let nfs = at("mount_nfs_shares(");
+        let publish = at(".publish(restore_hook,");
+        let start = at("fresh_chronyd.start();");
+        assert!(
+            clock < due && due < publish && publish < start,
+            "clock={clock} due={due} publish={publish} start={start}"
+        );
+        assert!(
+            clock < journald && journald < nfs,
+            "the journald restart is not right after the clock step: clock={clock} \
+             journald={journald} nfs={nfs}"
+        );
+        assert!(
+            !body.contains("restart_chronyd_after_restore("),
+            "the restore starts the chronyd itself, apart from `fresh_chronyd.start()`"
+        );
+        assert!(
+            !body[publish..start].contains('?'),
+            "the restore can return between the publication and the chronyd's start"
+        );
+    }
+
+    /// A restore dropped where no runtime runs (the agent going down) starts
+    /// nothing and does not panic.
+    ///
+    /// RED BEFORE THE FIX: `Drop` called `tokio::spawn`, which panics outside a
+    /// runtime.
+    #[test]
+    fn a_held_chronyd_dropped_without_a_runtime_starts_nothing() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let retired = runtime.block_on(crate::agent::retired_chronyd_for_test());
+        let held = FreshChronyd::after_the_clock_step(Ok(retired), "epoch");
+        drop(runtime);
+        drop(held);
     }
 
     #[test]

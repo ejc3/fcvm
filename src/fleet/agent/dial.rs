@@ -142,6 +142,35 @@ impl Replay {
     }
 }
 
+/// Pages mode's rule, kept per connection: no `renders` summary until the coordinator at the
+/// other end has sent a `renders` order. The agent outlives its connections, and a
+/// coordinator built before the mode sends no such order and closes the connection on the
+/// summary.
+#[derive(Default)]
+struct RendersGate {
+    ordered: bool,
+}
+
+impl RendersGate {
+    fn coordinator_frame(&mut self, frame: &str) {
+        self.ordered |= message_type(frame).as_deref() == Some("renders");
+    }
+
+    /// Whether an agent line goes to this connection now.
+    fn passes(&self, line: &str) -> bool {
+        self.ordered || message_type(line).as_deref() != Some("renders")
+    }
+}
+
+/// A message's `type`.
+fn message_type(line: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("type")?
+        .as_str()
+        .map(str::to_string)
+}
+
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -276,6 +305,7 @@ pub async fn run(agent: Agent, cfg: DialCfg) -> Result<()> {
         let (mut sink, mut stream) = ws.split();
         let mut ok = true;
         let mut heard = Instant::now();
+        let mut gate = RendersGate::default();
         let mut ping = tokio::time::interval(cfg.silence / 3);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         for l in replay.lines() {
@@ -298,6 +328,7 @@ pub async fn run(agent: Agent, cfg: DialCfg) -> Result<()> {
                     Some(Ok(Message::Text(t))) => {
                         heard = Instant::now();
                         replay.coordinator_frame(t.as_str());
+                        gate.coordinator_frame(t.as_str());
                         let mut line = t.as_bytes().to_vec();
                         line.push(b'\n');
                         if to_agent.write_all(&line).await.is_err() {
@@ -311,7 +342,7 @@ pub async fn run(agent: Agent, cfg: DialCfg) -> Result<()> {
                 l = lines.recv() => match l {
                     Some(l) => {
                         replay.note(&l);
-                        if sink.send(Message::Text(l.into())).await.is_err() {
+                        if gate.passes(&l) && sink.send(Message::Text(l.into())).await.is_err() {
                             ok = false;
                         }
                     }
@@ -329,7 +360,7 @@ pub async fn run(agent: Agent, cfg: DialCfg) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Replay;
+    use super::{RendersGate, Replay};
 
     /// An operator releases a GPU while its first quarantine waits for its acknowledgement,
     /// and the GPU fails again: the second report replaces the first in the replay, and the
@@ -381,6 +412,42 @@ mod tests {
         // Scenes and budgets change nothing.
         r.coordinator_frame(r#"{"type":"scene","epoch_unix_ms":1}"#);
         assert_eq!(r.lines().len(), 3);
+    }
+
+    /// A summary of pages mode goes to a connection only after that connection's coordinator
+    /// sent a `renders` order, and is never replayed: the next connection's coordinator may
+    /// be one built before the mode.
+    #[test]
+    fn a_renders_summary_waits_for_its_connections_order() {
+        let report = r#"{"type":"renders","at":1,"sides":{}}"#;
+        let slot = r#"{"type":"slot","id":"slot-1","phase":"running","generation":1}"#;
+        let mut gate = RendersGate::default();
+        assert!(!gate.passes(report));
+        assert!(gate.passes(slot));
+        gate.coordinator_frame(r#"{"type":"assign","slots":[],"region":null}"#);
+        gate.coordinator_frame(r#"{"type":"scene","renders":true}"#);
+        assert!(!gate.passes(report));
+        gate.coordinator_frame(r#"{"type":"renders","order":{"run":false}}"#);
+        assert!(gate.passes(report));
+        assert!(
+            !RendersGate::default().passes(report),
+            "a new connection starts closed"
+        );
+        let mut r = Replay::default();
+        r.note(r#"{"type":"hello","host":"h","arch":"x86_64","gpus":[],"capacity":0}"#);
+        r.note(report);
+        assert_eq!(r.lines().len(), 1);
+        // every connection gets a gate of its own, and every agent line passes it
+        let source = include_str!("dial.rs");
+        let source = &source[source.find("pub async fn run(").unwrap()..];
+        let source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let connected = source.find("connected to the coordinator").unwrap();
+        let fresh = source
+            .find("let mut gate = RendersGate::default();")
+            .unwrap();
+        let frame = source.find("gate.coordinator_frame(t.as_str());").unwrap();
+        assert!(connected < fresh && fresh < frame);
+        assert_eq!(source.matches("if gate.passes(&l) &&").count(), 1);
     }
 
     /// A coordinator that lost the host learns the image's latest state on the next

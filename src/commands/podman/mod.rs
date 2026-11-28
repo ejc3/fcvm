@@ -59,6 +59,7 @@ use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::commands::common::{
     RuntimeConfig, VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE,
 };
+use crate::firecracker::error_text;
 use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping, RoutedNetwork};
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
@@ -745,9 +746,16 @@ async fn verify_prepared_snapshot_in(
 ) -> Result<Option<PreparedSnapshot>> {
     let snapshot_key = target.name.as_str();
     let snapshot_dir = snapshot_root.join(snapshot_key);
-    tokio::fs::create_dir_all(snapshot_root)
+    // Looked up first: a mkdir of a directory that exists still takes its parent's lock for
+    // writing, and every launch comes through here.
+    if !tokio::fs::metadata(snapshot_root)
         .await
-        .context("creating snapshot directory")?;
+        .is_ok_and(|metadata| metadata.is_dir())
+    {
+        crate::paths::ensure_dir_async(snapshot_root)
+            .await
+            .context("creating snapshot directory")?;
+    }
     let generation_lock = super::common::acquire_snapshot_dir_lock(&snapshot_dir, false).await?;
 
     let config_path = snapshot_dir.join("config.json");
@@ -918,6 +926,23 @@ fn publish_prepared_snapshot(prepared: &PreparedSnapshot) -> Result<()> {
 /// True when the VM's kernel profile enables ARM64 NV2 nested virtualization
 /// (the profile's firecracker_args carry --enable-nv2). Drives the
 /// miss-path-converges-on-restore behavior, which exists for NV2 guests only.
+/// Whether `--setup` may build the rootfs, which boots fcvm setup's unconfined VM: never
+/// for a confined run.
+fn setup_may_boot_its_vm(setup: bool, decision: &crate::confine::Decision) -> bool {
+    setup && decision.confinement().is_none()
+}
+
+/// The Firecracker arguments `args`'s kernel profile adds, for the confinement preflight,
+/// which refuses a profile that turns seccomp off or sets its own filter. A profile that
+/// cannot be read adds none here; the boot itself reads it again and fails on it.
+fn profile_firecracker_args(args: &RunArgs) -> Option<String> {
+    let name = args.kernel_profile.as_deref().unwrap_or("default");
+    crate::setup::get_kernel_profile(name)
+        .ok()
+        .flatten()
+        .and_then(|profile| profile.firecracker_args)
+}
+
 fn nv2_profile(kernel_profile: &Option<String>) -> bool {
     let Some(name) = kernel_profile.as_deref() else {
         return false;
@@ -1052,6 +1077,14 @@ fn run_host_ipv6(env: &[String]) -> Option<std::net::Ipv6Addr> {
     }
 }
 
+/// The read-only `HOST:GUEST:ro` specs among a run's `--map`.
+fn read_only_maps(maps: &[String]) -> Vec<String> {
+    maps.iter()
+        .filter(|spec| spec.split(':').nth(2) == Some("ro"))
+        .cloned()
+        .collect()
+}
+
 /// The `snapshot run` arguments that restore this run from a cached snapshot.
 ///
 /// `publish` is this run's own `--publish`, so the clone listens where this run asked,
@@ -1073,6 +1106,7 @@ fn snapshot_restore_args(
         exec: None,
         no_dirty_tracking: false, // podman needs dirty tracking for later snapshots
         no_swap: args.no_swap,
+        confine: args.confine,
         vsock_dir: args.vsock_dir.clone(),
         publish: if args.publish.is_empty() {
             vec![crate::commands::snapshot::PUBLISH_NONE.to_string()]
@@ -1080,7 +1114,10 @@ fn snapshot_restore_args(
             args.publish.clone()
         },
         publish_limit_per_source: args.publish_limit_per_source,
-        map: Vec::new(),
+        // This run's read-only maps, which the pre-start key holds by guest path only: the
+        // clone serves each from this run's directory. A read-write map's host path is in
+        // the key, so the snapshot's is this run's.
+        map: read_only_maps(&args.map),
         ipv6_prefix: launch_ipv6_prefix(args),
         ipv6_address: args.ipv6_address,
         // This run's HOST_IPV6, which the snapshot key leaves out: the restored guest
@@ -1140,17 +1177,22 @@ enum RestoreFault {
 /// - "image disk build changed" is `verify_image_disk_identity`'s marker: the snapshot names a
 ///   disk build that no longer exists at that path. "snapshot pmem image changed" is
 ///   `check_snapshot_pmem_images`', for the same reason: Firecracker reopens the recorded path.
+/// - `CH_SNAPSHOT_OF_ANOTHER_BUILD` is a Cloud Hypervisor restore refusing a snapshot another
+///   build wrote. The cache key holds the binary's path, which names the commit for the
+///   configured build but not for a binary given by `FCVM_CLOUD_HYPERVISOR_BIN` or found on
+///   PATH and replaced in place.
 const UNUSABLE_SNAPSHOT_MARKERS: &[&str] = &[
-    "Failed to load snapshot state from file",
-    "Invalid data version",
-    "An error occurred during bitcode serialization",
-    "Invalid snapshot state",
-    "Unknown Network Device",
-    "Unknown Vsock Device",
-    "Unknown Block Device",
-    "frequency not present in the given snapshot",
+    error_text::STATE_FILE_UNREADABLE,
+    error_text::INVALID_DATA_VERSION,
+    error_text::STATE_DOES_NOT_DECODE,
+    error_text::INVALID_SNAPSHOT_STATE,
+    error_text::UNKNOWN_NETWORK_DEVICE,
+    error_text::UNKNOWN_VSOCK_DEVICE,
+    error_text::UNKNOWN_BLOCK_DEVICE,
+    error_text::NO_TSC_FREQUENCY,
     "image disk build changed",
     "snapshot pmem image changed",
+    crate::commands::common::CH_SNAPSHOT_OF_ANOTHER_BUILD,
 ];
 
 /// Classify a failed restore of a cached snapshot.
@@ -1175,7 +1217,7 @@ fn classify_restore_failure(err: &anyhow::Error) -> RestoreFault {
     {
         return RestoreFault::UnusableSnapshot;
     }
-    if rendered.contains("Load snapshot error") {
+    if rendered.contains(error_text::LOAD_SNAPSHOT_ERROR) {
         return RestoreFault::LoadFailed;
     }
     RestoreFault::Other
@@ -1261,7 +1303,7 @@ pub(crate) async fn cleanup_failed_prepare(
 
 /// End the owner of a launch that a cache hit served, which made nothing of its own
 /// beyond what its record lists. A failure here does not fail the run that already
-/// finished: what remains stays recorded for the next launch.
+/// finished: what remains stays recorded for the next sweep.
 async fn complete_unused_owner(owner: crate::reclaim::Owner) {
     if let Err(e) = owner.complete().await {
         warn!(error = %format!("{e:#}"), "resources of a launch served from a snapshot remain");
@@ -1426,9 +1468,14 @@ async fn export_localhost_image_disk(
 
     // Use content-addressable cache: /mnt/fcvm-btrfs/image-cache/{digest}/
     let image_cache_dir = paths::image_cache_dir();
-    tokio::fs::create_dir_all(&image_cache_dir)
+    if !tokio::fs::metadata(&image_cache_dir)
         .await
-        .context("creating image-cache directory")?;
+        .is_ok_and(|metadata| metadata.is_dir())
+    {
+        crate::paths::ensure_dir_async(&image_cache_dir)
+            .await
+            .context("creating image-cache directory")?;
+    }
 
     // Lock per-digest to prevent concurrent exports of the same image
     let lock_file = lock_image_cache_entries(&image_cache_dir, &digest)?;
@@ -1481,7 +1528,7 @@ async fn export_localhost_image_disk(
             anyhow::anyhow!("internal: localhost image id was not captured at inspect time")
         })?;
         // A UUID-keyed orphan is never overwritten by the next run, so the temp is
-        // recorded before it exists and a SIGKILLed export leaves it to the next launch
+        // recorded before it exists and a SIGKILLed export leaves it to the next sweep
         // to reclaim (crate::reclaim).
         let temps = image::temp_owner()?;
         temps.record(crate::reclaim::Resource::Temp {
@@ -1623,6 +1670,17 @@ async fn prepare_vm_for_lifecycle(
 ) -> Result<VmPreparation> {
     // Every podman launch, the library's start_vm and prepare_vm included, comes here first.
     crate::cgroup::require_swap_disabled(args.no_swap)?;
+    // Before any side effect: a start that must be confined and cannot be is refused here.
+    let decision = crate::confine::resolve(&crate::confine::Request {
+        flag: args.confine,
+        backend: args.hypervisor.into(),
+        network: args.network.into(),
+        // A kernel profile's arguments as well as FCVM_FIRECRACKER_ARGS, which Host reads.
+        firecracker_args: profile_firecracker_args(&args).as_deref(),
+        unsupported: None,
+        kernel_profile: args.kernel_profile.as_deref(),
+        passthrough_devices: args.gpu.len(),
+    })?;
     info!(
         lifecycle = ?lifecycle,
         "Starting fcvm podman lifecycle"
@@ -1739,6 +1797,8 @@ async fn prepare_vm_for_lifecycle(
         },
     )
     .await?;
+    // Still before anything is created: a confined start needs this binary's filter.
+    crate::commands::common::require_confined_filter(&decision, &runtime_config)?;
 
     // Get kernel path
     // Priority: --kernel (explicit) > profile (named or "default")
@@ -1776,9 +1836,21 @@ async fn prepare_vm_for_lifecycle(
     // content-addressed base rootfs. create_cow_disk reflinks whatever it's given.
     let base_rootfs = match &args.rootfs_override {
         Some(p) => p.clone(),
-        None => crate::setup::ensure_rootfs(args.setup, rootfs_type.as_deref())
-            .await
-            .context("setting up rootfs")?,
+        // Building the rootfs boots fcvm setup's VM, which does not support confinement:
+        // a confined run uses a rootfs that exists and never builds one.
+        None => crate::setup::ensure_rootfs(
+            setup_may_boot_its_vm(args.setup, &decision),
+            rootfs_type.as_deref(),
+        )
+        .await
+        .with_context(|| {
+            if decision.confinement().is_some() {
+                "setting up rootfs: a confined run does not build one, because fcvm setup's \
+                 VM does not support confinement; run fcvm setup without --confine first"
+            } else {
+                "setting up rootfs"
+            }
+        })?,
     };
     let initrd_path = crate::setup::ensure_fc_agent_initrd(args.setup)
         .await
@@ -1914,7 +1986,7 @@ async fn prepare_vm_for_lifecycle(
     let boot_inputs = GuestBootInputs::resolve(args.dns.as_deref(), &runtime_config);
 
     // What VMs of processes killed without teardown left on the host goes first.
-    crate::reclaim::reclaim_abandoned().await;
+    crate::reclaim::reclaim_abandoned_if_due().await;
     // Generated before the snapshot key so the staging path of a read-only --disk-dir
     // is in this VM's data directory, which teardown removes.
     let vm_id = generate_vm_id();
@@ -1935,6 +2007,10 @@ async fn prepare_vm_for_lifecycle(
     // file identity. Without the snapshot cache nothing is keyed or staged.
     let mut disk_dir_staging = None;
     if !no_snapshot && (!args.disk.is_empty() || !args.disk_dir.is_empty()) {
+        // The runtime directory first, through the helper that makes its bucket with
+        // vm-disks' owner and mode: the staging below would otherwise make the bucket
+        // itself, with this process's owner and umask (root's, in a user's store).
+        paths::create_vm_runtime_dir(&vm_id).await?;
         let root = paths::vm_runtime_dir(&vm_id).join("disk-dir-staging");
         let (disk, disk_dir) = (args.disk.clone(), args.disk_dir.clone());
         let (staging, resolved) = tokio::task::spawn_blocking(move || {
@@ -2047,7 +2123,30 @@ async fn prepare_vm_for_lifecycle(
         }
 
         // Check for pre-start snapshot (container loaded but not initialized)
-        if restores_pre_start(&lifecycle) && check_podman_snapshot(&key).await.is_some() {
+        let pre_start = if restores_pre_start(&lifecycle) {
+            check_podman_snapshot(&key).await
+        } else {
+            None
+        };
+        // The pre-start key holds a read-only map by its guest path, and a hit serves it from
+        // this run's directory. If that directory lacks a file the snapshot's guest holds,
+        // the restore would answer EIO for it, so this run boots cold and takes no snapshot;
+        // the snapshot under the key stays (#2239).
+        let unservable = match &pre_start {
+            Some(snapshot) => snapshot
+                .memory_path
+                .parent()
+                .map(|generation| {
+                    super::snapshot::moved_volumes_missing_paths(
+                        &snapshot.metadata.volumes,
+                        &read_only_maps(&args.map),
+                        generation,
+                    )
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        if pre_start.is_some() && unservable.is_empty() {
             info!(
                 snapshot_key = %key,
                 image = %args.image,
@@ -2103,37 +2202,62 @@ async fn prepare_vm_for_lifecycle(
             }
         }
 
-        info!(
-            snapshot_key = %key,
-            image = %args.image,
-            startup_snapshot_key = %startup_key,
-            "Snapshot miss, will create snapshot after image load"
-        );
-        failpoint::hit_async("cache.miss").await;
-        // A cold boot's first snapshot is a full one. A prepare fails without its startup
-        // snapshot and a --gpu run without its pre-start snapshot, so both are refused here
-        // when it cannot fit. Any other run only skips caching when its snapshot is refused.
-        if let Some(target) = prepare_target.as_mut() {
-            target.free_at_start = check_snapshot_space_before_boot(
-                "podman prepare's startup snapshot",
-                args.mem,
-                false,
-                Some(target),
-            )
-            .await?;
-        } else if !args.gpu.is_empty() {
-            check_snapshot_space_before_boot(
-                "the pre-start snapshot that --gpu restores with its devices attached",
-                args.mem,
-                false,
-                None,
-            )
-            .await?;
+        if let Some((volume, path)) = unservable.first() {
+            // A prepare is a snapshot, and a --gpu run restores its devices from one: neither
+            // can boot cold without it.
+            if lifecycle.is_prepare() || !args.gpu.is_empty() {
+                bail!(
+                    "the pre-start snapshot {key}'s guest holds {volume}/{path}, which this \
+                     run's read-only map of {volume} lacks; map a directory that holds it"
+                );
+            }
+            info!(
+                snapshot_key = %key,
+                volume = %volume,
+                path = %path,
+                missing = unservable.len(),
+                "the pre-start snapshot's guest holds a file this run's read-only map lacks; \
+                 booting cold and taking no snapshot"
+            );
+            on_disk_dir_staging(&mut disk_dir_staging, |s| s.stage()).await?;
         }
-        // The cold boot builds each read-only --disk-dir image from a private copy, and
-        // refuses one whose content is no longer what the key names.
-        on_disk_dir_staging(&mut disk_dir_staging, |s| s.stage()).await?;
-        (Some(config), Some(key), Some(startup_base), prepare_target)
+        if unservable.is_empty() {
+            info!(
+                snapshot_key = %key,
+                image = %args.image,
+                startup_snapshot_key = %startup_key,
+                "Snapshot miss, will create snapshot after image load"
+            );
+            failpoint::hit_async("cache.miss").await;
+            // A cold boot's first snapshot is a full one. A prepare fails without its startup
+            // snapshot and a --gpu run without its pre-start snapshot, so both are refused here
+            // when it cannot fit. Any other run only skips caching when its snapshot is refused.
+            if let Some(target) = prepare_target.as_mut() {
+                target.free_at_start = check_snapshot_space_before_boot(
+                    "podman prepare's startup snapshot",
+                    args.mem,
+                    false,
+                    Some(target),
+                )
+                .await?;
+            } else if !args.gpu.is_empty() {
+                check_snapshot_space_before_boot(
+                    "the pre-start snapshot that --gpu restores with its devices attached",
+                    args.mem,
+                    false,
+                    None,
+                )
+                .await?;
+            }
+            // The cold boot builds each read-only --disk-dir image from a private copy, and
+            // refuses one whose content is no longer what the key names.
+            on_disk_dir_staging(&mut disk_dir_staging, |s| s.stage()).await?;
+        }
+        if unservable.is_empty() {
+            (Some(config), Some(key), Some(startup_base), prepare_target)
+        } else {
+            (None, None, None, None)
+        }
     } else {
         if std::env::var("FCVM_NO_SNAPSHOT")
             .map(|v| !v.is_empty())
@@ -2170,8 +2294,7 @@ async fn prepare_vm_for_lifecycle(
     // the cause (observed as "VolumeServer failed to signal ready: channel
     // closed"), so refuse it here where the path can still be named.
     paths::check_socket_path_budget(&vm_id)?;
-    let data_dir = paths::vm_runtime_dir(&vm_id);
-    tokio::fs::create_dir_all(&data_dir)
+    let data_dir = paths::create_vm_runtime_dir(&vm_id)
         .await
         .context("creating VM data directory")?;
 
@@ -2187,6 +2310,7 @@ async fn prepare_vm_for_lifecycle(
     // Instead, env is passed directly to MMDS at VM start time
     let mut vm_state = VmState::new(vm_id.clone(), args.image.clone(), args.cpu, args.mem);
     vm_state.name = Some(vm_name.clone());
+    vm_state.confinement = decision.confinement().cloned();
     vm_state.config.volumes = args.map.clone();
     vm_state.config.health_check_url = args.health_check.clone();
     vm_state.config.health_check_timeout = args.health_check_timeout;
@@ -2251,8 +2375,29 @@ async fn prepare_vm_for_lifecycle(
         );
     }
 
+    // A VM that publishes ports on a loopback address of its own leases the address
+    // before its first state is written, so that state carries it and no state of the VM
+    // is ever listed without the address its ports are on.
+    let leases_loopback_ip = match args.network {
+        NetworkMode::Rootless => true,
+        NetworkMode::Routed => RoutedNetwork::mappings_need_loopback_ip(&port_mappings),
+        NetworkMode::Bridged => false,
+    };
+    let loopback_lease = if leases_loopback_ip {
+        Some(
+            state_manager
+                .lease_loopback_ip_for_claim(&mut vm_state)
+                .context("allocating loopback IP")?,
+        )
+    } else {
+        None
+    };
+
     // The VM's first state is written here, under its name, and refused when a live
-    // VM already has that name. Every error from here on removes the state again.
+    // VM already has that name. Every error from here on removes the state again. It
+    // records the VM's runtime directory from the start: every reader of a running VM's
+    // directory (exec, health, the memory server's failure note) takes it from there.
+    vm_state.config.vm_runtime_dir = Some(data_dir.clone());
     if let Err(e) = state_manager
         .claim_name(&mut vm_state)
         .await
@@ -2260,6 +2405,10 @@ async fn prepare_vm_for_lifecycle(
     {
         cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
         return Err(e);
+    }
+    // The state holds the address now, and gives it back when it is deleted.
+    if let Some(lease) = loopback_lease {
+        lease.keep();
     }
 
     // Bridged and routed re-derive this from the namespace they reserve (see
@@ -2308,21 +2457,19 @@ async fn prepare_vm_for_lifecycle(
                 net.preflight_check()
                     .context("routed mode preflight check failed")?;
                 if net.needs_loopback_ip() {
-                    let loopback_ip = state_manager
-                        .allocate_loopback_ip(&mut vm_state)
-                        .await
-                        .context("allocating loopback IP for routed mode")?;
+                    let loopback_ip = vm_state.config.network.loopback_ip.clone().context(
+                        "a routed VM with a port on its loopback address has no address \
+                         leased before its name claim",
+                    )?;
                     net = net.with_loopback_ip(loopback_ip);
                 }
                 Box::new(net)
             }
             NetworkMode::Rootless => {
-                // For rootless mode, allocate loopback IP atomically with state persistence
-                // This prevents race conditions when starting multiple VMs concurrently
-                let loopback_ip = state_manager
-                    .allocate_loopback_ip(&mut vm_state)
-                    .await
-                    .context("allocating loopback IP")?;
+                // Leased before the name claim, whose state write carries it.
+                let loopback_ip = vm_state.config.network.loopback_ip.clone().context(
+                    "a rootless VM has no loopback address leased before its name claim",
+                )?;
 
                 // --dns reaches pasta as well as the guest: naming the pasta
                 // gateway as the resolver means "the service on host
@@ -2384,7 +2531,7 @@ async fn prepare_vm_for_lifecycle(
             let absolute_dir = socket_path
                 .parent()
                 .expect("a custom vsock socket path always has a parent");
-            tokio::fs::create_dir_all(absolute_dir)
+            crate::paths::ensure_dir_async(absolute_dir)
                 .await
                 .with_context(|| format!("creating vsock dir: {:?}", absolute_dir))?;
             Ok(socket_path)
@@ -2616,6 +2763,7 @@ async fn prepare_vm_for_lifecycle(
     // Run the main VM setup in a helper to ensure cleanup on error
     let setup_result = run_vm_setup(
         VmSetupParams {
+            decision: decision.clone(),
             args: &args,
             vm_id: &vm_id,
             data_dir: &data_dir,
@@ -4029,7 +4177,12 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     spawn_lifecycle_signal_handler("cancelling podman prepare")?;
 
     let record = !args.no_record_working_set;
+    // The recording clone is another VMM start: it asks for the prepare's confinement.
     let ready_timeout = std::time::Duration::from_secs(args.ready_timeout);
+    let recording = Recording {
+        timeout: ready_timeout,
+        confine: args.run.confine,
+    };
     let lifecycle = PodmanLifecycle::Prepare(PrepareOptions {
         tag: args.tag,
         force: args.force,
@@ -4038,7 +4191,7 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     match prepare_vm_for_lifecycle(args.run, lifecycle.clone()).await? {
         VmPreparation::Prepared(prepared) => {
             if record {
-                record_working_set(&prepared.output.snapshot_key, ready_timeout, &cancel).await;
+                record_working_set(&prepared.output.snapshot_key, &recording, &cancel).await;
             }
             publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
         }
@@ -4074,7 +4227,7 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
             };
             let prepared = finish_prepare(operation, cleanup)?;
             if record {
-                record_working_set(&prepared.output.snapshot_key, ready_timeout, &cancel).await;
+                record_working_set(&prepared.output.snapshot_key, &recording, &cancel).await;
             }
             publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
         }
@@ -4090,11 +4243,17 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
 /// `snapshot run --exec true` through a memory server (`FCVM_FORCE_UFFD`), whose server
 /// writes the clone's faults beside the snapshot when it stops, and the clone is torn down.
 /// A recording that fails is logged and the prepare still succeeds: the set is a hint.
-async fn record_working_set(
-    snapshot_key: &str,
+/// How a prepare's working-set recording clone runs.
+#[derive(Clone, Copy)]
+struct Recording {
+    /// How long the clone has to become ready.
     timeout: std::time::Duration,
-    cancel: &CancellationToken,
-) {
+    /// The prepare's --confine, which the clone, another VMM start, asks for too.
+    confine: bool,
+}
+
+async fn record_working_set(snapshot_key: &str, recording: &Recording, cancel: &CancellationToken) {
+    let Recording { timeout, confine } = *recording;
     let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
     if recorded_pages(&snapshot_dir) > 0 {
         info!(
@@ -4104,7 +4263,7 @@ async fn record_working_set(
         return;
     }
     let started = std::time::Instant::now();
-    match recording_restore(snapshot_key, timeout, cancel).await {
+    match recording_restore(snapshot_key, timeout, confine, cancel).await {
         Ok(()) if recorded_pages(&snapshot_dir) > 0 => info!(
             snapshot_key,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -4130,10 +4289,11 @@ async fn record_working_set(
 async fn recording_restore(
     snapshot_key: &str,
     timeout: std::time::Duration,
+    confine: bool,
     cancel: &CancellationToken,
 ) -> Result<()> {
     let exe = std::env::current_exe().context("locating the fcvm binary")?;
-    let mut command = recording_restore_command(&exe, snapshot_key, &recording_vm_name());
+    let mut command = recording_restore_command(&exe, snapshot_key, &recording_vm_name(), confine);
     run_recording(&mut command, timeout, cancel).await
 }
 
@@ -4188,6 +4348,7 @@ fn recording_restore_command(
     exe: &std::path::Path,
     snapshot_key: &str,
     name: &str,
+    confine: bool,
 ) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(exe);
     command
@@ -4200,6 +4361,7 @@ fn recording_restore_command(
             name,
         ])
         .args(["--exec", "true"])
+        .args(confine.then_some("--confine"))
         .env("FCVM_FORCE_UFFD", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -4234,6 +4396,22 @@ pub(crate) fn launch_ipv6_prefix(args: &RunArgs) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `--setup` never boots fcvm setup's unconfined VM for a confined run.
+    #[test]
+    fn a_confined_run_never_builds_the_rootfs() {
+        let confined = crate::confine::Decision::for_test(Some(crate::confine::Confinement {
+            landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
+            layers: vec![crate::confine::Layer::Process],
+            core_limit: 1,
+            seccomp: None,
+        }));
+        let unconfined = crate::confine::Decision::for_test(None);
+        assert!(!super::setup_may_boot_its_vm(true, &confined));
+        assert!(super::setup_may_boot_its_vm(true, &unconfined));
+        assert!(!super::setup_may_boot_its_vm(false, &unconfined));
+    }
+
     use super::*;
     use crate::cli::args::{ImageMode as CliImageMode, NetworkMode};
     use crate::firecracker::ImageMode;
@@ -4259,13 +4437,39 @@ mod tests {
         );
     }
 
+    /// A confined prepare's working-set recording clone is another VMM start: it asks for
+    /// the same confinement.
+    #[test]
+    fn a_confined_prepare_records_with_a_confined_clone() {
+        let args = |confine| -> Vec<String> {
+            recording_restore_command(Path::new("/bin/fcvm"), "snap", "record-1-snap", confine)
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(args(true).last().map(String::as_str), Some("--confine"));
+        assert!(!args(false).iter().any(|a| a == "--confine"));
+        let source = include_str!("mod.rs");
+        let prepare = &source[source.find("pub async fn cmd_podman_prepare(").unwrap()..];
+        let prepare = &prepare[..prepare.find("\n}\n").unwrap()];
+        assert!(prepare.contains("confine: args.run.confine,"));
+        assert_eq!(
+            prepare
+                .matches("record_working_set(&prepared.output.snapshot_key, &recording, &cancel)")
+                .count(),
+            2
+        );
+    }
+
     /// The recording restore is `snapshot run --snapshot <key> --exec true` of this binary
     /// through a memory server, with its stdout discarded, and a prepare runs it before it
     /// publishes, on a cache hit and after a cold or restored boot alike, unless told not
     /// to (#955).
     #[test]
     fn a_prepare_records_its_snapshots_working_set_before_it_publishes() {
-        let command = recording_restore_command(Path::new("/bin/fcvm"), "snap", "record-1-snap");
+        let command =
+            recording_restore_command(Path::new("/bin/fcvm"), "snap", "record-1-snap", false);
         let std = command.as_std();
         let args: Vec<_> = std
             .get_args()
@@ -4463,6 +4667,7 @@ mod tests {
             pmem_devices: vec![],
             resolved_extra_disks: None,
             no_swap: false,
+            confine: false,
         }
     }
 
@@ -4571,6 +4776,21 @@ mod tests {
         let gpu = snapshot_restore_args(&args, "k", Some("k".to_string()), (None, None));
         assert_eq!(gpu.startup_snapshot_base_key, None);
         assert_eq!(gpu.gpu, ["0000:01:00.0"]);
+    }
+
+    /// A pre-start snapshot is shared by runs that map one guest path read-only from
+    /// different host directories (its key holds no read-only host path, #2239), so a hit
+    /// serves each read-only map from this run's own directory, through `snapshot run --map`.
+    /// A read-write map is not moved: its host path is in the key, so it is the snapshot's.
+    #[test]
+    fn a_pre_start_hit_serves_the_runs_own_read_only_maps() {
+        let mut args = test_args();
+        args.map = vec![
+            "/run/b/cfg:/root/.config/fcvm:ro".to_string(),
+            "/data:/data".to_string(),
+        ];
+        let restore = snapshot_restore_args(&args, "k", Some("k".to_string()), (None, None));
+        assert_eq!(restore.map, ["/run/b/cfg:/root/.config/fcvm:ro"]);
     }
 
     /// A cache hit restores through `snapshot run`, where a clone chooses where it
@@ -4753,7 +4973,7 @@ mod tests {
     /// #1183: a launch records its runtime directory with its owner before anything in
     /// it exists (the --disk-dir staging, then the directory itself), and reclaims what
     /// killed launches left before it records anything. A launch killed in between
-    /// leaves the directory to the next launch only if the record comes first.
+    /// leaves the directory to the next sweep only if the record comes first.
     #[test]
     fn a_launch_records_its_runtime_dir_before_creating_it() {
         let source = include_str!("mod.rs");
@@ -4764,11 +4984,11 @@ mod tests {
             body.find(needle)
                 .unwrap_or_else(|| panic!("prepare_vm_for_lifecycle has no {needle:?}"))
         };
-        let reclaimed = at("crate::reclaim::reclaim_abandoned().await");
+        let reclaimed = at("crate::reclaim::reclaim_abandoned_if_due().await");
         let owned = at("crate::reclaim::Owner::begin(&vm_id)?");
         let recorded = at("crate::reclaim::Resource::RuntimeDir {");
         let staged = at("DiskDirStaging::resolve(");
-        let created = at("tokio::fs::create_dir_all(&data_dir)");
+        let created = at("paths::create_vm_runtime_dir(&vm_id)");
         assert!(
             reclaimed < owned && owned < recorded,
             "the launch must reclaim, then begin its owner, then record"
@@ -4776,6 +4996,11 @@ mod tests {
         assert!(
             recorded < staged && recorded < created,
             "the runtime directory is created before it is recorded"
+        );
+        assert!(
+            created < staged,
+            "the --disk-dir staging makes the VM's bucket itself, with this process's owner \
+             and umask, unless the runtime directory (and its bucket) is made first"
         );
 
         // The same order in a restore.
@@ -4787,14 +5012,39 @@ mod tests {
             body.find(needle)
                 .unwrap_or_else(|| panic!("cmd_snapshot_run_inner has no {needle:?}"))
         };
-        let reclaimed = at("crate::reclaim::reclaim_abandoned().await");
+        let reclaimed = at("crate::reclaim::reclaim_abandoned_if_due().await");
         let owned = at("crate::reclaim::Owner::begin(&vm_id)?");
         let recorded = at("crate::reclaim::Resource::RuntimeDir {");
-        let created = at("tokio::fs::create_dir_all(&data_dir)");
+        let created = at("paths::create_vm_runtime_dir(&vm_id)");
         assert!(
             reclaimed < owned && owned < recorded && recorded < created,
             "a restore must reclaim, begin its owner and record its runtime directory, in \
              that order, before creating the directory"
+        );
+    }
+
+    /// A VM leases its loopback address before it claims its name, so no state of it is
+    /// ever written without the address its ports are on. Nothing after the claim leases
+    /// one.
+    #[test]
+    fn a_vm_leases_its_loopback_address_before_its_name_claim() {
+        let source = include_str!("mod.rs");
+        let body = &source[source.find("async fn prepare_vm_for_lifecycle(").unwrap()..];
+        let lease = body
+            .find(".lease_loopback_ip_for_claim(&mut vm_state)")
+            .expect("podman run leases the VM's loopback address");
+        let claim = body
+            .find(".claim_name(&mut vm_state)")
+            .expect("podman run claims the VM's name");
+        let kept = body.find("lease.keep();").expect("the lease is kept");
+        assert!(lease < claim && claim < kept);
+        let end = claim
+            + body[claim..]
+                .find("\nasync fn ")
+                .unwrap_or(body.len() - claim);
+        assert!(
+            !body[claim..end].contains("allocate_loopback_ip("),
+            "an address leased after the name claim is in no state until the next write"
         );
     }
 
@@ -7517,12 +7767,12 @@ mod tests {
             512,
         );
         state_manager.save_state(&vm_state).await.unwrap();
-        assert!(state_dir.join("vm-test-cleanup.json").exists());
+        assert!(state_manager.state_file("vm-test-cleanup").exists());
 
         cleanup_failed_prepare(&state_manager, "vm-test-cleanup", &data_dir).await;
 
         assert!(
-            !state_dir.join("vm-test-cleanup.json").exists(),
+            !state_manager.state_file("vm-test-cleanup").exists(),
             "state file should be removed after a failed prepare"
         );
         assert!(
@@ -7727,6 +7977,20 @@ mod restore_fault_classifier_tests {
         assert_eq!(classify("some other failure"), RestoreFault::Other);
     }
 
+    /// A cached Cloud Hypervisor snapshot that another build wrote (a binary named by
+    /// `FCVM_CLOUD_HYPERVISOR_BIN`, or on PATH, replaced in place: the key holds its path,
+    /// which did not change) is deleted and the run boots fresh. Unclassified, every later
+    /// run of that image failed on the same entry until someone deleted it by hand.
+    #[test]
+    fn a_cloud_hypervisor_snapshot_of_another_build_is_an_unusable_snapshot() {
+        let refusal = format!(
+            "this snapshot was written by `cloud-hypervisor v1` and this host runs \
+             `cloud-hypervisor v2` (/opt/ch): {}. Create the snapshot again",
+            crate::commands::common::CH_SNAPSHOT_OF_ANOTHER_BUILD
+        );
+        assert_eq!(classify(&refusal), RestoreFault::UnusableSnapshot);
+    }
+
     /// A format or version rejection is the artifact: it can never load with this binary.
     #[test]
     fn a_format_rejection_is_an_unusable_snapshot() {
@@ -7740,6 +8004,12 @@ mod restore_fault_classifier_tests {
              state from file: Failed to load snapshot state from file: CRC64 validation failed",
             "Load snapshot error: Failed to restore from snapshot: Invalid snapshot state: \
              No DRAM memory region defined.",
+            "Load snapshot error: Failed to restore from snapshot: Failed to get snapshot \
+             state from file: Failed to load snapshot state from file: Invalid data version: \
+             the snapshot has no layout mark, so another Firecracker build wrote it",
+            "Load snapshot error: Failed to restore from snapshot: Failed to get snapshot \
+             state from file: Failed to load snapshot state from file: Invalid data version: \
+             the snapshot's state has layout 2 and this build reads layout 1",
         ] {
             assert_eq!(classify(text), RestoreFault::UnusableSnapshot, "{text}");
         }

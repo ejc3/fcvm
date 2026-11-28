@@ -17,7 +17,7 @@ import { streamBitrate } from "./bandwidth.ts";
 import * as fmt from "./format.ts";
 import { frameSocketUrl, mirrorSocketUrl, streamUrl } from "./net.ts";
 import { megabytes, mbits } from "./meter.ts";
-import { sameViewer, type Admission, type PhoneTile, type Phones, type Tile } from "./protocol.ts";
+import { sameViewer, type Admission, type GpuInfo, type VmStats, type PhoneTile, type Phones, type Tile } from "./protocol.ts";
 import { serverNow } from "./clock.ts";
 import type { ClientState, Notice } from "./store.ts";
 import {
@@ -40,6 +40,19 @@ export const NO_PHONES = "This fleet runs no phones.";
 
 /** A phone's screen, width over height (720 x 1280). */
 export const PHONE_ASPECT = 720 / 1280;
+/** How far a stream's picture may stray from the phone's screen shape before the page draws it as
+ *  another shape. The page asks each stream at the size it draws, and the encoder rounds that size to
+ *  whole pixels, so the first frame after a resize has a width over height a few thousandths off the
+ *  last frame's (158 x 280 is 0.564, 162 x 286 is 0.566). Drawn as is, the screen, and the tap target
+ *  over it, moved by half a pixel under a click aimed a moment earlier (e2e/phones.spec.ts, 2026-11-27). */
+export const ASPECT_SNAP = 0.02;
+/** The aspect a phone's screen is drawn at, from a picture `w` wide and `h` high: the phone's own
+ *  shape, upright or turned, when the picture is within ASPECT_SNAP of it, else the picture's own. */
+export function screenAspect(w: number, h: number): number {
+  const a = w / h;
+  for (const own of [PHONE_ASPECT, 1 / PHONE_ASPECT]) if (Math.abs(a / own - 1) <= ASPECT_SNAP) return own;
+  return Math.round(a * 1000) / 1000;
+}
 
 /** The phone body around the screen, as fractions of the screen's short side. */
 export const BEZEL = {
@@ -622,11 +635,68 @@ export function readoutRows(view: TakeoverView, video: StreamReadout | null, mir
   return rows;
 }
 
+/**
+ * One live reading: `text` has fixed-width digits and `fraction` (0..1) drives a bar. A reading
+ * with a bar is a meter, named `meter.name` with `meter.valuetext` as its value; one without
+ * is plain text under its `term`.
+ */
+export interface PhoneStat {
+  key: string;
+  term: string;
+  text: string;
+  fraction: number | null;
+  meter: { name: string; valuetext: string } | null;
+}
+
+/** A reading older than this is dropped (the renderer is sampled about once a second). */
+export const STATS_STALE_MS = 5000;
+
+const pad = (n: number, w: number) => String(Math.round(n)).padStart(w, "\u2007");
+const clamp01 = (x: number) => Math.min(1, Math.max(0, x));
+const gb = (mb: number) => (Math.round((mb / 1024) * 10) / 10).toString();
+
+/**
+ * The readings of a phone, GPU first. `at` is the coordinator's receipt time, so a reading is
+ * dropped as stale only against the coordinator's clock: with `clocked` false (the page has
+ * no clock sample yet) its local clock is not trusted and every reading is shown.
+ */
+export function statsOf(g: GpuInfo | null, vm: VmStats | null, srvNow: number, clocked = true): PhoneStat[] {
+  const fresh = (at: number | null) => at === null || !clocked || srvNow - at <= STATS_STALE_MS;
+  return [...(g !== null && fresh(g.at) ? gpuStats(g) : []), ...(vm !== null && fresh(vm.at) ? vmStatsOf(vm) : [])];
+}
+
+function vmStatsOf(vm: VmStats): PhoneStat[] {
+  const n = `${vm.vcpus} vCPU${vm.vcpus === 1 ? "" : "s"}`;
+  return [
+    { key: "vm-cpu", term: "CPU", text: `${pad(vm.cpu_pct, 3)} %  ${n}`, fraction: clamp01(vm.cpu_pct / 100), meter: { name: "CPU", valuetext: `${Math.round(vm.cpu_pct)} percent of ${n}` } },
+  ];
+}
+
+function gpuStats(g: GpuInfo): PhoneStat[] {
+  const out: PhoneStat[] = [];
+  if (g.util_pct !== null) out.push({ key: "gpu-util", term: "GPU", text: `${pad(g.util_pct, 3)} %`, fraction: clamp01(g.util_pct / 100), meter: { name: "GPU utilisation", valuetext: `${Math.round(g.util_pct)} percent` } });
+  if (g.temp_c !== null) out.push({ key: "gpu-temp", term: "Temperature", text: `${pad(g.temp_c, 3)} \u00b0C`, fraction: null, meter: null });
+  if (g.power_w !== null) out.push({ key: "gpu-power", term: "Power", text: `${pad(g.power_w, 3)} W`, fraction: null, meter: null });
+  if (g.mem_used_mb !== null) {
+    const total = g.mem_total_mb !== null && g.mem_total_mb > 0 ? g.mem_total_mb : null;
+    out.push({
+      key: "gpu-mem",
+      term: "GPU memory",
+      text: total === null ? `${pad(g.mem_used_mb, 5)} MB` : `${pad(g.mem_used_mb, 5)} of ${pad(total, 5)} MB`,
+      fraction: total === null ? null : clamp01(g.mem_used_mb / total),
+      meter: total === null ? null : { name: "GPU memory", valuetext: `${gb(g.mem_used_mb)} of ${gb(total)} GB` },
+    });
+  }
+  return out;
+}
+
 export interface PhonePanel {
   id: string;
   title: string;
   state: string;
   rows: { term: string; value: string }[];
+  /** Live readings, one row each; a reading the phone does not report has no row. */
+  stats: PhoneStat[];
   restoreTitle: string;
   restoreTotal: string;
   restoreNote: string;
@@ -819,7 +889,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
   const aspects: Record<string, number> = {};
   for (const t of phones.tiles) {
     const fs = s.frames?.tiles[`d:${t.id}`];
-    if (fs && fs.width > 0 && fs.height > 0 && fs.newestT !== null) aspects[t.id] = Math.round((fs.width / fs.height) * 1000) / 1000;
+    if (fs && fs.width > 0 && fs.height > 0 && fs.newestT !== null) aspects[t.id] = screenAspect(fs.width, fs.height);
   }
   // The phone this viewer holds, opened with the GPU mirror in view: side by side with its video
   // ("both"), or in the video's place ("mirror").
@@ -827,7 +897,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
   const mp = inp.mirrorPicture ?? null;
   const shown = (p: MirrorPicture) => p.h - (p.banded ? STAMP_ROWS : 0);
   // with the mirror alone there is no video to say what shape the screen is: the mirror says
-  if (takeover === "mirror" && mp && mp.w > 0 && shown(mp) > 0) aspects[mp.id] = Math.round((mp.w / shown(mp)) * 1000) / 1000;
+  if (takeover === "mirror" && mp && mp.w > 0 && shown(mp) > 0) aspects[mp.id] = screenAspect(mp.w, shown(mp));
   const heldTile = open === null ? null : (phones.tiles.find((t) => t.id === open && t.borrowed !== null && sameViewer(t.borrowed.viewer ?? null, s.you)) ?? null);
   const mirrorView = heldTile !== null && heldTile.borrowed?.session !== undefined && takeover !== "video" ? takeover : null;
   const opened = open !== null && stage ? openedArea(stage, inp.narrow) : null;
@@ -995,6 +1065,7 @@ function panelOf(
   return {
     id: t.id,
     title: phoneName(t),
+    stats: running ? statsOf(g, t.vm_stats, srvNow, s.clock.offsetMs !== null) : [],
     state: running ? (restored && !restored.restoring ? restored.text : "streaming") : restored?.text ?? phaseText(t.phase),
     rows: [
       { term: "GPU", value: g?.name ?? "none yet" },

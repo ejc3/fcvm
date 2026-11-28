@@ -307,3 +307,81 @@ fn snapshot_import_takes_no_tag_and_needs_a_file_for_input() {
         ErrorKind::UnknownArgument
     );
 }
+
+/// A command that needs the config, run with a config that will not load, returns an error:
+/// exit status 1 and the reason on stderr, not a panic (exit status 101). A runner that reads
+/// fcvm's exit status (www_sim's VM runner) cannot tell a panic from a crash.
+///
+/// The config is made unloadable with a relative FCVM_CONFIG_DIR, which the lookup refuses
+/// before any fallback, so the result does not depend on the build profile (a debug binary
+/// also searches its CARGO_MANIFEST_DIR) or on a system config in /etc/fcvm.
+#[test]
+fn a_config_that_will_not_load_is_an_error_not_a_panic() {
+    let fcvm_path = common::find_fcvm_binary().expect("fcvm binary not found");
+    let output = Command::new(&fcvm_path)
+        .args(["ls", "--json"])
+        .env("FCVM_CONFIG_DIR", "relative-config-dir")
+        .env_remove("FCVM_DATA_DIR")
+        .output()
+        .expect("failed to run fcvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("FCVM_CONFIG_DIR must be absolute"),
+        "stderr: {stderr}"
+    );
+}
+
+/// `fcvm paths --json` prints the directories `fcvm::paths` resolves, as one JSON object: the
+/// data directory FCVM_DATA_DIR names and its state directory (`paths::state_dir`: the
+/// `state` directory of the runtime directory `fcvm::runtime_dir::locate` names for that data
+/// directory; here a named base, FCVM_RUNTIME_DIR, so the answer does not depend on the
+/// host's /run). It reads no VM state and makes nothing: the data directory and the base are
+/// still empty afterwards.
+#[test]
+fn paths_prints_the_directories_the_path_functions_resolve() {
+    let fcvm_path = common::find_fcvm_binary().expect("fcvm binary not found");
+    let data = tempfile::tempdir().expect("temporary data directory");
+    let base = tempfile::tempdir().expect("temporary runtime base");
+    let output = Command::new(&fcvm_path)
+        .args(["paths", "--json"])
+        .env("FCVM_DATA_DIR", data.path())
+        .env("FCVM_RUNTIME_DIR", base.path())
+        .output()
+        .expect("failed to run fcvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "one JSON line, got: {stdout}");
+    let value: serde_json::Value = serde_json::from_str(lines[0]).expect("a JSON object");
+    assert_eq!(
+        value["data_dir"],
+        data.path().to_str().expect("UTF-8 temp path"),
+        "{stdout}"
+    );
+    let host = fcvm::runtime_dir::Host::current().expect("this host's boot id and uid");
+    let runtime = fcvm::runtime_dir::locate(
+        Some(base.path().as_os_str().to_owned()),
+        None,
+        data.path(),
+        std::path::Path::new("/run"),
+        &host,
+    );
+    assert_eq!(
+        value["state_dir"],
+        runtime.dir.join("state").to_str().expect("UTF-8 temp path"),
+        "{stdout}"
+    );
+    for dir in [data.path(), base.path()] {
+        let made: Vec<_> = std::fs::read_dir(dir)
+            .expect("read the directory")
+            .collect();
+        assert!(
+            made.is_empty(),
+            "fcvm paths created {made:?} in {}",
+            dir.display()
+        );
+    }
+}

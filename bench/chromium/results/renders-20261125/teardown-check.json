@@ -1,0 +1,176 @@
+{
+ "rows": [
+  {
+   "stage": "start",
+   "signal": "KILL",
+   "ended_s": 0.05,
+   "running_at_the_kill": {
+    "processes": 2,
+    "namespaces": 0,
+    "clones": 0
+   },
+   "reaper_found": {
+    "cgroups_populated": 0,
+    "owners": 0,
+    "resources": 0,
+    "sockets": 0
+   },
+   "left": {}
+  },
+  {
+   "stage": "cgroups",
+   "signal": "KILL",
+   "ended_s": 0.05,
+   "running_at_the_kill": {
+    "processes": 2,
+    "namespaces": 0,
+    "clones": 0
+   },
+   "reaper_found": {
+    "cgroups_populated": 0,
+    "owners": 0,
+    "resources": 0,
+    "sockets": 0
+   },
+   "left": {}
+  },
+  {
+   "stage": "replays",
+   "signal": "KILL",
+   "ended_s": 0.05,
+   "running_at_the_kill": {
+    "processes": 10,
+    "namespaces": 0,
+    "clones": 0
+   },
+   "reaper_found": {
+    "cgroups_populated": 1,
+    "owners": 0,
+    "resources": 0,
+    "sockets": 0
+   },
+   "left": {}
+  },
+  {
+   "stage": "serve-starting",
+   "signal": "KILL",
+   "ended_s": 0.05,
+   "running_at_the_kill": {
+    "processes": 10,
+    "namespaces": 0,
+    "clones": 0
+   },
+   "reaper_found": {
+    "cgroups_populated": 1,
+    "owners": 0,
+    "resources": 0,
+    "sockets": 0
+   },
+   "left": {}
+  },
+  {
+   "stage": "serve",
+   "signal": "KILL",
+   "ended_s": 0.05,
+   "running_at_the_kill": {
+    "processes": 11,
+    "namespaces": 0,
+    "clones": 1
+   },
+   "reaper_found": {
+    "cgroups_populated": 2,
+    "owners": 0,
+    "resources": 0,
+    "sockets": 1
+   },
+   "left": {}
+  },
+  {
+   "stage": "engines-starting",
+   "signal": "KILL",
+   "ended_s": 0.05,
+   "running_at_the_kill": {
+    "processes": 11,
+    "namespaces": 0,
+    "clones": 1
+   },
+   "reaper_found": {
+    "cgroups_populated": 2,
+    "owners": 0,
+    "resources": 0,
+    "sockets": 1
+   },
+   "left": {}
+  },
+  {
+   "stage": "engines",
+   "signal": "KILL",
+   "ended_s": 0.11,
+   "running_at_the_kill": {
+    "processes": 27,
+    "namespaces": 0,
+    "clones": 1
+   },
+   "reaper_found": {
+    "cgroups_populated": 3,
+    "owners": 0,
+    "resources": 0,
+    "sockets": 1
+   },
+   "left": {}
+  },
+  {
+   "stage": "workers",
+   "signal": "KILL",
+   "ended_s": 0.11,
+   "running_at_the_kill": {
+    "processes": 49,
+    "namespaces": 0,
+    "clones": 1
+   },
+   "reaper_found": {
+    "cgroups_populated": 3,
+    "owners": 0,
+    "resources": 0,
+    "sockets": 1
+   },
+   "left": {}
+  },
+  {
+   "stage": "running",
+   "signal": "KILL",
+   "ended_s": 0.21,
+   "running_at_the_kill": {
+    "processes": 55,
+    "namespaces": 6,
+    "clones": 251
+   },
+   "reaper_found": {
+    "cgroups_populated": 3,
+    "owners": 6,
+    "resources": 6,
+    "sockets": 1
+   },
+   "left": {}
+  },
+  {
+   "stage": "running",
+   "signal": "TERM",
+   "ended_s": 0.21,
+   "running_at_the_kill": {
+    "processes": 55,
+    "namespaces": 6,
+    "clones": 255
+   },
+   "reaper_found": {
+    "cgroups_populated": 3,
+    "owners": 6,
+    "resources": 6,
+    "sockets": 1
+   },
+   "left": {}
+  }
+ ],
+ "stages": 10,
+ "with_something_left": 0
+}

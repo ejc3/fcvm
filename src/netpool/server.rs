@@ -17,7 +17,7 @@ use crate::network::{netns_agent, NetworkManager, PastaNetwork};
 use anyhow::{bail, Context, Result};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -28,8 +28,9 @@ use tracing::{info, warn};
 
 /// The least time between two namespaces destroyed. The kernel destroys the namespaces that
 /// died since its cleanup worker last ran as one batch under `rtnl_mutex`; this keeps a
-/// batch at one namespace, which is one hold of 1.5 ms, or of 15 ms on a kernel that still
-/// has the bridge's `rcu_barrier()`.
+/// batch at one namespace, which is one hold of 1.1 to 1.5 ms, or of 15 to 16 ms on a
+/// kernel that still has the bridge's `rcu_barrier()`
+/// (`bench/start-rate/pieces/RESULTS.md` changelog 9).
 pub const DESTROY_SPACING: Duration = Duration::from_millis(50);
 
 /// Namespaces built at once. A build is bound by `rtnl_mutex`, so more builders wait for
@@ -43,15 +44,19 @@ const RESET_CONCURRENCY: usize = 64;
 /// How long a connection has to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long a reset waits for the namespace to read as it did when it was built. The
-/// lease's connection closes a moment before the VMM's TAP does (both in the VMM's exit,
-/// the TAP's close behind `rtnl_mutex`), and until then the TAP has a carrier.
+/// How long a reset waits for the namespace to read as it did when it was built: what
+/// trails a link change (a route's link-down flag, pasta's TAP coming up again) settles
+/// well within it.
 const VERIFY_BUDGET: Duration = Duration::from_secs(2);
 
 /// How long a failed build waits before the next attempt.
 const REBUILD_DELAY: Duration = Duration::from_secs(1);
 /// The pause after a failed `accept`.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+/// How often, and how far apart, a pool that is starting asks again for the host's IPv6
+/// address when the probe fails.
+const HOST_PROBE_TRIES: u32 = 20;
+const HOST_PROBE_PAUSE: Duration = Duration::from_millis(250);
 /// The least time between two reports of a claim for another key.
 const KEY_MISS_REPORT: Duration = Duration::from_secs(30);
 
@@ -105,6 +110,9 @@ struct Namespace {
     network: PastaNetwork,
     user_namespace: std::fs::File,
     net_namespace: std::fs::File,
+    /// The queue the TAP is attached by: a copy of the one the holder keeps. Every lease
+    /// gets a copy for its VMM.
+    tap: OwnedFd,
     /// The fingerprint taken when the build finished.
     built_as: String,
     pid_dir: PathBuf,
@@ -113,7 +121,10 @@ struct Namespace {
 /// The network every namespace of a pool is built from: a restored clone's, with no
 /// published port. Its [`PastaNetwork::pool_key`] is the pool's key.
 fn slot_network(vm_id: String, pid_dir: PathBuf) -> PastaNetwork {
-    PastaNetwork::new(vm_id, proto::TAP.to_string(), Vec::new()).with_pid_dir(pid_dir)
+    PastaNetwork::new(vm_id, proto::TAP.to_string(), Vec::new())
+        .with_pid_dir(pid_dir)
+        .with_attached_tap()
+        .with_control_socket()
 }
 
 impl Namespace {
@@ -152,21 +163,23 @@ impl Namespace {
                 std::fs::File::open(&path).with_context(|| format!("opening {path}"))
             };
             let (user_namespace, net_namespace) = (open("user")?, open("net")?);
+            let tap = agent.queue().await.context("getting the TAP's queue")?;
             let built_as = agent
                 .fingerprint(proto::TAP)
                 .await
                 .context("taking the fingerprint")?;
-            Ok::<_, anyhow::Error>((agent, user_namespace, net_namespace, built_as))
+            Ok::<_, anyhow::Error>((agent, user_namespace, net_namespace, tap, built_as))
         }
         .await;
         match built {
-            Ok((agent, user_namespace, net_namespace, built_as)) => Ok(Self {
+            Ok((agent, user_namespace, net_namespace, tap, built_as)) => Ok(Self {
                 holder,
                 holder_pid,
                 agent,
                 network,
                 user_namespace,
                 net_namespace,
+                tap,
                 built_as,
                 pid_dir,
             }),
@@ -214,50 +227,37 @@ impl Namespace {
                 self.user_namespace.as_raw_fd(),
                 self.net_namespace.as_raw_fd(),
                 lessee_end.as_raw_fd(),
+                self.tap.as_raw_fd(),
             ],
         )
         .context("sending the grant")?;
         proto::watch(offer.connection).context("watching the lease")
     }
 
-    /// After a lease: wait until nothing is attached to the VMM's TAP, restart pasta, have
-    /// the holder remove what a VM's use leaves, and check the namespace against its
-    /// fingerprint. An error means it must not be lent again.
+    /// After a lease: have pasta forget the guest, have the holder remove what a VM's use
+    /// leaves, and check the namespace against its fingerprint. An error means it must not
+    /// be lent again.
     ///
-    /// The wait comes first. While a process is attached to the TAP it can send frames,
-    /// and what a frame leaves in the kernel shows in the fingerprint but what it leaves in
-    /// pasta does not: a flow, the MAC and the address pasta learns. So the pasta that
-    /// serves the next VM is started only after the last writer is gone, and cleaning
-    /// happens after that. A TAP that still has a carrier at the end of the budget gets
-    /// the namespace destroyed.
+    /// The lease's end is what says the VMM is gone. The TAP is attached by its holder
+    /// for the namespace's whole life, so its carrier cannot say whether a VMM still has the
+    /// queue, as it could while a VMM attached by name. The queue goes to the VMM alone,
+    /// together with the lease, and is close-on-exec in every other process.
     async fn reset(&mut self) -> Result<()> {
         failpoint::hit_async("pool.pre_reset").await;
-        let deadline = tokio::time::Instant::now() + VERIFY_BUDGET;
-        let mut pause = Duration::from_millis(1);
-        while self
-            .agent
-            .carrier(proto::TAP)
-            .await
-            .context("reading the TAP's carrier")?
-        {
-            if tokio::time::Instant::now() >= deadline {
-                bail!(
-                    "a process is still attached to the namespace's TAP, {VERIFY_BUDGET:?} \
-                     after its lease ended"
-                );
-            }
-            tokio::time::sleep(pause).await;
-            pause = (pause * 2).min(Duration::from_millis(50));
-        }
-        self.network.cleanup().await.context("stopping pasta")?;
+        // The namespace first, pasta second. A frame of the last tenant can still be in
+        // the kernel on its way to pasta when the lease ends; one that reaches a pasta
+        // already reset opens a new flow, and the host's answer would be framed to the
+        // next guest. With pasta reset last, such a frame has the whole of the holder's
+        // reset to arrive in and be forgotten with the rest. That is a margin, not a
+        // proof: nothing here waits for the kernel's queues to be empty.
         self.agent
             .reset()
             .await
             .context("resetting the namespace")?;
         self.network
-            .post_start(self.holder_pid)
+            .reset_pasta()
             .await
-            .context("starting pasta again")?;
+            .context("resetting pasta")?;
         let deadline = tokio::time::Instant::now() + VERIFY_BUDGET;
         let mut pause = Duration::from_millis(2);
         loop {
@@ -328,15 +328,16 @@ impl Pool {
             return;
         }
         self.key_miss_reported.set(Some(now));
+        // A probe that failed says nothing about the host: the plain report is made.
         let current = slot_network(String::new(), self.dir.clone()).pool_key_now();
-        if current != self.key {
+        if let Some(current) = current.filter(|current| *current != self.key) {
             warn!(
                 built_for = %self.key,
                 host_now = %current,
                 asked,
                 "the host has changed since this pool started (its IPv6 address, \
-                 /etc/resolv.conf or the invoking user): the pool's namespaces match no \
-                 clone started now. Restart the pool"
+                 /etc/resolv.conf, /etc/subuid, /etc/subgid or the invoking user): the \
+                 pool's namespaces match no clone started now. Restart the pool"
             );
         } else {
             warn!(
@@ -393,6 +394,13 @@ async fn lend(pool: &Pool, slot: SlotId, namespace: &mut Namespace) -> String {
         let Ok(offer) = offer else {
             return "its offer was dropped".to_string();
         };
+        // The stop and an offer can both be ready when this task runs. A grant made now
+        // would be revoked in the next statement's select, and a clone that has a grant
+        // and loses it fails, where one that is refused builds its own namespace. Dropping
+        // the offer closes the claimer's connection, which is that refusal.
+        if pool.stopping() {
+            return "the pool is stopping".to_string();
+        }
         let claimed = offer.claimed;
         let lease = match namespace.grant(slot, offer).await {
             Ok(lease) => lease,
@@ -563,6 +571,29 @@ async fn answer(pool: Rc<Pool>, connection: UnixStream) {
     }
 }
 
+/// Have the host's IPv6 address probed before the pool makes its key or builds a
+/// namespace: both use the address as this process first found it, for as long as the pool
+/// runs. A probe that failed would leave a pool whose key says the host has no address,
+/// which no clone on a host that has one ever matches. So the pool waits for an answer,
+/// five seconds at most, and does not start without one.
+async fn host_ipv6_probed() -> Result<()> {
+    let mut tries = 0;
+    loop {
+        match PastaNetwork::host_ipv6_known() {
+            Ok(()) => return Ok(()),
+            Err(error) if tries < HOST_PROBE_TRIES => {
+                tries += 1;
+                warn!(%error, tries, "probing the host's IPv6 address; trying again");
+                tokio::time::sleep(HOST_PROBE_PAUSE).await;
+            }
+            Err(error) => {
+                return Err(error)
+                    .context("probing the host's IPv6 address, which the pool's key holds")
+            }
+        }
+    }
+}
+
 fn listen(path: &Path) -> Result<AsyncFd<UnixStream>> {
     use std::os::unix::ffi::OsStrExt;
     match std::fs::remove_file(path) {
@@ -639,9 +670,37 @@ async fn accept(listener: &AsyncFd<UnixStream>) -> std::io::Result<UnixStream> {
 /// Run a pool of `slots` namespaces for this user and data directory until SIGTERM or
 /// SIGINT, then destroy them one at a time. A second signal ends the process at once, and
 /// the kernel then kills every holder and pasta with it.
+/// The deepest Unix socket a pool of `slots` namespaces binds under its directory: the
+/// control socket of the last slot's pasta.
+fn deepest_socket(dir: &Path, slots: usize) -> PathBuf {
+    dir.join("slots")
+        .join(slots.saturating_sub(1).to_string())
+        .join("pasta.ctl")
+}
+
+/// Refuse a pool directory too deep for the pool's sockets, before anything starts. A
+/// slot's pasta cannot bind a control socket longer than `sockaddr_un` holds; it reports
+/// that as a startup failure it retries, the slot never becomes ready, and every claim
+/// waits for a pool that never answers.
+fn check_socket_budget(dir: &Path, slots: usize) -> Result<()> {
+    let deepest = deepest_socket(dir, slots);
+    let length = deepest.as_os_str().len();
+    anyhow::ensure!(
+        length <= crate::paths::SUN_PATH_MAX,
+        "the runtime directory is too deep for the namespace pool's sockets: {length} bytes, \
+         limit {} (sockaddr_un.sun_path)\n  {}\n\
+         Shorten the runtime directory's base (FCVM_RUNTIME_DIR or paths.runtime_dir), or \
+         the data directory when no base is set.",
+        crate::paths::SUN_PATH_MAX,
+        deepest.display()
+    );
+    Ok(())
+}
+
 pub async fn serve(slots: usize) -> Result<()> {
     anyhow::ensure!(slots > 0, "a pool needs at least one namespace");
     let dir = proto::dir()?;
+    check_socket_budget(&dir, slots)?;
     let lock_path = proto::lock_path(&dir);
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
@@ -662,6 +721,7 @@ pub async fn serve(slots: usize) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("removing a previous pool's slot directories"),
     }
+    host_ipv6_probed().await?;
     let key = slot_network(String::new(), dir.clone()).pool_key();
     let socket_path = proto::socket_path(&dir);
     let listener = listen(&socket_path)?;
@@ -731,6 +791,138 @@ pub async fn serve(slots: usize) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A pool directory whose last slot's control socket is one byte over `sockaddr_un`
+    /// is refused, with the path and the setting to shorten; one at the limit is not.
+    #[test]
+    fn a_pool_directory_too_deep_for_its_sockets_is_refused() {
+        let suffix = "/slots/9/pasta.ctl".len();
+        let at_limit = PathBuf::from(format!(
+            "/{}",
+            "d".repeat(crate::paths::SUN_PATH_MAX - suffix - 1)
+        ));
+        check_socket_budget(&at_limit, 10).expect("a socket of exactly the limit fits");
+        let over = PathBuf::from(format!(
+            "/{}",
+            "d".repeat(crate::paths::SUN_PATH_MAX - suffix)
+        ));
+        let error = check_socket_budget(&over, 10).expect_err("one byte over is refused");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("FCVM_RUNTIME_DIR") && text.contains("pasta.ctl"),
+            "{text}"
+        );
+        assert_eq!(
+            deepest_socket(Path::new("/p"), 10),
+            Path::new("/p/slots/9/pasta.ctl")
+        );
+    }
+
+    /// The check runs before the pool starts anything: before its lock, its socket and
+    /// its slots, so a too-deep directory ends `serve` instead of a pool nobody can reach.
+    #[test]
+    fn serve_checks_the_socket_budget_before_it_starts() {
+        let source = include_str!("server.rs");
+        let serve = source
+            .split_once("pub async fn serve(slots: usize) -> Result<()> {")
+            .expect("serve")
+            .1;
+        let check = serve
+            .find("check_socket_budget(&dir, slots)?")
+            .expect("serve checks the budget");
+        let lock = serve
+            .find("proto::lock_path(&dir)")
+            .expect("serve takes the lock");
+        let listen = serve.find("listen(&socket_path)").expect("serve listens");
+        assert!(
+            check < lock && check < listen,
+            "the budget is checked first"
+        );
+    }
+
+    /// A claim that reaches a namespace's task together with the pool's stop is refused,
+    /// not granted and then revoked: the claimer's connection closes with nothing sent on
+    /// it. The offer and the stop are both made ready between two polls of `lend`, which
+    /// is the one schedule where its `biased` select takes the offer of a stopping pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_claim_that_arrives_with_the_stop_is_refused_not_granted() {
+        let scratch = tempfile::tempdir().unwrap();
+        // Without pasta, a setup asset the unit lanes do not have: nothing here needs it.
+        let mut namespace =
+            Namespace::build_with(scratch.path().join("slot"), "stop-claim".into(), false)
+                .await
+                .expect("building a namespace as the pool does");
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let pool = Pool {
+            dir: scratch.path().to_path_buf(),
+            key: String::new(),
+            table: RefCell::new(Table::new(1)),
+            offers: RefCell::new(HashMap::new()),
+            counters: RefCell::new(Stats::default()),
+            builds: tokio::sync::Semaphore::new(1),
+            resets: tokio::sync::Semaphore::new(1),
+            destroying: tokio::sync::Mutex::new(()),
+            key_miss_reported: std::cell::Cell::new(None),
+            stop,
+        };
+        pool.table.borrow_mut().built(0).unwrap();
+        let (claimer, pools_end) = netns_agent::channel().unwrap();
+        let reason = {
+            let lending = lend(&pool, 0, &mut namespace);
+            tokio::pin!(lending);
+            // One poll: `lend` registers its offer and waits.
+            tokio::select! {
+                biased;
+                reason = &mut lending => panic!("lend ended before a claim: {reason}"),
+                _ = std::future::ready(()) => {}
+            }
+            let claimed = pool
+                .table
+                .borrow_mut()
+                .claim()
+                .expect("the ready namespace");
+            let offer = pool
+                .offers
+                .borrow_mut()
+                .remove(&claimed.slot)
+                .expect("the namespace's offer");
+            assert!(offer
+                .send(Offer {
+                    connection: pools_end,
+                    claimed,
+                })
+                .is_ok());
+            pool.stop.send_replace(true);
+            lending.await
+        };
+        assert_eq!(reason, "the pool is stopping");
+        assert_eq!(
+            pool.counters.borrow().grants,
+            0,
+            "a stopping pool granted a namespace"
+        );
+        assert!(
+            matches!(proto::receive(&claimer), Ok(None)),
+            "the claimer was sent something before its connection closed"
+        );
+        namespace.destroy().await;
+    }
+
+    /// The pool has the host's address probed, with the probe's failure an error, before it
+    /// makes its key: a key from a failed probe would say the host has no IPv6 address for
+    /// the pool's life.
+    #[test]
+    fn the_pool_probes_the_host_before_it_makes_its_key() {
+        let source = include_str!("server.rs");
+        let start = source.find("pub async fn serve(slots: usize)").unwrap();
+        let body = &source[start..];
+        let probed = body.find("host_ipv6_probed().await?;").expect("no probe");
+        let key = body.find(".pool_key()").expect("no key");
+        assert!(probed < key, "the key is made before the host is probed");
+        let probe = &source[source.find("async fn host_ipv6_probed()").unwrap()..];
+        assert!(probe[..probe.find("\nfn listen(").unwrap()]
+            .contains("PastaNetwork::host_ipv6_known()"));
+    }
+
     /// A pooled namespace is built by the code an unpooled clone's is, so the two read the
     /// same but for the TAP's name. This fails when the pool gets a build of its own.
     ///
@@ -755,11 +947,27 @@ mod tests {
         own.build_namespace(holder_pid)
             .await
             .expect("building the links");
-        let own_fingerprint = netns_agent::client(holder_pid)
-            .unwrap()
-            .fingerprint("tap-own")
-            .await
-            .expect("fingerprinting the clone's own namespace");
+        // A bridge is created with a carrier and loses it once it has ports and none of
+        // them forwards, which the kernel works out through its link watch some time after
+        // the ports are added (0.1 to 2.1 s in six builds on an idle host). The clone's own
+        // namespace has no attached TAP yet, so its bridge settles without one: read it
+        // then, not during the time it still shows the carrier it was created with.
+        let own_agent = netns_agent::client(holder_pid).unwrap();
+        let settle_by = tokio::time::Instant::now() + Duration::from_secs(20);
+        let own_fingerprint = loop {
+            let now = own_agent
+                .fingerprint("tap-own")
+                .await
+                .expect("fingerprinting the clone's own namespace");
+            if !bridge_has_carrier(&now) {
+                break now;
+            }
+            assert!(
+                tokio::time::Instant::now() < settle_by,
+                "the clone's own bridge kept a carrier with no attached port:\n{now}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
 
         assert!(
             pooled.built_as.contains("link tap-pool "),
@@ -776,6 +984,13 @@ mod tests {
             "{}",
             pooled.built_as
         );
+        // The one difference: the pooled TAP is attached from its build on, by its holder,
+        // and has a carrier; a clone's own is attached when its VMM starts. Each bridge
+        // follows its ports: the pooled one has a carrier, the clone's own has none.
+        assert!(tap_flags(&pooled.built_as, proto::TAP) & CARRIER == CARRIER);
+        assert!(tap_flags(&own_fingerprint, "tap-own") & CARRIER == 0);
+        assert!(bridge_has_carrier(&pooled.built_as), "{}", pooled.built_as);
+        assert!(!bridge_has_carrier(&own_fingerprint), "{own_fingerprint}");
         assert_eq!(
             comparable(&pooled.built_as, proto::TAP),
             comparable(&own_fingerprint, "tap-own"),
@@ -788,10 +1003,58 @@ mod tests {
         pooled.destroy().await;
     }
 
+    /// IFF_LOWER_UP: the flag of a link with a carrier that a fingerprint keeps.
+    const CARRIER: u32 = 0x1_0000;
+
+    /// The flags on a fingerprint's `link` line, when it is one.
+    fn link_flags(line: &str) -> Option<u32> {
+        let flags = line.strip_prefix("link ")?.split("flags=0x").nth(1)?;
+        u32::from_str_radix(flags.split_whitespace().next()?, 16).ok()
+    }
+
+    /// Whether a fingerprint's bridge shows a carrier.
+    fn bridge_has_carrier(fingerprint: &str) -> bool {
+        let bridge = fingerprint
+            .lines()
+            .find(|line| line.ends_with("kind=bridge"))
+            .unwrap_or_else(|| panic!("no bridge: {fingerprint}"));
+        link_flags(bridge).unwrap() & CARRIER != 0
+    }
+
+    /// The flags on the fingerprint's line for the link `tap`.
+    fn tap_flags(fingerprint: &str, tap: &str) -> u32 {
+        fingerprint
+            .lines()
+            .find(|line| line.starts_with(&format!("link {tap} ")))
+            .and_then(link_flags)
+            .unwrap_or_else(|| panic!("no link {tap}: {fingerprint}"))
+    }
+
     /// A fingerprint with what differs between any two namespaces taken out: the VMM's
-    /// TAP's name, and the MAC the kernel drew for each TAP.
+    /// TAP's name, the MAC the kernel drew for each TAP, whether the VMM's TAP has a
+    /// carrier yet, and with it the bridge's, which follows its ports'.
     fn comparable(fingerprint: &str, tap: &str) -> String {
-        let mut text = fingerprint.replace(tap, "TAP");
+        let flags = tap_flags(fingerprint, tap);
+        let mut text = fingerprint
+            .replace(
+                &format!("link {tap} flags={flags:#x} "),
+                &format!("link {tap} flags={:#x} ", flags & !CARRIER),
+            )
+            .replace(tap, "TAP")
+            .lines()
+            .map(|line| match link_flags(line) {
+                Some(flags) if line.ends_with("kind=bridge") => line.replacen(
+                    &format!("flags={flags:#x} "),
+                    &format!("flags={:#x} ", flags & !CARRIER),
+                    1,
+                ),
+                _ => line.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if fingerprint.ends_with('\n') {
+            text.push('\n');
+        }
         let drawn: Vec<(String, String)> = text
             .lines()
             .filter(|line| line.starts_with("link ") && line.ends_with("kind=tun"))

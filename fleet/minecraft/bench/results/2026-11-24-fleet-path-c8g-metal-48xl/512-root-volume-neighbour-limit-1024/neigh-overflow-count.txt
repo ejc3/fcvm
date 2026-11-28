@@ -1,0 +1,3 @@
+700
+674
+net.ipv6.neigh.default.gc_thresh3 = 1024

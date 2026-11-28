@@ -4,10 +4,14 @@
 # netlink neighbour-sync fix, and the fix that keeps -a, -g and -n on a host
 # without IPv4. The checksum verifies the immutable upstream archive.
 #
-# Local patch (passt-*.patch, kept next to this script) is applied on top:
+# Local patches (passt-*.patch, kept next to this script) are applied on top, in order:
 #   - passt-udp-sock-errs-null-flow.patch: guards udp_sock_errs() against a NULL
 #     flow, so a published UDP port's listening socket does not crash pasta on a
 #     socket error. Submitted upstream; drop it when the pin moves past the merge.
+#   - passt-no-neigh-notify.patch: --no-neigh-notify, for the pastas of a namespace
+#     pool (fcvm netpool serve).
+#   - passt-control-reset-status.patch: a reset over the control socket and a status
+#     reply, for the same pastas (src/network/pesto.rs).
 set -euo pipefail
 
 PASST_COMMIT="4e8aa70379a35ec9deb11d76513e7f6c4123b667"
@@ -21,6 +25,8 @@ PASST_TARBALL_SHA256="ef88ad2c6137b52286e6fcd10311d61f2ab329e5558abe097170e9e585
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PASST_PATCHES=(
     "$SCRIPT_DIR/passt-udp-sock-errs-null-flow.patch"
+    "$SCRIPT_DIR/passt-no-neigh-notify.patch"
+    "$SCRIPT_DIR/passt-control-reset-status.patch"
 )
 # Key the kept source on the tarball and patch contents so a tree from an older
 # pin or patch set is never picked up.

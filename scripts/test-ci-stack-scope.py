@@ -2,8 +2,8 @@
 """Tests of CI's pull request scope: drafts and lower stack PRs run nothing, the top
 of a stack classifies the whole stack's diff, and a passing top marks the lower PRs.
 
-Runs scripts/ci-pr-scope.sh and scripts/ci-stack-coverage.sh against a fake `gh`
-that answers from a fixture and applies --jq with the real jq. Run with
+Runs scripts/ci-pr-scope.sh against a fake `gh` that answers from a fixture and applies
+--jq with the real jq. What a passing top marks is tested in scripts/test-ci-pool.py. Run with
 make test-ci-scope.
 """
 import ast
@@ -51,8 +51,9 @@ FAKE_GH = textwrap.dedent('''\
 REPO = 'example-owner/example-repo'
 
 
-def pr(number, head_ref, base_ref, sha='0' * 40, repo=REPO):
-    return {'number': number, 'head': {'ref': head_ref, 'sha': sha, 'repo': {'full_name': repo}},
+def pr(number, head_ref, base_ref, sha='0' * 40, repo=REPO, draft=False):
+    return {'number': number, 'draft': draft,
+            'head': {'ref': head_ref, 'sha': sha, 'repo': {'full_name': repo}},
             'base': {'ref': base_ref}}
 
 
@@ -120,6 +121,38 @@ class PrScope(Harness):
         self.assertEqual(outputs['code'], 'false')
         self.assertIn('#13', outputs['reason'])
 
+    def test_a_draft_child_defers_nothing(self):
+        # A draft runs no CI, so a draft stacked here tests nothing: deferring to it
+        # left this PR's head with every job skipped and a green Summary (deferred).
+        fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100':
+                   [pr(13, 'feature-c', 'feature-b', 'c' * 40, draft=True)],
+                   f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'ahead'},
+                   f'repos/{REPO}/pulls/12/files': files('src/lib.rs')}
+        outputs, _, stdout = self.scope(fixture)
+        self.assertEqual(outputs['run'], 'true')
+        self.assertEqual(outputs['code'], 'true')
+        self.assertIn('#13 is stacked here but is a draft', stdout)
+
+    def test_a_ready_child_beside_a_draft_one_still_defers(self):
+        fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100':
+                   [pr(13, 'feature-c', 'feature-b', 'c' * 40, draft=True),
+                    pr(14, 'feature-d', 'feature-b', 'd' * 40)],
+                   f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'ahead'},
+                   f'repos/{REPO}/compare/{"b" * 40}...{"d" * 40}': {'status': 'ahead'}}
+        outputs, _, _ = self.scope(fixture)
+        self.assertEqual(outputs['run'], 'false')
+        self.assertIn('#14', outputs['reason'])
+        self.assertNotIn('#13', outputs['reason'])
+
+    def test_a_child_whose_draft_state_is_unknown_defers_nothing(self):
+        child = pr(13, 'feature-c', 'feature-b', 'c' * 40)
+        del child['draft']
+        fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100': [child],
+                   f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'ahead'},
+                   f'repos/{REPO}/pulls/12/files': files('src/lib.rs')}
+        outputs, _, _ = self.scope(fixture)
+        self.assertEqual(outputs['run'], 'true')
+
     def test_a_child_that_does_not_contain_this_head_defers_nothing(self):
         # A fix pushed here before the child was rebased: the child's runs do not
         # test this commit, so this PR runs.
@@ -139,11 +172,14 @@ class PrScope(Harness):
 
     def test_a_fork_pr_on_this_branch_does_not_defer_it(self):
         fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100':
-                   [pr(13, 'feature-c', 'feature-b', repo='someone/fork')],
+                   [pr(13, 'feature-c', 'feature-b', 'c' * 40, repo='someone/fork')],
+                   # The fork's head would cover this one if the fork counted as a child.
+                   f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'ahead'},
                    f'repos/{REPO}/pulls/12/files': files('src/lib.rs')}
-        outputs, _, _ = self.scope(fixture)
+        outputs, calls, _ = self.scope(fixture)
         self.assertEqual(outputs['run'], 'true')
         self.assertEqual(outputs['code'], 'true')
+        self.assertFalse([c for c in calls if '/compare/' in c['path']], 'the fork child was looked up')
 
     def test_a_fork_pr_whose_branch_shares_a_stack_branch_name_runs(self):
         # Upstream has a PR stacked on feature-b; this PR's feature-b is a fork's branch.
@@ -166,6 +202,22 @@ class PrScope(Harness):
         self.assertEqual(self.flags(outputs), dict(run='true', code='false', bench='false', fleet='false', web='false'))
         self.assertNotIn(f'repos/{REPO}/compare/main...' + 'b' * 40, [c['path'] for c in calls])
 
+    def test_a_scripts_only_pr_still_runs_ci(self):
+        # The tree-wide guards sit in the actionlint job, which runs whenever `run` is true.
+        fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100': [],
+                   f'repos/{REPO}/pulls/12/files': files('scripts/ci-pr-scope.sh')}
+        outputs, _, _ = self.scope(fixture)
+        self.assertEqual(outputs['run'], 'true')
+        self.assertEqual(outputs['bench'], 'false')
+
+    def test_what_fleet_web_reads_outside_fleet_web_runs_fleet_web(self):
+        # mock/test/potato.test.ts compares the mock with fleet/core/tests/vectors and fleet/PROTOCOL.md.
+        for changed in ('fleet/core/tests/vectors/33_potato.json', 'fleet/core/src/potato.rs', 'fleet/PROTOCOL.md'):
+            fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100': [],
+                       f'repos/{REPO}/pulls/12/files': files(changed)}
+            outputs, _, _ = self.scope(fixture)
+            self.assertEqual(outputs['web'], 'true', changed)
+
     def test_the_top_of_a_stack_classifies_the_whole_stack(self):
         # The top PR changes only docs; the PR below it changed code. Classifying the
         # top's own files would skip the matrix for that code.
@@ -175,6 +227,37 @@ class PrScope(Harness):
         outputs, _, _ = self.scope(fixture, BASE_REF='feature-a')
         self.assertEqual(outputs['run'], 'true')
         self.assertEqual(outputs['code'], 'true')
+
+    def test_a_change_to_the_vmm_confinement_asks_for_the_x64_host_lane(self):
+        # Host-x64's test-confine step is the only place the x86_64 seccomp policy runs
+        # under real confinement, and a pull request leaves that job out unless asked.
+        for path, confine in (('resources/seccomp/confined-changes.json', 'true'),
+                              ('src/confine.rs', 'true'),
+                              ('src/firecracker/vm.rs', 'true'),
+                              ('src/hypervisor/firecracker.rs', 'true'),
+                              # The pre_exec and keep_fds, the preflight and the restore's
+                              # thread check, setup's compile and digest, the assertion
+                              # every gate test makes, and the gate's filter and count.
+                              ('src/utils.rs', 'true'),
+                              ('src/commands/common.rs', 'true'),
+                              ('src/setup/kernel.rs', 'true'),
+                              ('tests/common/mod.rs', 'true'),
+                              ('Makefile', 'true'),
+                              # The Firecracker pin and [confine], their parser, and the
+                              # two commands that call the preflight.
+                              ('rootfs-config.toml', 'true'),
+                              ('src/setup/rootfs.rs', 'true'),
+                              ('src/commands/snapshot.rs', 'true'),
+                              ('src/commands/podman/mod.rs', 'true'),
+                              ('src/setup/pasta.rs', 'false'),
+                              ('scripts/confine-gate.sh', 'true'),
+                              ('tests/test_confine.rs', 'true'),
+                              ('src/main.rs', 'false'),
+                              ('docs/x.md', 'false')):
+            fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100': [],
+                       f'repos/{REPO}/pulls/12/files': files(path)}
+            outputs, _, _ = self.scope(fixture)
+            self.assertEqual(outputs['confine'], confine, path)
 
     def test_a_stack_diff_the_compare_api_may_truncate_runs_everything(self):
         many = files(*[f'docs/{i}.md' for i in range(300)])
@@ -195,47 +278,6 @@ class PrScope(Harness):
         outputs, _, _ = self.scope(fixture)
         self.assertEqual(outputs['code'], 'true')
         self.assertEqual(outputs['bench'], 'true')
-
-
-class StackCoverage(Harness):
-    def cover(self, fixture, base_ref='feature-b'):
-        return self.run_script('ci-stack-coverage.sh', fixture, PR='13', HEAD_SHA='c' * 40,
-                               BASE_REF=base_ref, RUN_URL='https://example.invalid/run/1')
-
-    def posts(self, calls):
-        return [(c['path'], c['fields']['context'], c['fields']['state']) for c in calls if c['method'] == 'POST']
-
-    def test_each_lower_pr_whose_head_this_run_tested_is_marked(self):
-        fixture = {
-            f'repos/{REPO}/pulls?state=open&head=example-owner:feature-b&per_page=100': [pr(12, 'feature-b', 'feature-a', 'b' * 40)],
-            f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'ahead'},
-            f'repos/{REPO}/pulls?state=open&head=example-owner:feature-a&per_page=100': [pr(11, 'feature-a', 'main', 'a' * 40)],
-            f'repos/{REPO}/compare/{"a" * 40}...{"c" * 40}': {'status': 'ahead'},
-        }
-        _, calls, _ = self.cover(fixture)
-        self.assertEqual(self.posts(calls), [(f'repos/{REPO}/statuses/' + 'b' * 40, 'Stack CI', 'success'),
-                                             (f'repos/{REPO}/statuses/' + 'a' * 40, 'Stack CI', 'success')])
-
-    def test_a_lower_pr_that_moved_after_this_head_is_not_marked_nor_anything_below(self):
-        fixture = {
-            f'repos/{REPO}/pulls?state=open&head=example-owner:feature-b&per_page=100': [pr(12, 'feature-b', 'feature-a', 'b' * 40)],
-            f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'diverged'},
-            f'repos/{REPO}/pulls?state=open&head=example-owner:feature-a&per_page=100': [pr(11, 'feature-a', 'main', 'a' * 40)],
-            f'repos/{REPO}/compare/{"a" * 40}...{"c" * 40}': {'status': 'ahead'},
-        }
-        _, calls, _ = self.cover(fixture)
-        self.assertEqual(self.posts(calls), [])
-
-    def test_a_base_with_no_open_pr_ends_the_walk(self):
-        fixture = {f'repos/{REPO}/pulls?state=open&head=example-owner:feature-b&per_page=100': []}
-        _, calls, _ = self.cover(fixture)
-        self.assertEqual(self.posts(calls), [])
-
-    def test_a_fork_pr_with_the_same_branch_name_is_not_marked(self):
-        fixture = {f'repos/{REPO}/pulls?state=open&head=example-owner:feature-b&per_page=100':
-                   [pr(12, 'feature-b', 'main', 'b' * 40, repo='someone/fork')]}
-        _, calls, _ = self.cover(fixture)
-        self.assertEqual(self.posts(calls), [])
 
 
 def jobs(text):
@@ -299,8 +341,9 @@ def evaluate(expression, context):
 
 class Workflow(unittest.TestCase):
     def test_a_deferred_run_skips_every_job_that_tests(self):
-        # Every job other than the scope, the matrix planner and the report must be
-        # skipped when `changes` says run=false, whatever the planner says.
+        # Every job other than the scope, the matrix planner, the report and the status job
+        # (which tests nothing and says so) must be skipped when `changes` says run=false,
+        # whatever the planner says.
         deferred = {k: 'false' for k in ('run', 'code', 'bench', 'fleet', 'web')}
         context = {
             'needs': {'changes': {'outputs': deferred, 'result': 'success'},
@@ -311,7 +354,7 @@ class Workflow(unittest.TestCase):
                        'repository': {'default_branch': 'main'}}, 'repository': REPO},
         }
         for name, block in jobs(CI.read_text()).items():
-            if name in ('changes', 'skip-check', 'summary'):
+            if name in ('changes', 'skip-check', 'summary', 'pool-status'):
                 continue
             with self.subTest(job=name):
                 gate = job_if(block)
@@ -339,7 +382,25 @@ class Workflow(unittest.TestCase):
     def test_a_deferred_summary_is_not_named_summary(self):
         block = jobs(CI.read_text())['summary']
         name = re.search(r'^    name:\s*(.*)$', block, re.M)[1]
-        self.assertEqual(name, "${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || 'Summary' }}")
+        self.assertEqual(name, "${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || "
+                               "(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name "
+                               "!= github.repository) && 'Summary (fork, no self-hosted lanes)' || "
+                               "(github.event.inputs.lanes && 'Summary (some lanes)' || 'Summary') }}")
+        # The name is `Summary` only for a run that deferred nothing, filtered no lane and is
+        # not a fork's (whose run skips every self-hosted job).
+        expression = name.removeprefix('${{').removesuffix('}}').strip()
+        def named(run, lanes, event='push', head_repo=''):
+            return evaluate(expression, {'needs': {'changes': {'outputs': {'run': run}}},
+                                         'github': {'event_name': event, 'repository': 'ejc3/fcvm',
+                                                    'event': {'inputs': {'lanes': lanes},
+                                                              'pull_request': {'head': {'repo': {'full_name': head_repo}}}}}})
+        self.assertEqual(named('true', ''), 'Summary')
+        self.assertEqual(named('true', 'Host-arm64'), 'Summary (some lanes)')
+        self.assertEqual(named('false', ''), 'Summary (deferred)')
+        self.assertEqual(named('false', 'Host-arm64'), 'Summary (deferred)')
+        self.assertEqual(named('true', '', 'pull_request', 'ejc3/fcvm'), 'Summary')
+        self.assertEqual(named('true', '', 'pull_request', 'someone/fcvm'), 'Summary (fork, no self-hosted lanes)')
+        self.assertEqual(named('false', '', 'pull_request', 'someone/fcvm'), 'Summary (deferred)')
 
     def test_the_scope_sees_draft_state_and_the_stack(self):
         block = jobs(CI.read_text())['changes']
@@ -348,34 +409,71 @@ class Workflow(unittest.TestCase):
                     'BASE_REF: ${{ github.event.pull_request.base.ref }}', 'run: bash scripts/ci-pr-scope.sh'):
             self.assertIn(env, block)
 
-    def test_only_the_coverage_job_may_write_statuses(self):
+    def test_only_the_status_job_may_write_statuses(self):
         text = CI.read_text()
         self.assertEqual(text.count('statuses: write'), 1)
-        self.assertIn('statuses: write', jobs(text)['stack-coverage'])
-        self.assertIn("needs.summary.result == 'success'", jobs(text)['stack-coverage'])
+        # No job may cancel or rerun a run: a watcher that stopped runs was measured and
+        # taken out (docs/ci-pool.md, "A run that was stopped").
+        self.assertNotIn('actions: write', text)
+        block = jobs(text)['pool-status']
+        self.assertIn('statuses: write', block)
+        self.assertIn('run: python3 scripts/ci-pool/ci_pool.py mark', block)
+        for env in ('RAN: ${{ needs.changes.outputs.run }}', 'SUMMARY: ${{ needs.summary.result }}',
+                    'HEAD_SHA: ${{ github.event.pull_request.head.sha }}', 'RUN_ID: ${{ github.run_id }}'):
+            self.assertIn(env, block)
 
-    def test_the_coverage_job_runs_when_summary_waited_for_a_skipped_job(self):
-        # GitHub adds success() to an `if:` that names no status function, and success() is false
-        # when a job anywhere before this one in the needs graph was skipped. Summary waits for
-        # jobs most PRs skip (the bench and fleet tests), so a coverage job gated on the event and
-        # Summary's result alone is skipped on every stack whose top passed, and no lower PR is
-        # ever marked as tested.
-        blocks = jobs(CI.read_text())
-        waited_for = re.search(r'^    needs: \[(.*)\]$', blocks['summary'], re.M)[1].split(', ')
-        can_skip = [name for name in waited_for if job_if(blocks[name]) is not None]
-        self.assertTrue(can_skip, 'summary waits for no job that can be skipped')
-        gate = job_if(blocks['stack-coverage'])
-        self.assertTrue(gate.startswith('!cancelled() && '),
-                        f'stack-coverage is skipped whenever one of {can_skip} is: {gate}')
-        passed = {
+    def status_gate(self, **override):
+        context = {
             'needs': {'changes': {'outputs': {'run': 'true'}, 'result': 'success'}, 'summary': {'result': 'success'}},
             'github': {'event_name': 'pull_request', 'repository': REPO,
-                       'event': {'pull_request': {'base': {'ref': 'feature-a'}, 'head': {'repo': {'full_name': REPO}}},
+                       'event': {'action': 'synchronize',
+                                 'pull_request': {'base': {'ref': 'feature-a'}, 'head': {'repo': {'full_name': REPO}}},
                                  'repository': {'default_branch': 'main'}}},
         }
-        self.assertTrue(evaluate(gate, passed), f'stack-coverage does not run for the top of a stack that passed: {gate}')
-        failed = {**passed, 'needs': {**passed['needs'], 'summary': {'result': 'failure'}}}
-        self.assertFalse(evaluate(gate, failed), f'stack-coverage runs after a failed Summary: {gate}')
+        context['github']['event'].update(override.pop('event', {}))
+        context['github'].update(override)
+        return evaluate(job_if(jobs(CI.read_text())['pool-status']), context)
+
+    def test_the_status_job_runs_whatever_summary_waited_for_and_however_it_ended(self):
+        # GitHub adds success() to an `if:` that names no status function, and success() is false
+        # when a job anywhere before this one in the needs graph was skipped. Summary waits for
+        # jobs most PRs skip (the bench and fleet tests), so a status job gated on the event alone
+        # would be skipped on every pool. It also has to run after a failed Summary (to say so)
+        # and on a run that tested nothing (to say that).
+        blocks = jobs(CI.read_text())
+        waited_for = re.search(r'^    needs: \[(.*)\]$', blocks['summary'], re.M)[1].split(', ')
+        self.assertTrue([name for name in waited_for if job_if(blocks[name]) is not None])
+        gate = job_if(blocks['pool-status'])
+        self.assertTrue(gate.startswith('!cancelled() && '), gate)
+        self.assertNotIn('needs.summary.result', gate)
+        self.assertNotIn('needs.changes.outputs.run', gate)
+        self.assertTrue(self.status_gate())
+
+    def test_summary_reports_on_every_run_that_was_not_itself_cancelled(self):
+        # A cancelled run's failed Summary stayed on the head for good: on a lower member of
+        # a stack no later check has its name. So Summary does not report on a cancelled run.
+        blocks = jobs(CI.read_text())
+        self.assertEqual(job_if(blocks['summary']), '!cancelled()')
+        # cancelled() is about the run. A lane that ended cancelled while the run went on
+        # (its own timeout, a lost runner) must still fail Summary: Summary waits for every
+        # lane job, and the step that fails it looks for a cancelled result as for a failed
+        # one. Run 45830927225 (a throwaway probe, 2026-11-26): a job that hit its
+        # timeout-minutes ended cancelled, and a job needing it with this `if:` ran and
+        # read `needs.<job>.result == 'cancelled'`.
+        waited_for = re.search(r'^    needs: \[(.*)\]$', blocks['summary'], re.M)[1].split(', ')
+        for lane_job in ('host', 'host-root', 'container'):
+            self.assertIn(lane_job, waited_for)
+        gate = re.search(r"      - name: Fail if any gating job did not succeed\n        if: (.*)\n", blocks['summary'])
+        self.assertEqual(gate[1], "contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')")
+        step = blocks['summary'][gate.end():].split('\n      - ', 1)[0]
+        self.assertRegex(step, r'(?m)^\s+exit 1$')
+
+    def test_the_status_job_never_runs_with_a_forks_code_or_outside_a_pull_request(self):
+        fork = {'pull_request': {'base': {'ref': 'main'}, 'head': {'repo': {'full_name': 'someone/fork'}}}}
+        self.assertFalse(self.status_gate(event=fork))
+        self.assertFalse(self.status_gate(event={'action': 'closed'}))
+        for event in ('push', 'workflow_dispatch', 'workflow_run', 'pull_request_target'):
+            self.assertFalse(self.status_gate(event_name=event), event)
 
 
 if __name__ == '__main__':
