@@ -456,7 +456,7 @@ description = "Default fcvm guest kernel"
 kernel_version = "7.3.6"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "ca1837829fd0"
-kernel_artifact_sha256 = "28115c483723c3f8a7e3cc86958084cfd121223f6ea7beb09716154d868b8aab"
+kernel_artifact_sha256 = "7c9717869a6cfef65d7af4f3bcff2e6dd31bc74118d2f96d604776331e165dd8"
 build_inputs = [
     "kernel/default-arm64.build.toml",
     "kernel/default.conf",
@@ -645,7 +645,7 @@ guest_kvm = true
 kernel_version = "7.3.6"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "e0fef7e83c89"
-kernel_artifact_sha256 = "6a0a3e0cbe7623593fbc62c3c51ba82ab72761c91a873b180a86652627201a1f"
+kernel_artifact_sha256 = "14dffc178d047d5e183963e0838756e92652c781a6af624c2db19335407e0a6c"
 
 # Build configuration - these files determine when kernel needs rebuilding
 # SHA is computed from contents of all files matching these patterns
@@ -774,7 +774,7 @@ description = "Kernel with FUSE and btrfs support for efficient container storag
 kernel_version = "7.3.6"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "b1dd099392e5"
-kernel_artifact_sha256 = "464accf3e4d36668921442202fbd58f474349ff9df083aba90a2933966a86385"
+kernel_artifact_sha256 = "8cf69028f37a76a7a88e938467b63b3eed8ea92fd8358b5c4369aa5fdc46659e"
 
 # The patches are build inputs: the build applies them, so the tag has to
 # change when one of them does.
@@ -800,7 +800,7 @@ description = "Kernel with FUSE and btrfs support for efficient container storag
 kernel_version = "7.3.6"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "e710148cf2c4"
-kernel_artifact_sha256 = "6ead06a21e9329bed557b15fb4d234ba48bee8f66083c891b59f114be0f04d5c"
+kernel_artifact_sha256 = "e9eca8e442ea2f8ef1ebdc34d0e76f8565306140b805c65408cd0c9b63233a96"
 
 # The patches are build inputs: the build applies them, so the tag has to
 # change when one of them does.
