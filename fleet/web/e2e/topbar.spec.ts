@@ -34,9 +34,11 @@ for (const size of SIZES) {
       for (const href of hrefs) {
         await page.goto(href);
         await expect(page.locator("nav.mode-switch")).toBeVisible();
-        // the Zoom control of phones mode is there once the fleet reports phones
+        // The controls that arrive with the fleet's first snapshot are awaited, so the
+        // measurement below always includes them.
+        if (href === "/") await expect(page.getByTestId("stream-mode")).toBeVisible();
         if (href.includes("phones")) await expect(page.getByTestId("phones-zoom")).toBeVisible();
-        await page.waitForTimeout(0);
+        if (href.includes("minecraft")) await expect(page.getByTestId("mc-join-copy")).toBeVisible();
         if (shots) await page.screenshot({ path: `${shots}/${size.name}-${href.replace(/\W+/g, "_")}.png` });
         const report = await page.evaluate(
           ([sel, coarse]) => {
