@@ -61,10 +61,8 @@
 //! name) happens once in a store's life and is not counted.
 //!
 //! No traced start runs the `btrfs` tool. A clone's disks are made in fcvm's own process, as
-//! a reflink or as one subvolume snapshot ioctl, and a btrfs child per start was a fork of
-//! fcvm and an exec on every start that took the subvolume snapshot. The four starts added
-//! between the measured two take that path (`FCVM_REFLINK_MAX_EXTENTS=0` makes the test VM's
-//! small disk one to snapshot), so both ways of making a clone's disks are traced.
+//! one subvolume snapshot ioctl of the snapshot's disk directory, and a btrfs child per start
+//! was a fork of fcvm and an exec on every start that took the subvolume snapshot.
 //!
 //! `strace` is a requirement. Without it, or with one that lacks an option used here, every
 //! test in this file that needs it fails: a detector that cannot run has seen nothing.
@@ -2494,17 +2492,13 @@ mod start {
             .await?;
             // The first measured clone is one of the clones added; these are the others. They
             // are traced too: every traced start's creates are compared ([`judge_creates`]).
-            // They take the subvolume snapshot of the snapshot's disks, which the measured two,
-            // whose small disk is reflinked, do not.
-            let mut snapshotting_env = env.clone();
-            snapshotting_env.push((fcvm::storage::disk::REFLINK_MAX_EXTENTS_ENV, "0"));
             let mut creates = vec![first_creates];
             for index in 1..ADDED {
                 let (_, made) = listings_of_one_start(
                     &runner,
                     &snapshot,
                     &format!("{clone}-b{index}"),
-                    &snapshotting_env,
+                    &env,
                     &roots,
                     untraced_map,
                     &mut running,
