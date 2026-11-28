@@ -1706,7 +1706,7 @@ fn test_sigterm_cleanup_routed() -> Result<()> {
     // Start fcvm in routed mode with port forwarding
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("cleanup-routed");
-    let host_port = common::find_available_high_port().context("finding available port")?;
+    let (_host_port_held, host_port) = common::test_ports::reserved_port_number();
     let publish_arg = format!("{}:80", host_port);
 
     let mut cmd = Command::new(&fcvm_path);

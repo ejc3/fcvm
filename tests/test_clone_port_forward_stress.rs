@@ -47,7 +47,7 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
     let fcvm_path = common::find_fcvm_binary()?;
 
     // Allocate port before baseline so it's baked into the snapshot
-    let host_port = common::find_available_high_port().context("finding available port")?;
+    let (_host_port_held, host_port) = common::test_ports::reserved_port_number();
     let publish_arg = format!("{}:80", host_port);
 
     // Step 1: Start baseline VM with nginx + port forwarding

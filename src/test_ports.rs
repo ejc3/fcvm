@@ -13,6 +13,7 @@
 //!
 //! * [`refused_address`]: nothing listens there, and nothing can.
 //! * [`reserved_port`]: a program the test starts can bind it, and nothing else can.
+//! * [`reserved_port_number`]: the same for a program that binds on an address of its own.
 //! * [`reserved_ipv6_loopback_port`]: the same for `::1`, which has no private address.
 //!
 //! `tests/test_listener_ports.rs` fails on a listener bound only for its address anywhere
@@ -134,6 +135,17 @@ fn guarded_ports(count: u16) -> (Held, u16) {
 /// against `Held`.
 pub fn reserved_port() -> (Held, SocketAddrV4) {
     reserved_ports_in_a_row(1)
+}
+
+/// A port number for a program under test that binds it on an address nothing else uses:
+/// fcvm publishing a port on a VM's own loopback address, or on one the test names.
+///
+/// `Held` keeps the number bound on [`GUARD_IP`], TCP and UDP, as [`reserved_port`] does,
+/// so no socket on the wildcard address can take it, and two reservations never share one.
+/// It does not keep the number free on 127.0.0.1, which every process shares: a program
+/// that binds there wants [`reserved_port`] and its address.
+pub fn reserved_port_number() -> (Held, u16) {
+    guarded_ports(1)
 }
 
 /// [`reserved_port`] for `count` ports in a row on one address; the first is returned.

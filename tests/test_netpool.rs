@@ -1137,6 +1137,8 @@ struct Fixture {
     pool: Pool,
     tag: String,
     env: Vec<(String, String)>,
+    /// The snapshot's published port is its clones' by default, for as long as the fixture.
+    _snapshot_port: common::test_ports::Held,
 }
 
 /// A clone publishes its snapshot's ports unless told otherwise, and a clone that publishes
@@ -1151,9 +1153,15 @@ impl Fixture {
             pool.data_dir.to_string_lossy().into_owned(),
         )];
         let (base, _, tag, _) = common::unique_names("netpool");
-        let fixture = Self { pool, tag, env };
+        let (snapshot_port_held, snapshot_port) = common::test_ports::reserved_port_number();
+        let fixture = Self {
+            pool,
+            tag,
+            env,
+            _snapshot_port: snapshot_port_held,
+        };
         // A cold boot builds its own namespace whether a pool runs or not.
-        let publish = format!("{}:80", common::find_available_high_port().unwrap());
+        let publish = format!("{snapshot_port}:80");
         let (mut fcvm, pid) = fixture
             .run(
                 &[
@@ -1413,7 +1421,8 @@ async fn clones_run_in_recycled_namespaces() {
 
     // A clone that publishes a port builds its own namespace with one free in the pool, and
     // does not ask: the snapshot's port by default, or one of its own choosing.
-    let publish = format!("{}:80", common::find_available_high_port().unwrap());
+    let (_own_port_held, own_port) = common::test_ports::reserved_port_number();
+    let publish = format!("{own_port}:80");
     for (name, ports) in [
         ("inherits", &[][..]),
         ("publishes", &["--publish", &publish][..]),

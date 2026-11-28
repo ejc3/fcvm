@@ -1142,7 +1142,7 @@ async fn run_seed(seed: u64, total_ops: usize) -> Result<()> {
     let host_dir = scratch.join("host");
     std::fs::create_dir_all(&host_dir).context("creating scratch dir")?;
 
-    let host_port = common::find_available_high_port()?;
+    let (_host_port_held, host_port) = common::test_ports::reserved_port_number();
     let map_arg = format!("{}:/mnt/fuzz", host_dir.display());
     let publish_arg = format!("{}:80", host_port);
 

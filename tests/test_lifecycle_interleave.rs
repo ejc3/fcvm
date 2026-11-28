@@ -961,7 +961,7 @@ async fn test_lifecycle_interleave_healthy_means_live_dataplane() -> Result<()> 
     // snapshot is CREATED this run (a warm start would skip the pause and
     // make this test vacuous).
     let env_unique = format!("ILV_ID={}", vm_name);
-    let host_port = common::find_available_high_port()?;
+    let (_host_port_held, host_port) = common::test_ports::reserved_port_number();
     let publish_arg = format!("{}:80", host_port);
 
     let (mut child, pid, vm_log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
@@ -1693,7 +1693,7 @@ async fn test_lifecycle_interleave_early_connection_cannot_poison_restored_ingre
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("ilv-early-ingress");
     let go_file = PathBuf::from(format!("/tmp/{clone_name}-restore-go"));
     remove_file_if_exists(&go_file).context("removing stale restore go-file")?;
-    let host_port = common::find_available_high_port()?;
+    let (_host_port_held, host_port) = common::test_ports::reserved_port_number();
     let publish_arg = format!("{host_port}:80");
 
     let mut baseline: Option<(tokio::process::Child, PinnedProcess)> = None;
@@ -3470,7 +3470,7 @@ async fn test_lifecycle_interleave_snapshot_create_waits_behind_an_export_of_the
 /// the next create failed to reach fc-agent.
 async fn killed_snapshot_create_resumes_its_source(prefix: &str, hypervisor: &str) -> Result<()> {
     let (vm_name, _, snapshot, second_snapshot) = common::unique_names(prefix);
-    let host_port = common::find_available_high_port()?;
+    let (_host_port_held, host_port) = common::test_ports::reserved_port_number();
     let publish = format!("{host_port}:80");
     let (mut vm, vm_pid) = common::spawn_fcvm(&[
         "podman",

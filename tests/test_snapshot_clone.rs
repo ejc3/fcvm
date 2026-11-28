@@ -3090,7 +3090,7 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     let fcvm_path = common::find_fcvm_binary()?;
 
     // Allocate port before baseline so it's baked into the snapshot
-    let host_port = common::find_available_high_port().context("finding available port")?;
+    let (_host_port_held, host_port) = common::test_ports::reserved_port_number();
     let publish_arg = format!("{}:80", host_port);
 
     let verdict: Result<()> = async {
@@ -3334,7 +3334,7 @@ async fn test_clone_port_forward_routed() -> Result<()> {
     let fcvm_path = common::find_fcvm_binary()?;
 
     // Allocate port before baseline so it's baked into the snapshot
-    let host_port = common::find_available_high_port().context("finding available port")?;
+    let (_host_port_held, host_port) = common::test_ports::reserved_port_number();
     let publish_arg = format!("{}:80", host_port);
 
     // Step 1: Start baseline VM with nginx (routed) and port forwarding
@@ -3451,12 +3451,7 @@ async fn test_clone_port_forward_routed() -> Result<()> {
 
     // Step 6: a second clone chooses where it publishes. Guest port 80 is one the
     // snapshot published, so this clone may put it on an address and port of its own.
-    let moved_port = loop {
-        let port = common::find_available_high_port().context("finding available port")?;
-        if port != host_port {
-            break port;
-        }
-    };
+    let (_moved_port_held, moved_port) = common::test_ports::reserved_port_number();
     let moved_ip = common::private_loopback_ip();
     let moved_publish = format!("{}:{}:80", moved_ip, moved_port);
     let moved_name = format!("{}-moved", clone_name);
@@ -9739,7 +9734,7 @@ async fn a_snapshot_of_a_clone_is_refused_until_its_restore_is_acknowledged() ->
     let failed_name = format!("{clone_name}-failed");
     let reported_name = format!("{clone_name}-reported");
     let reported_tag = format!("{clone_snap_tag}-reported");
-    let host_port = common::find_available_high_port().context("finding a host port")?;
+    let (_host_port_held, host_port) = common::test_ports::reserved_port_number();
     let publish = format!("{host_port}:80");
     let teardown_go = std::env::temp_dir().join(format!("{failed_name}-teardown-go"));
     let _ = std::fs::remove_file(&teardown_go);

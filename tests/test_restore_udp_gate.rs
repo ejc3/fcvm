@@ -173,7 +173,7 @@ async fn test_restored_bridged_clone_udp_port_is_closed_until_the_restore_ack() 
 async fn closed_until_the_restore_ack(network: &str) -> Result<()> {
     let (baseline_name, clone_name, snapshot_name, _) =
         common::unique_names(&format!("udp-gate-{network}"));
-    let host_port = common::find_available_high_port()?;
+    let (_host_port_held, host_port) = common::test_ports::reserved_port_number();
     let publish = format!("{host_port}:5000/udp");
     let go_file = std::path::PathBuf::from(format!("/tmp/fcvm-{clone_name}.go"));
     let _ = std::fs::remove_file(&go_file);
