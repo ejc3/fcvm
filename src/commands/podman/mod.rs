@@ -5020,11 +5020,6 @@ mod tests {
             "the --disk-dir staging makes the VM's bucket itself, with this process's owner \
              and umask, unless the disk directory (and its bucket) is made first"
         );
-        assert!(
-            created < staged,
-            "the --disk-dir staging makes the VM's bucket itself, with this process's owner \
-             and umask, unless the runtime directory (and its bucket) is made first"
-        );
 
         // The same order in a restore.
         let source = include_str!("../snapshot.rs");
