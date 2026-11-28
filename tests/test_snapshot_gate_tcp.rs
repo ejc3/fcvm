@@ -251,6 +251,107 @@ async fn a_stale_tracked_tuple_does_not_pass_a_restored_clones_closed_gate() -> 
     deleted
 }
 
+/// #2112: a restore attaches no connection tracking in the guest, so a clone's tracked
+/// connections after publication are the source's.
+///
+/// The source is a routed VM with no nat rule, which tracks nothing. The clone is
+/// restored, and once it is healthy five connections are made to its nginx, each held
+/// open while the gate's last traces would still be detaching. Its tracker must hold
+/// no entry, as the source's held none.
+///
+/// RED BEFORE THE FIX: the restored clone's UDP rule was `-m conntrack --ctdir ORIGINAL`;
+/// it attached the tracker from the restore's first steps, and each restore left 4 or 5
+/// entries.
+#[tokio::test]
+async fn a_restore_leaves_the_clones_tracked_connections_as_the_sources_were() -> Result<()> {
+    let (golden_name, clone_name, snapshot_name, _) = common::unique_names("restoreconn");
+    let (mut golden_child, golden_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &golden_name,
+            "--network",
+            "routed",
+            "--no-snapshot",
+            "--health-check",
+            "http://localhost:80",
+            common::TEST_IMAGE,
+        ],
+        &golden_name,
+    )
+    .await
+    .context("spawning the source VM")?;
+    let prepared: Result<(Ipv6Addr, String)> = async {
+        common::poll_health_by_pid(golden_pid, 180).await?;
+        let address = guest_address(golden_pid).await?;
+        let before = tracked(golden_pid).await?;
+        common::create_snapshot_by_pid(golden_pid, &snapshot_name).await?;
+        Ok((address, before))
+    }
+    .await;
+    common::kill_process(golden_pid).await;
+    let _ = golden_child.wait().await;
+    let (address, before) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = common::delete_snapshot(&snapshot_name).await;
+            return Err(error);
+        }
+    };
+    anyhow::ensure!(
+        before.trim().is_empty(),
+        "the source tracks connections, so the comparison says nothing:\n{before}"
+    );
+
+    let (mut clone_child, clone_pid, _clone_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snapshot_name,
+            "--name",
+            &clone_name,
+            "--ipv6-address",
+            &address.to_string(),
+        ],
+        &[],
+    )
+    .await
+    .context("spawning the restored clone")?;
+    let checked: Result<()> = async {
+        common::poll_health_by_pid(clone_pid, 120).await?;
+        let target: SocketAddr = (address, 80).into();
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(
+                connect_from(0, target)
+                    .await
+                    .context("a connection to the published clone")?,
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let after = tracked(clone_pid).await?;
+        drop(held);
+        anyhow::ensure!(
+            after.trim().is_empty(),
+            "the restore attached connection tracking in the clone; it tracks:\n{after}"
+        );
+        let rules = common::exec_in_vm(clone_pid, &["/usr/sbin/ip6tables -w -S"]).await?;
+        anyhow::ensure!(
+            !rules.contains("FCVM_SNAPSHOT"),
+            "the published clone kept part of the gate:\n{rules}"
+        );
+        Ok(())
+    }
+    .await;
+    common::kill_process(clone_pid).await;
+    let _ = clone_child.wait().await;
+    let deleted = common::delete_snapshot(&snapshot_name).await;
+    checked?;
+    deleted
+}
+
 /// A snapshot leaves the source's connection tracking as it found it, and a connection
 /// that carries data through the snapshot is not reset.
 ///
