@@ -70,7 +70,7 @@
 /* Narrow screens: the sandboxes on top, the panel a bottom sheet under them (its top is set inline). */
 .win-sheet.narrow { top: auto; left: 0; right: 0; bottom: 0; width: auto; max-width: none; border-radius: 16px 16px 0 0; border-bottom: 0; padding-bottom: env(safe-area-inset-bottom); }
 @media (max-width: 700px) {
-  .win-top { padding: 10px 16px 6px; }
+  .win-top { padding: 8px 16px 6px; }
   .win-page .win-top .brand h1 { font-size: 20px; }
   .win-stats { font-size: 12px; gap: 0 12px; }
   .win-stage { margin: 0 8px 8px; }

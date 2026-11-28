@@ -3,7 +3,7 @@
    panel of an opened phone. Colours and controls come from wall.css. */
 
 .phones-page { position: fixed; inset: 0; z-index: 1; display: flex; flex-direction: column; pointer-events: none; }
-.phones-top { display: flex; align-items: center; justify-content: space-between; gap: 12px 24px; padding: 14px 24px; min-height: 72px; background-image: linear-gradient(rgba(0, 0, 0, 0.72), rgba(0, 0, 0, 0)); }
+.phones-top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 24px; padding: 14px 24px; min-height: 72px; background-image: linear-gradient(rgba(0, 0, 0, 0.72), rgba(0, 0, 0, 0)); }
 .phones-top .btn { pointer-events: auto; background: rgba(11, 13, 16, 0.55); }
 /* The room the phones are laid out in, measured by the page. */
 .phones-stage { flex: 1; min-height: 0; margin: 0 24px 24px; }

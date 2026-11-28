@@ -87,6 +87,7 @@ pnpm build && pnpm exec playwright test -c playwright.phones.config.ts   # phone
 pnpm build && pnpm exec playwright test -c playwright.windows.config.ts  # windows mode only, against a mock with four sandboxes, on a desktop and a phone screen
 pnpm build && pnpm exec playwright test -c playwright.minecraft.config.ts  # minecraft mode only, against a mock with four servers, on a desktop and a phone screen
 pnpm build && pnpm exec playwright test -c playwright.potato.config.ts   # potato mode only, against a mock host with eight players
+pnpm build && pnpm exec playwright test -c playwright.topbar.config.ts   # every mode's top bar on 390, 360, 1280 and 1728 px screens: each control inside the viewport, 44 px tall on touch
 FLEET_SCREENSHOT_DIR=$PWD/docs/screenshots pnpm test:e2e   # also rewrites the pictures
 pnpm build && pnpm measure [16 50 100]       # decode and draw cost
 ```
