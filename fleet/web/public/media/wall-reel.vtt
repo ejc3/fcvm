@@ -1,0 +1,4 @@
+WEBVTT
+
+00:00.000 --> 00:26.000
+The live wall: 14 Tesla T4 GPUs path-tracing the same scene, fcvm restored from a snapshot on the left, EC2 launched from an AMI on the right.

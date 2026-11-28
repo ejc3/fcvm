@@ -99,6 +99,32 @@ jobs:
             *) echo "::error::stage.fcvm.dev answered an unauthenticated request without Access: $out"; exit 1 ;;
           esac
 
+  # Every file the page asks for under /media is served by the deployed host (200, right content
+  # type), through the Access service token the smoke uses. The header goes to stage.fcvm.dev only.
+  media:
+    name: Media files served on staging
+    needs: deploy
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: fleet-stage-deploy
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+      - name: Every /media file the page asks for
+        env:
+          STAGING_ORIGIN: ${{ vars.STAGING_ORIGIN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          [ -n "$CF_ACCESS_CLIENT_ID" ] && [ -n "$CF_ACCESS_CLIENT_SECRET" ] || { echo "::error::the Access service token is not set: cannot check staging"; exit 1; }
+          node fleet/web/scripts/media-check.ts "${STAGING_ORIGIN:-https://stage.fcvm.dev}"
+
   # The viewer-path smoke against the page's coordinator, after every web deploy: every mode's
   # tiles from an IPv4-only viewer and an IPv6 one (fleet-viewer-smoke.yml).
   smoke:

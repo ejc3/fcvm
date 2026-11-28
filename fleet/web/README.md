@@ -237,7 +237,7 @@ awake and every region of the live image has a frame, the recording fades out ov
 so nothing blank is ever shown. The wake, as measured, appears once under the counter:
 "Last wake: 128 GPUs from zero in 2:07". The page reads the media from `FLEET_MEDIA_URL`
 (default `/media` on its own origin, Workers static assets: a 720p reel stays well under
-the 25 MiB per-file limit); the mock serves a generated 4 s test clip.
+the 25 MiB per-file limit); the mock serves a generated 4 s test clip. The real reel is in `public/media` (a 26 s, 1280x720 recording of the staging wall: `wall-reel.mp4`, `wall-reel.webm`, `wall-reel.vtt`, `wall-reel.json`). `scripts/media-check.ts <origin>` requests every file the page asks for there and requires 200 with the right content type; it runs against the built Worker in `worker-smoke.sh`, against staging after each deploy, and against the prod page in the prod smoke.
 
 **Each side as wide as its GPUs, and re-tiling without a hitch.** The coordinator gives
 every tile its rectangle, and the sides are as wide as the GPUs each has live (fcvm 100

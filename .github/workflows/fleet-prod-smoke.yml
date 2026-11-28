@@ -68,6 +68,11 @@ jobs:
           case "$HOLD_MINUTES" in ''|*[!0-9]*) echo "hold_minutes must be a whole number" >&2; exit 2;; esac
           python3 -B fleet/coord/stage-smoke.py --target prod --family v4 --single-family --modes "$MODES" --broadcast \
             --hold-seconds "$((10#$HOLD_MINUTES * 60))" | tee "$RUNNER_TEMP/smoke.jsonl"
+      # prod-page-check.sh also runs fleet/web/scripts/media-check.ts, which needs Node 22.18 or later.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        if: vars.PROD_SITE_LIVE == 'true'
+        with:
+          node-version: '22'
       - name: The page at fcvm.dev over IPv4
         if: vars.PROD_SITE_LIVE == 'true'
         env:
@@ -120,6 +125,11 @@ jobs:
         run: |
           set -o pipefail
           python3 -B fcvm/fleet/coord/stage-smoke.py --target prod --family v6 --modes "$MODES" --broadcast | tee "$RUNNER_TEMP/smoke.jsonl"
+      # prod-page-check.sh also runs fleet/web/scripts/media-check.ts, which needs Node 22.18 or later.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        if: vars.PROD_SITE_LIVE == 'true'
+        with:
+          node-version: '22'
       - name: The page at fcvm.dev over IPv6
         if: vars.PROD_SITE_LIVE == 'true'
         env:
