@@ -1765,9 +1765,37 @@ vDSO waits out that gap (a Python `time.sleep(0.5)` took the test's whole 1140 s
 tokio's timers fire at once or not for half an hour: "Firecracker socket not ready after 5
 seconds", and #2246's restore watcher retrying 520 times a second. It needs no counter
 offset from the VMM: a Firecracker that never calls KVM_ARM_SET_COUNTER_OFFSET shows the
-same gap. Which FEAT_NV2p1-conditional path in L1's KVM does it has not been traced
-(candidates in 7.3.3: `timer_set_traps` writing CNTKCTL_EL1 instead of CNTHCTL_EL2, the
-save of a guest hypervisor's CNTHCTL_EL2, the CPACR_EL1 trap).
+same gap. Which FEAT_NV2p1-conditional path in L1's KVM makes the two counters differ has
+not been traced (candidates in 7.3.3: `timer_set_traps` writing CNTKCTL_EL1 instead of
+CNTHCTL_EL2, the save of a guest hypervisor's CNTHCTL_EL2, the CPACR_EL1 trap).
+
+**Why the kernel and the vDSO read different counters at all: the device tree.** That
+gap needs two things, and the false FEAT_NV2p1 was the second. The first was in the
+device tree Firecracker gave a guest with EL2: its timer node listed four interrupts
+(PPIs 13, 14, 11, 10) and not the EL2 virtual timer's (PPI 12, INTID 28). A kernel at EL2
+with VHE then prints `arch_timer: [Firmware Bug]: VHE-capable CPU without EL2 virtual
+timer interrupt`, takes its tick from the EL2 physical timer (`cp15 timer running at ...
+(hyp-phys)`) and keeps time on the physical counter, while its vDSO reads the virtual
+one. nested.arm64's Firecracker lists PPI 12 for a guest started with `--enable-nv2`
+since 790258178c97; the kernel then runs on the EL2 virtual timer (`hyp-virt`) and reads
+the counter its vDSO reads. Measured on one boot of a c8gd.metal-24xl (host
+7.3.3-fcvm-57abeebe8d9c) with the nested kernel that still set NV_frac to 2, in L2:
+
+| nested Firecracker | mode | L2 kernel timer | CNTVCT_EL0 - `cycle_last` | vDSO - syscall |
+|---|---|---|---|---|
+| 8750b5219068, four interrupts | snapshot | hyp-phys | -71.389 s | +2127.630 s |
+| 8750b5219068 | `FCVM_NO_SNAPSHOT=1` | hyp-phys | -64.314 s | +2134.699 s |
+| 790258178c97, five | snapshot | hyp-virt | +0.009 s | +7 us |
+| 790258178c97 | `FCVM_NO_SNAPSHOT=1` | hyp-virt | +0.018 s | +6 us |
+
+Both fixes stay: a guest must not be told it has FEAT_NV2p1, and a guest with EL2 must be
+told its EL2 virtual timer's interrupt. The fifth interrupt also shortens nested boots:
+`test_nested_l3`, five runs each in rotated order on that boot with today's nested kernel
+(NV_frac 1), took 276.7 s from L2's marker to L3's on 8750b5219068 (261.3 to 297.0) and
+202.5 s on 790258178c97 (196.9 to 206.8); L1 to L2 77.3 s against 76.0 s.
+`test_a_guest_with_el2_gets_the_hypervisor_virtual_timer_interrupt` reads the timer node
+and the kernel's `arch_timer` interrupt in a guest of the nested profile. Only that
+profile starts Firecracker with `--enable-nv2`, so only its pin moved.
 
 An override may tell a guest about a feature the hypervisor below emulates, never about
 one it does not.

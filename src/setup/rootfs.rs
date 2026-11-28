@@ -4051,8 +4051,8 @@ branch = "agent/nv2"
         "df341d66cfef596c957d4ebd0865d6f39b787784",
         // gpu.arm64.
         "51247b891bceddcdd06169f61d5a64b33f5e0ba5",
-        // nested.arm64.
-        "8750b52190681dbc6fbf633243e1793b1841290d",
+        // nested.arm64: one commit on 8750b5219068, which carries the fix.
+        "790258178c9702f3eb7efe876f683a5f236103a1",
     ];
 
     /// A pin that moves to a commit without that fix brings #2172 back, and only a test that

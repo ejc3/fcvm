@@ -674,9 +674,13 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # build's does: a TX descriptor the guest published just before the pause is in
 # the snapshot but its notification is not, and under EVENT_IDX the guest never
 # notifies again, so the clone never reached the host over vsock (#1207).
+# The pin also lists the EL2 virtual timer's interrupt (PPI 12) in the device tree of a
+# guest started with --enable-nv2. Without it a guest kernel at EL2 keeps time on the EL2
+# physical timer and the physical counter while its vDSO reads the virtual counter (#2246,
+# .claude/CLAUDE.md "The value is 1, and 2 is a different feature").
 firecracker_repo = "ejc3/firecracker"
 firecracker_branch = "fix/vsock-restore-tx-kick-nv2-gic-clear-restore"
-firecracker_commit = "8750b52190681dbc6fbf633243e1793b1841290d"
+firecracker_commit = "790258178c9702f3eb7efe876f683a5f236103a1"
 firecracker_args = "--enable-nv2"
 
 # Boot args for nested KVM

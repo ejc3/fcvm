@@ -236,6 +236,147 @@ async fn test_kvm_available_in_vm() -> Result<()> {
     Ok(())
 }
 
+/// The PPI numbers of a device tree timer node's `interrupts` property, from
+/// `od -An -v -tu1` of it: big-endian cells in threes (type, number, flags).
+#[cfg(target_arch = "aarch64")]
+fn timer_interrupt_ppis(od_output: &str) -> Result<Vec<u32>> {
+    let bytes = od_output
+        .split_whitespace()
+        .map(|byte| {
+            byte.parse::<u8>()
+                .with_context(|| format!("od byte {byte:?}"))
+        })
+        .collect::<Result<Vec<u8>>>()?;
+    anyhow::ensure!(
+        !bytes.is_empty() && bytes.len() % 12 == 0,
+        "the timer node's interrupts property is {} bytes, not a list of 12-byte entries",
+        bytes.len()
+    );
+    bytes
+        .chunks(12)
+        .map(|entry| {
+            let cell =
+                |i: usize| u32::from_be_bytes([entry[i], entry[i + 1], entry[i + 2], entry[i + 3]]);
+            anyhow::ensure!(cell(0) == 1, "interrupt type {} is not a PPI", cell(0));
+            Ok(cell(4))
+        })
+        .collect()
+}
+
+/// The GIC interrupt number of the `arch_timer` line in `/proc/interrupts`.
+#[cfg(target_arch = "aarch64")]
+fn arch_timer_intid(proc_interrupts: &str) -> Result<u32> {
+    let line = proc_interrupts
+        .lines()
+        .find(|line| line.split_whitespace().last() == Some("arch_timer"))
+        .context("no arch_timer line in /proc/interrupts")?;
+    let mut words = line
+        .split_whitespace()
+        .skip_while(|word| !word.starts_with("GIC"));
+    words
+        .next()
+        .with_context(|| format!("no GIC column in {line:?}"))?;
+    words
+        .next()
+        .with_context(|| format!("no interrupt number after the GIC column in {line:?}"))?
+        .parse()
+        .with_context(|| format!("interrupt number in {line:?}"))
+}
+
+/// A guest that has EL2 must be told the interrupt of the EL2 virtual timer.
+///
+/// A kernel that boots at EL2 with VHE keeps time on the EL2 virtual timer when its
+/// device tree lists that timer's interrupt as the fifth of the timer node (PPI 12,
+/// INTID 28, KVM's default for it). Without it the kernel prints
+/// "arch_timer: [Firmware Bug]: VHE-capable CPU without EL2 virtual timer interrupt"
+/// and falls back to the EL2 physical timer (PPI 10, INTID 26). Firecracker listed four
+/// interrupts for every guest, so every guest of the nested profile ran on that
+/// fallback, and so did the guests it started. On it the kernel keeps time on the
+/// physical counter while its vDSO reads the virtual one, which is what let a wrong
+/// counter offset turn into #2246's clock, and `test_nested_l3` took 276.7 s from L2's
+/// marker to L3's against 202.5 s with the interrupt listed (.claude/CLAUDE.md, "Why the
+/// kernel and the vDSO read different counters at all").
+///
+/// The name avoids "nested" so the CI root lane's filter keeps the test: it boots one
+/// guest and starts nothing inside it.
+#[cfg(target_arch = "aarch64")]
+#[tokio::test]
+async fn test_a_guest_with_el2_gets_the_hypervisor_virtual_timer_interrupt() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("el2-timer");
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--kernel-profile",
+        "nested",
+        "--privileged",
+        common::TEST_IMAGE,
+    ])
+    .await
+    .context("spawning fcvm podman run with the nested profile")?;
+    if let Err(e) = common::poll_health(&mut child, 180).await {
+        let _ = child.kill().await;
+        return Err(e.context("VM failed to become healthy"));
+    }
+
+    let checks = async {
+        let property = common::exec_in_vm(
+            fcvm_pid,
+            &[
+                "/usr/bin/od",
+                "-An",
+                "-v",
+                "-tu1",
+                "/sys/firmware/devicetree/base/timer/interrupts",
+            ],
+        )
+        .await
+        .context("reading the timer node's interrupts property in the guest")?;
+        let ppis = timer_interrupt_ppis(&property)?;
+        anyhow::ensure!(
+            ppis == [13, 14, 11, 10, 12],
+            "the guest's timer node lists PPIs {ppis:?}; a guest with EL2 needs the EL2 virtual \
+             timer's PPI 12 after the four every guest gets (13, 14, 11, 10)"
+        );
+
+        let interrupts = common::exec_in_vm(fcvm_pid, &["/usr/bin/cat", "/proc/interrupts"])
+            .await
+            .context("reading /proc/interrupts in the guest")?;
+        let intid = arch_timer_intid(&interrupts)?;
+        anyhow::ensure!(
+            intid == 28,
+            "the guest kernel's arch_timer interrupt is INTID {intid}; on the EL2 virtual timer \
+             it is 28 (26 is the EL2 physical timer, the kernel's fallback)"
+        );
+        Ok(())
+    }
+    .await;
+    common::kill_process(fcvm_pid).await;
+    checks
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn the_timer_interrupt_parsers_read_what_a_guest_prints() {
+    // A four-interrupt timer node (13, 14, 11, 10), then the fifth (12): type 1, flags 4.
+    let four = "0 0 0 1 0 0 0 13 0 0 0 4 0 0 0 1 0 0 0 14 0 0 0 4\n \
+                0 0 0 1 0 0 0 11 0 0 0 4 0 0 0 1 0 0 0 10 0 0 0 4\n";
+    assert_eq!(timer_interrupt_ppis(four).unwrap(), [13, 14, 11, 10]);
+    let five = format!("{four} 0 0 0 1 0 0 0 12 0 0 0 4\n");
+    assert_eq!(timer_interrupt_ppis(&five).unwrap(), [13, 14, 11, 10, 12]);
+    assert!(timer_interrupt_ppis("0 0 0 1 0 0 0 13\n").is_err());
+    assert!(timer_interrupt_ppis("").is_err());
+
+    let interrupts = "           CPU0       CPU1\n \
+        11:       5210       4873     GICv3  28 Level     arch_timer\n \
+        13:          0          0     GICv3  27 Level     kvm guest vtimer\n";
+    assert_eq!(arch_timer_intid(interrupts).unwrap(), 28);
+    assert!(arch_timer_intid("  9:  1  GICv3  33 Level  uart-pl011\n").is_err());
+}
+
 /// Read one file inside a VM. `Err` carries what the guest said about the
 /// failure, so an unreadable file is distinguishable from an empty one.
 async fn read_file_in_vm(
@@ -1145,6 +1286,9 @@ async fn test_nested_l4() -> Result<()> {
 /// socket not ready after 5 seconds", #2246). A Firecracker that sets no counter
 /// offset for L2 showed the same gap. With NV_frac = 1 the two agree in L1, L2 and L3
 /// (kernel/patches-arm64/mmfr4-override.vm.patch has the numbers).
+/// The kernel and the vDSO read different counters there only because the guest's device
+/// tree lacked the EL2 virtual timer's interrupt:
+/// `test_a_guest_with_el2_gets_the_hypervisor_virtual_timer_interrupt`.
 ///
 /// `counter_check.py` runs in each level's container, and here on the host, and prints
 /// one line. This asserts each level printed it, that it says ok, and that no guest's
