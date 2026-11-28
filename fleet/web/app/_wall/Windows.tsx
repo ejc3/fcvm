@@ -6,6 +6,7 @@
 // on a tile resets that sandbox. The page measures the stage, ticks a clock and draws the view
 // model core/windows.ts computes; every word on it comes from there.
 
+import { Landing } from "./Landing.tsx";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
 import {
   HIDDEN_PAUSE_MS,
@@ -235,7 +236,10 @@ export function Windows({ coordUrl, directUrl }: { coordUrl: string; directUrl: 
                 <span className="site">{SITE}</span>
                 <h1>{view.title}</h1>
               </div>
-              <ModeSwitch current="windows" />
+              <div className="landing-row">
+                <ModeSwitch current="windows" />
+                <Landing landing={view.landing} colour="" />
+              </div>
             </div>
             <button type="button" className="btn" disabled={view.resetAll.disabled || resetAllPending} onClick={() => void client.act("windows_reset", { all: true })} data-testid="win-reset-all">
               {view.resetAll.label}

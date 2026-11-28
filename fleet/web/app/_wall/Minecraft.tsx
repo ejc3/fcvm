@@ -6,6 +6,7 @@
 // buttons of a touch layout) over that tile's socket. The page measures the stage, ticks a clock
 // and draws the view model core/minecraft.ts computes; every word on it comes from there.
 
+import { Landing } from "./Landing.tsx";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
 import {
   cellAt,
@@ -696,7 +697,10 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
                 <span className="site">{SITE}</span>
                 <h1>{view.title}</h1>
               </div>
-              <ModeSwitch current="minecraft" />
+              <div className="landing-row">
+                <ModeSwitch current="minecraft" />
+                <Landing landing={view.landing} colour="" />
+              </div>
             </div>
             <button type="button" className="btn" disabled={view.resetAll.disabled || resetAllPending} onClick={() => void client.act("minecraft_reset", { all: true })} data-testid="mc-reset-all">
               {view.resetAll.label}

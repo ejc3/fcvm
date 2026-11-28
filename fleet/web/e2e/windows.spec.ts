@@ -4,7 +4,7 @@
 // fixed actions, and that nothing on the page sends anything but the four Windows intents.
 
 import { expect, test, type Browser, type Page } from "@playwright/test";
-import { COORD, admin, mockState } from "./helpers.ts";
+import { COORD, admin, mockState, expectLanding } from "./helpers.ts";
 
 const SANDBOXES = 4;
 const SLOTS = ["win-1", "win-2", "win-3", "win-4"];
@@ -372,3 +372,38 @@ test.describe("on a 390 px phone", () => {
     await expect(page.getByTestId("win-panel")).toHaveCount(0);
   });
 });
+
+test("windows: the line under the title and the What is this? control", async ({ page }) => {
+  await openWindows(page);
+  await expectLanding(page, { stage: "win-stage", phone: false });
+  await page.setViewportSize({ width: 360, height: 800 });
+  await expectLanding(page, { stage: "win-stage", phone: true });
+});
+
+test("windows: Escape closes the About panel and releases nothing under it", async ({ page }, info) => {
+  // On a phone the line and its control step aside while something is held (the held view takes the room), so there is no panel to close then.
+  test.skip(info.project.name === "phone", "the control is hidden while something is held on a phone");
+  const sent: string[] = [];
+  page.on("websocket", (ws) => ws.on("framesent", (e) => sent.push(String(e.payload))));
+  await openWindows(page);
+  await page.getByTestId("sandbox-take-win-3").click();
+  await expect(page.getByTestId("win-panel")).toBeVisible();
+  await page.getByTestId("landing-button").focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("landing-panel")).toBeVisible();
+  const before = sent.length;
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("landing-panel")).toHaveCount(0);
+  await expect(page.getByTestId("win-panel"), "the layer under it stays").toBeVisible();
+  await page.waitForTimeout(500);
+  expect(sent.slice(before).filter((t) => /release_|"close"/.test(t)), "no release or close intent was sent").toEqual([]);
+});
+
+test("windows: at 360 by 640 with the line at four lines, the page's main control is on screen", async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 640 });
+  await openWindows(page);
+  const b = (await page.getByTestId("win-reset-all").boundingBox())!;
+  expect(b.y + b.height).toBeLessThanOrEqual(640);
+  expect(b.x + b.width).toBeLessThanOrEqual(360);
+});
+

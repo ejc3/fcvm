@@ -4,7 +4,7 @@
 
 import { expect, test, type Page } from "@playwright/test";
 import { potatoColour } from "../core/potato.ts";
-import { admin, mockState } from "./helpers.ts";
+import { admin, mockState, expectLanding } from "./helpers.ts";
 
 type MockRound = { id: number; size: number; started_at: number; hold_ms: number; pace_ms: number | null; holder: number | null };
 type MockPotato = { size: number; round: MockRound | null; next_round_at: number | null; ladder: { size: number; rounds: number; record_pace: number | null }[] };
@@ -250,3 +250,72 @@ test("the header switch: the wall links to the potato page, which links back to 
   await expect(page.getByTestId("mode-wall")).toHaveAttribute("href", "/?debug=1");
   await expect(page.getByTestId("mode-phones")).toHaveAttribute("href", "/?debug=1&mode=phones");
 });
+
+test("potato: the line under the title and the What is this? control", async ({ page }) => {
+  await openPotato(page);
+  await expectLanding(page, { stage: "potato-stage", phone: false });
+  await page.setViewportSize({ width: 360, height: 800 });
+  await expectLanding(page, { stage: "potato-stage", phone: true });
+});
+
+test("potato: the legend is on the page with room, in the panel without, and never over the ring or the cards", async ({ page }) => {
+  await startAt(8);
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await openPotato(page);
+  const legend = page.getByTestId("potato-legend");
+  await expect(legend).toBeVisible();
+  await expect(legend.getByRole("heading", { name: "Legend" })).toBeVisible();
+  const apart = (a: { x: number; y: number; width: number; height: number }, b: typeof a) => a.x + a.width <= b.x + 1 || b.x + b.width <= a.x + 1 || a.y + a.height <= b.y + 1 || b.y + b.height <= a.y + 1;
+  const lg = (await legend.boundingBox())!;
+  expect(apart(lg, (await page.getByTestId("potato-stage").boundingBox())!), "legend clear of the ring's stage").toBe(true);
+  for (const c of await page.locator(".potato-side > .card").all()) {
+    if ((await c.getAttribute("data-testid")) === "potato-legend") continue;
+    expect(apart(lg, (await c.boundingBox())!), "legend clear of the other cards").toBe(true);
+  }
+  await expect(page.getByTestId("landing-panel")).toHaveCount(0);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByTestId("potato-legend")).toHaveCount(0);
+  await page.getByTestId("landing-button").click();
+  const inPanel = page.getByTestId("landing-panel").getByTestId("potato-legend");
+  await expect(inPanel).toBeVisible();
+  await expect(inPanel).toContainText("saved as a snapshot; uses no CPU");
+  await expect(inPanel).toContainText("slowest player");
+});
+
+test("potato: the legend's marks keep their colours in the panel, in the dark and the light scheme", async ({ page }) => {
+  await startAt(8);
+  for (const scheme of ["dark", "light"] as const) {
+    await page.emulateMedia({ colorScheme: scheme });
+    await page.setViewportSize({ width: 360, height: 800 });
+    await openPotato(page);
+    await page.getByTestId("landing-button").click();
+    const panel = page.getByTestId("landing-panel");
+    await expect(panel).toBeVisible();
+    const sw = panel.locator(".potato-swatch").first();
+    const colours = await sw.evaluate((el) => ({ bg: getComputedStyle(el).backgroundColor, edge: getComputedStyle(el).boxShadow }));
+    expect(colours.bg, `${scheme}: the swatch has a fill`).not.toBe("rgba(0, 0, 0, 0)");
+    expect(colours.edge, `${scheme}: the tile edge`).not.toBe("none");
+    const holder = panel.locator('.potato-swatch[data-holder="true"]').first();
+    if (await holder.count()) expect(await holder.evaluate((el) => getComputedStyle(el).boxShadow), `${scheme}: the holder's ring`).toMatch(/rgb/);
+    const ball = panel.locator(".lg-ball").first();
+    if (await ball.count()) expect(await ball.evaluate((el) => getComputedStyle(el).backgroundImage), `${scheme}: the ball has a fill`).toMatch(/gradient/);
+    // the panel's own colours follow the page's scheme
+    const panelBg = await panel.evaluate((el) => getComputedStyle(el).backgroundColor);
+    const [r, g, b] = panelBg.match(/\d+/g)!.map(Number) as [number, number, number];
+    if (scheme === "light") expect(Math.min(r, g, b), "a light panel").toBeGreaterThan(200);
+    else expect(Math.max(r, g, b), "a dark panel").toBeLessThan(60);
+    await page.keyboard.press("Escape");
+  }
+});
+
+test("potato: at 360 by 640 with the line at four lines, Faster and Restart are on screen", async ({ page }) => {
+  await startAt(8);
+  await page.setViewportSize({ width: 360, height: 640 });
+  await openPotato(page);
+  for (const id of ["potato-faster", "potato-restart"]) {
+    const b = (await page.getByTestId(id).boundingBox())!;
+    expect(b.y + b.height, id).toBeLessThanOrEqual(640);
+    expect(b.x + b.width, id).toBeLessThanOrEqual(360);
+  }
+});
+

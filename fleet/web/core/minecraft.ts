@@ -5,6 +5,7 @@
 // has WebGL2 (minecraft3d.ts), else as a flat map. The colours are ours: one flat colour per
 // material. No texture, sound or other asset of the game.
 
+import { landingView, type LandingView } from "./landing.ts";
 import type { Box } from "./layout.ts";
 import * as fmt from "./format.ts";
 import { serverNow } from "./clock.ts";
@@ -34,8 +35,6 @@ import {
 } from "./minecraft-field.ts";
 
 export const MINECRAFT_TITLE = "Minecraft";
-export const MINECRAFT_SENTENCE =
-  "Each tile is a Minecraft server in its own virtual machine, restored from one snapshot with its world loaded, drawn by your browser. Fork copies a running server into the tile next to it.";
 export const NO_MINECRAFT = "This fleet runs no Minecraft servers.";
 
 /** The port Java Edition players connect to. */
@@ -1048,7 +1047,7 @@ export interface MinecraftInput {
 
 export interface MinecraftView {
   title: string;
-  sentence: string;
+  landing: LandingView;
   online: boolean;
   empty: string | null;
   banner: string | null;
@@ -1182,7 +1181,7 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
   const srvNow = serverNow(s.clock, inp.now);
   const common = {
     title: MINECRAFT_TITLE,
-    sentence: MINECRAFT_SENTENCE,
+    landing: landingView("minecraft"),
     online,
     renderer: inp.renderer ?? null,
     verify: verifyView(s),

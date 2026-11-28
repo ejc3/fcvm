@@ -4,6 +4,7 @@
 // Nothing here describes a click or a key on a desktop: a viewer resets a sandbox, borrows one
 // and presses fixed actions, and the intents carry no point and no text.
 
+import { landingView, type LandingView } from "./landing.ts";
 import { snap, type Box } from "./layout.ts";
 import * as fmt from "./format.ts";
 import { serverNow } from "./clock.ts";
@@ -14,7 +15,6 @@ import { BLANK_PLAN, directPlan, gridOf, openedArea, tenths } from "./phones.ts"
 import { noneListedText, phaseText, sleepView, verifyView, type DrawPlan, type SleepView } from "./view.ts";
 
 export const WINDOWS_TITLE = "Windows";
-export const WINDOWS_SENTENCE = "Each sandbox is a Windows desktop in its own virtual machine, restored from one snapshot. Click a desktop to throw it away and restore a new one.";
 export const NO_WINDOWS = "This fleet runs no Windows sandboxes.";
 
 /** Between two tiles, CSS pixels. */
@@ -332,7 +332,7 @@ export interface WindowsInput {
 
 export interface WindowsView {
   title: string;
-  sentence: string;
+  landing: LandingView;
   online: boolean;
   /** Why there is nothing to show, when there is nothing. */
   empty: string | null;
@@ -394,7 +394,7 @@ export function windowsView(inp: WindowsInput): WindowsView {
   const srvNow = serverNow(s.clock, inp.now);
   const common = {
     title: WINDOWS_TITLE,
-    sentence: WINDOWS_SENTENCE,
+    landing: landingView("windows"),
     online,
     verify: verifyView(s),
     notice: windowsNotice(s.notices),

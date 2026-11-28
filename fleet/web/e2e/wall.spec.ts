@@ -4,7 +4,7 @@ import { DETAIL_TILE_PX, layoutMosaic, neighbour, readingOrder, streamHeightFor,
 import { ZOOM_DIM_NEAR, ZOOM_SHEET_W, zoomInsetsFor } from "../core/view.ts";
 import { IVS_PLAYER_URL } from "../core/broadcast.ts";
 import { streamBitrate } from "../core/bandwidth.ts";
-import { COORD, SEAM_MIN_PAIRS, admin, fleetNow, focusError, holdSeamCamera, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
+import { COORD, SEAM_MIN_PAIRS, admin, expectLanding, fleetNow, focusError, holdSeamCamera, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
 
 const view = (page: Page) =>
   page.evaluate(() => {
@@ -2180,3 +2180,22 @@ test("a probe that lands while the renderers are not accepting yet tries again: 
   expect((await page.evaluate(() => window.__fleet!.client.getState().net)).family).toBe("v6");
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
 });
+
+test("the line under the title and the What is this? control", async ({ page }) => {
+  await openWall(page, 1);
+  await expectLanding(page, { phone: false });
+  await page.setViewportSize({ width: 360, height: 800 });
+  await expectLanding(page, { phone: true });
+});
+
+test("a tap on a tile with the About panel open only closes the panel", async ({ page }) => {
+  await openWall(page, 1);
+  await page.getByTestId("landing-button").click();
+  await expect(page.getByTestId("landing-panel")).toBeVisible();
+  const t = await page.evaluate(() => window.__fleet!.view().tiles.find((x) => x.box !== null)!.box!);
+  await page.mouse.click(t.x + t.w / 2, t.y + t.h / 2);
+  await expect(page.getByTestId("landing-panel")).toHaveCount(0);
+  await page.waitForTimeout(400);
+  await expect(page.getByTestId("focus"), "the tile under the tap did not open").toHaveCount(0);
+});
+

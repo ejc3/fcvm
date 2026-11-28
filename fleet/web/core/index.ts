@@ -16,6 +16,7 @@ export * from "./race.ts";
 export * from "./reel.ts";
 export * from "./broadcast.ts";
 export * from "./view.ts";
+export * from "./landing.ts";
 export * from "./phones.ts";
 export * from "./potato.ts";
 export * from "./windows.ts";

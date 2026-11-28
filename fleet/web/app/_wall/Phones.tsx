@@ -5,6 +5,7 @@
 // (state.phones.zoomed_out); which phone is opened is this viewer's own. The page measures the
 // stage, forwards input as actions and draws the view model core/phones.ts computes.
 
+import { Landing } from "./Landing.tsx";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
 import {
   HIDDEN_PAUSE_MS,
@@ -615,7 +616,10 @@ export function Phones({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
               <span className="site">{SITE}</span>
               <h1>{view.title}</h1>
             </div>
-            <ModeSwitch current="phones" />
+            <div className="landing-row">
+              <ModeSwitch current="phones" />
+              <Landing landing={view.landing} colour="" />
+            </div>
           </div>
           {!panelOpen ? (
             <button

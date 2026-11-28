@@ -202,7 +202,7 @@ function PlaySections({ client, view, word, setWord }: { client: WallClient; vie
 function AboutSection({ view }: { view: WallView }) {
   return (
     <section className="about" data-testid="about">
-      <p data-testid="sentence">{view.sentence}</p>
+      <p data-testid="sentence">{view.landing.line}</p>
       <p>
         <a href="/boot-race" data-testid="boot-race-link">Boot race: recorded results</a> of fcvm restores against EC2, ECS and Lambda.
       </p>

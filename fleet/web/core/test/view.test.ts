@@ -63,6 +63,14 @@ function view(s: ClientState, now: number, over: Partial<WallInput> = {}) {
   });
 }
 
+it("the wall's line stops saying EC2 when the view lists a Lambda tile", () => {
+  const lam = view(stateWith(lambdaFleet()), EPOCH);
+  expect(lam.landing.line).not.toContain("EC2");
+  expect(lam.landing.line).toBe("Each square is a virtual machine with its own NVIDIA GPU. About half are restored by fcvm; the rest are started on AWS the usual way.");
+  const ec2 = view(stateWith(fleet(2, 2)), EPOCH);
+  expect(ec2.landing.line).toContain("EC2");
+});
+
 function race(start: number, over: Partial<RelaunchAll> = {}): RelaunchAll {
   return {
     started_at: start,
@@ -953,7 +961,8 @@ describe("the stage", () => {
     }
     expect(v.labels.sides[0]!.x).toBeLessThan(v.layout!.halfLineX!);
     expect(v.labels.sides[1]!.x).toBeGreaterThan(v.layout!.halfLineX!);
-    expect(v.sentence).toBe("Each square is its own virtual machine with its own NVIDIA GPU. Restart them all and watch which side comes back.");
+    expect(v.landing.line).toBe("Each square is a virtual machine with its own NVIDIA GPU. About half are restored by fcvm; the rest are EC2 GPUs started normally.");
+    expect(v.landing.line).toContain("EC2");
   });
 
   it("shortens a half's tag to its name when that half is too narrow for the whole tag", () => {
