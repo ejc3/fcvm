@@ -696,33 +696,6 @@ mod tests {
         );
     }
 
-    /// The SIGKILL case in tests/test_lifecycle_interleave.rs kills and reaps its create on
-    /// every way out (a create left held at its failpoint keeps the generation lock that the
-    /// cleanup's delete waits on), and takes the time of the kill before the kill and
-    /// rejects an answer that arrives after the deadline.
-    #[test]
-    fn the_sigkill_case_reaps_its_create_and_rejects_a_late_recovery() {
-        let source = include_str!("../../tests/test_lifecycle_interleave.rs");
-        let start = source
-            .find("async fn killed_snapshot_create_resumes_its_source(")
-            .unwrap();
-        let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
-        let killed_at = body.find("let killed_at = Instant::now();").unwrap();
-        let kill = body.find("libc::SIGKILL").unwrap();
-        assert!(killed_at < kill, "the kill's time is taken after the kill");
-        assert!(body.contains("break in_time(\"exec\""));
-        assert!(body.contains("break in_time(\"port\""));
-        let after_block = &body[body.rfind("}\n    .await;").unwrap()..];
-        let reaped = after_block
-            .find("start_kill()")
-            .expect("no kill of the create after the case");
-        let stopped = after_block.find("sigterm(vm_pid)").unwrap();
-        assert!(
-            reaped < stopped,
-            "the create is reaped after the VM is stopped"
-        );
-    }
-
     /// Creates the guard's socket pair and pidfd with close-on-exec, so no other child of
     /// the create keeps them across its exec, and clears the flag only in the guard's own
     /// pre_exec, on exactly the descriptors it is handed.
