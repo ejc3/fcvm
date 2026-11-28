@@ -793,6 +793,112 @@ impl KernelPatchFixture {
     }
 }
 
+impl KernelPatchFixture {
+    /// `validate nested.host_kernel` with `workdir` as KERNEL_PATCH_WORKDIR, run from `cwd`.
+    /// A `curl` ahead of the real one on PATH stands in for the download: it writes the
+    /// fixture's release 9.9.9 source to the tarball the script asked for.
+    fn validate(&self, workdir: &std::ffi::OsStr, cwd: &Path) -> std::process::Output {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = self.root.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(
+            bin.join("curl"),
+            "#!/bin/sh\n\
+             # kernel-patch.sh runs: curl -fL -o <tarball> <url>\n\
+             while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n\
+             exec tar -cf \"$out\" -C \"$KERNEL_SOURCE_PARENT\" --exclude=.git linux-9.9.9\n",
+        )
+        .unwrap();
+        fs::set_permissions(bin.join("curl"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        Command::new("bash")
+            .arg(self.root.path().join("scripts/kernel-patch.sh"))
+            .args(["validate", "nested.host_kernel"])
+            .current_dir(cwd)
+            .env("PATH", path)
+            .env("KERNEL_SOURCE_PARENT", self.work.path())
+            .env("KERNEL_PATCH_ARCH", "aarch64")
+            .env("KERNEL_PATCH_WORKDIR", workdir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("run kernel-patch.sh validate")
+    }
+}
+
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// KERNEL_PATCH_WORKDIR names the directory `validate` works under. `validate` removed
+/// the directory itself when it finished, so one that held anything else lost it: here,
+/// the source tree an `edit` left there and a file beside it.
+#[test]
+fn validate_removes_only_the_directory_it_made() {
+    let fixture = KernelPatchFixture::new();
+    let work = fixture.work.path();
+    fs::write(work.join("keep.txt"), "not validate's\n").unwrap();
+    let before = names_in(work);
+    let source = fixture.source();
+
+    let out = fixture.validate(work.as_os_str(), fixture.root.path());
+    assert!(out.status.success(), "{}", output_text(&out));
+    assert!(
+        output_text(&out).contains("All patches valid"),
+        "validate did not reach its patches:\n{}",
+        output_text(&out)
+    );
+    assert!(
+        work.join("keep.txt").exists(),
+        "validate deleted a file it did not make:\n{}",
+        output_text(&out)
+    );
+    assert_eq!(
+        names_in(work),
+        before,
+        "what validate left in its work directory"
+    );
+    assert_eq!(
+        fixture.source(),
+        source,
+        "validate patched a tree it did not extract"
+    );
+}
+
+/// A relative KERNEL_PATCH_WORKDIR is resolved where `validate` was started. It was
+/// resolved again for the cleanup, from inside the kernel tree, so nothing was removed.
+#[test]
+fn validate_cleans_up_under_a_relative_work_directory() {
+    let fixture = KernelPatchFixture::new();
+    let here = tempfile::tempdir().expect("create the directory validate starts in");
+
+    let out = fixture.validate(std::ffi::OsStr::new("scratch"), here.path());
+    assert!(out.status.success(), "{}", output_text(&out));
+    assert!(
+        output_text(&out).contains("All patches valid"),
+        "validate did not reach its patches:\n{}",
+        output_text(&out)
+    );
+    assert_eq!(names_in(here.path()), ["scratch"]);
+    assert_eq!(
+        names_in(&here.path().join("scratch")),
+        [] as [&str; 0],
+        "validate left its work behind:\n{}",
+        output_text(&out)
+    );
+}
+
 fn output_text(out: &std::process::Output) -> String {
     format!(
         "{}{}",

@@ -21,6 +21,10 @@
 #   # Validate all patches for a profile apply cleanly
 #   ./scripts/kernel-patch.sh validate nested
 #
+# KERNEL_PATCH_WORKDIR: where the kernel source is extracted. create and edit work in that
+# directory itself and leave it for `finish`. validate makes its own directory under it and
+# removes that one when it exits (default: under /tmp).
+#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -188,7 +192,7 @@ setup_kernel_source() {
         info "Initializing git repo..."
         git init -q
         # A commit of the whole tree leaves enough loose objects for git to start
-        # `gc --auto` in the background, and validate's `rm -rf` of the work
+        # `gc --auto` in the background, and validate's `rm -rf` of its work
         # directory then races it ("Directory not empty").
         git config gc.auto 0
         git add -A
@@ -449,13 +453,23 @@ cmd_validate() {
     local version patches_dir
     version=$(get_kernel_version "$profile") || error "Could not resolve kernel version for profile '$profile'"
     patches_dir=$(get_patches_dir "$profile") || error "Could not resolve patches_dir for profile '$profile'"
-    local workdir="${KERNEL_PATCH_WORKDIR:-/tmp/kernel-validate-$$}"
 
     # An empty patches_dir means the profile deliberately applies no patches.
     if [[ -z "$patches_dir" ]]; then
         info "Profile '$profile' has patches disabled (patches_dir is empty); nothing to validate"
         return
     fi
+
+    # validate works in a directory it makes under KERNEL_PATCH_WORKDIR (default /tmp) and
+    # removes only that directory, on every exit. The parent can hold anything else, an
+    # `edit` in progress or another validate's directory, and a relative one is resolved
+    # here, before any cd.
+    local parent="${KERNEL_PATCH_WORKDIR:-/tmp}"
+    mkdir -p "$parent" || error "Cannot create work directory parent '$parent'"
+    parent=$(cd "$parent" && pwd -P) || error "Cannot enter work directory parent '$parent'"
+    VALIDATE_WORKDIR=$(mktemp -d "$parent/kernel-validate.XXXXXXXX") || error "Cannot create a work directory under '$parent'"
+    trap 'rm -rf -- "$VALIDATE_WORKDIR"' EXIT
+    local workdir="$VALIDATE_WORKDIR"
 
     info "Validating patches for kernel $version (profile: $profile)"
 
@@ -479,8 +493,6 @@ cmd_validate() {
             failed=1
         fi
     done
-
-    rm -rf "$workdir"
 
     if [[ $failed -eq 0 ]]; then
         info "All patches valid!"
