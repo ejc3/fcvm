@@ -1747,14 +1747,30 @@ make test-root FILTER=kvm
 
 **The value is 1, and 2 is a different feature.** ID_AA64MMFR4_EL1.NV_frac is 0 NV_NV2,
 1 NV2_ONLY, 2 NV2P1, 3 NV3 (`arch/arm64/tools/sysreg`, Linux 7.3.3). The alias set 2 until
-2026-11-27, which told every nested guest it had FEAT_NV2p1. An L1's KVM that believes
-that writes its guests' counter and timer traps to CNTKCTL_EL1, where without FEAT_NV2p1
-the trap bits are RES0 and the host never sees them (`timer_set_traps`), and stops
-trapping its guest hypervisor's CPACR_EL1. L2's kernel then read L1's counter while L2's
-user space read the zero-based one, 73 s apart, so every vDSO clock in L2 was wrong by up
-to 2^41 ns and jumped in multiples of 2^33 ns (#2246: tokio timers firing at once,
-"Firecracker socket not ready after 5 seconds"). An override may tell a guest about a
-feature the hypervisor below emulates, never about one it does not.
+2026-11-28, which told every nested guest it had FEAT_NV2p1 on CPUs that have not.
+Measured on a c8gd.metal-24xl (#2249), reading CNTVCT_EL0 at EL0 against the kernel's
+`cycle_last` in the vDSO data page:
+
+| nested kernel | host | L1 | L2 | L3 |
+|---|---|---|---|---|
+| NV_frac = 2 (L1 logs `FEAT_NV2p1`) | +0.4 to +1.6 ms | +5 to +15 ms | -9 to -73 s | not read |
+| NV_frac = 1 | +0.3 to +1.6 ms | +0.8 to +15 ms | +5 to +15 ms | +13 ms |
+
+With 2, the counter L2's user space reads is behind the one its kernel keeps time with by
+L1's counter at L2's creation. The vDSO's difference wraps through the 56-bit clocksource
+mask and overflows, so every vDSO clock in L2 was up to 2^41 ns (2199 s) from the kernel's
+and jumped by multiples of 2^33 ns (8.59 s) whenever NTP moved the multiplier: 38 jumps in
+179 samples. Anything in L2 that waits for an absolute monotonic deadline taken from the
+vDSO waits out that gap (a Python `time.sleep(0.5)` took the test's whole 1140 s), and
+tokio's timers fire at once or not for half an hour: "Firecracker socket not ready after 5
+seconds", and #2246's restore watcher retrying 520 times a second. It needs no counter
+offset from the VMM: a Firecracker that never calls KVM_ARM_SET_COUNTER_OFFSET shows the
+same gap. Which FEAT_NV2p1-conditional path in L1's KVM does it has not been traced
+(candidates in 7.3.3: `timer_set_traps` writing CNTKCTL_EL1 instead of CNTHCTL_EL2, the
+save of a guest hypervisor's CNTHCTL_EL2, the CPACR_EL1 trap).
+
+An override may tell a guest about a feature the hypervisor below emulates, never about
+one it does not.
 `the_nv2_boot_parameter_claims_nv2_only` pins the value, and
 `test_nested_l2_user_space_reads_the_kernels_counter` reads the counters and each level's
 FEAT_NV2p1 detection.

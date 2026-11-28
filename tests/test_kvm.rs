@@ -1131,29 +1131,24 @@ async fn test_nested_l4() -> Result<()> {
 /// A guest's user space must read the counter its kernel keeps time with, at every
 /// nesting level.
 ///
-/// Every level here boots at virtual EL2 (`--kernel-profile nested`), so its kernel
-/// reads the physical counter (CNTPCT_EL0) and its vDSO reads the virtual one
-/// (CNTVCT_EL0 at EL0). They are the same count only if the hypervisor below applies
-/// the VM's counter offset to both. Measured 2026-11-27 on a c8gd.metal-24xl, host and
-/// guest kernels 7.3.3: on the host and in L1 CNTVCT_EL0 was 1 to 11 ms past the
-/// kernel's cycle_last, as it should be. In L2 it was 73.45 s behind it, the offset
-/// L1's Firecracker gave L2 with KVM_ARM_SET_COUNTER_OFFSET: L2's kernel was reading
-/// L1's counter and L2's user space the zero-based one. The vDSO then computes with a
-/// wrapped, overflowing difference, so in L2 `clock_gettime` through the vDSO was
-/// 2125.558 s from the syscall's for CLOCK_MONOTONIC_RAW, and CLOCK_MONOTONIC,
-/// REALTIME and BOOTTIME jumped by whole multiples of 2^33 ns (8.59 s) as NTP moved
-/// the clocksource multiplier: 38 jumps in 179 samples over six runs. Every tokio
-/// timer and `Instant` in L2 runs on that clock ("Firecracker socket not ready after 5
-/// seconds", #2246).
-///
-/// The cause was fcvm's own guest kernel patch: `arm64.nv2` set
-/// ID_AA64MMFR4_EL1.NV_frac to 2, which is NV2P1 and not NV2_ONLY, so L1's KVM believed
-/// in FEAT_NV2p1 and wrote L2's counter traps to CNTKCTL_EL1, where the host never sees
-/// them (kernel/patches-arm64/mmfr4-override.vm.patch has the whole chain).
+/// The vDSO computes a clock from CNTVCT_EL0 read at EL0 and the `cycle_last` the kernel
+/// recorded from its own counter. Measured 2026-11-27 and 28 on a c8gd.metal-24xl, host
+/// and guest kernels 7.3.3, while fcvm's guest patch made `arm64.nv2` set
+/// ID_AA64MMFR4_EL1.NV_frac to 2 (NV2P1; 1 is NV2_ONLY): on the host and in L1
+/// CNTVCT_EL0 was 0.4 to 15 ms past `cycle_last`, as it should be, and in L2 it was 9 to
+/// 73 s behind it, L1's counter when it created L2. L1's boot log showed `FEAT_NV2p1`,
+/// which the CPU has not. The vDSO's difference then wraps and overflows: in L2
+/// `clock_gettime` through the vDSO was 2125 to 2190 s from the syscall's for
+/// CLOCK_MONOTONIC_RAW, and CLOCK_MONOTONIC, REALTIME and BOOTTIME jumped by whole
+/// multiples of 2^33 ns (8.59 s) as NTP moved the clocksource multiplier, 38 jumps in
+/// 179 samples. Every tokio timer and `Instant` in L2 runs on that clock ("Firecracker
+/// socket not ready after 5 seconds", #2246). A Firecracker that sets no counter
+/// offset for L2 showed the same gap. With NV_frac = 1 the two agree in L1, L2 and L3
+/// (kernel/patches-arm64/mmfr4-override.vm.patch has the numbers).
 ///
 /// `counter_check.py` runs in each level's container, and here on the host, and prints
 /// one line. This asserts each level printed it, that it says ok, and that no guest's
-/// kernel detected FEAT_NV2p1 when the host's did not. No L3: about two minutes.
+/// kernel detected FEAT_NV2p1 when the host's did not. No L3: 17 to 110 s.
 #[cfg(target_arch = "aarch64")]
 #[tokio::test]
 async fn test_nested_l2_user_space_reads_the_kernels_counter() -> Result<()> {

@@ -1,6 +1,6 @@
-From 52631dd658fe330aa76acf391666bc6f300a32e9 Mon Sep 17 00:00:00 2001
+From 7801adaf75c250fd4e0c9501b064e9c7bcaeab06 Mon Sep 17 00:00:00 2001
 From: ejc3 <ejc3@users.noreply.github.com>
-Date: Fri, 27 Nov 2026 22:34:54 +0000
+Date: Sat, 28 Nov 2026 01:53:42 +0000
 Subject: [PATCH] arm64: make arm64.nv2 set ID_AA64MMFR4_EL1.NV_frac to
  NV2_ONLY
 
@@ -12,16 +12,26 @@ without the override L1 KVM reports KVM_CAP_ARM_EL2=0 and cannot run L2.
 The value is 1, NV2_ONLY. The field's encoding (arch/arm64/tools/sysreg) is
 0 NV_NV2, 1 NV2_ONLY, 2 NV2P1, 3 NV3. This alias used to set 2, which told
 every guest that booted with it that the CPU has FEAT_NV2p1
-(ARM64_HAS_NV2P1), on hardware and under a host KVM that have not. A KVM
-that believes in FEAT_NV2p1 programs its guest's timer and counter traps
-through CNTKCTL_EL1 instead of CNTHCTL_EL2 (timer_set_traps), where without
-FEAT_NV2p1 the trap bits are RES0 and the write does not trap to the host,
-and it stops trapping its guest hypervisor's CPACR_EL1. The host never saw
-L1 ask to trap L2's physical counter, so it answered L2's CNTPCT_EL0 with
-L1's offset only, while CNTVOFF_EL2, a VNCR register, did carry L2's
-offset: L2's kernel read L1's counter and L2's user space the zero-based
-one, 73 s apart, and every vDSO clock in L2 was wrong by up to 2^41 ns and
-jumped in multiples of 2^33 ns (fcvm #2246).
+(ARM64_HAS_NV2P1), on hardware and under a host KVM that have not.
+
+Measured on a c8gd.metal-24xl, host and guest kernels 7.3.3 (fcvm #2249),
+with CNTVCT_EL0 read at EL0 against the timekeeping cycle_last in the vDSO
+data page. With the value 2, L1's boot log shows "FEAT_NV2p1" and in L2,
+which L1's KVM runs at virtual EL2, the counter user space reads is behind
+the one the kernel keeps time with by L1's counter at L2's creation: 9 to
+73 s over 8 runs. The vDSO's difference then wraps through the 56-bit
+clocksource mask and overflows, so vDSO clocks in L2 are up to 2^41 ns
+from the kernel's and jump by multiples of 2^33 ns when NTP moves the
+multiplier. The same happens when the VMM sets no counter offset for L2
+(KVM's default virtual offset is enough). With the value 1, L1 does not
+detect FEAT_NV2p1 and the two agree to 5 to 15 ms in L1, L2 and L3, as on
+the host.
+
+Which FEAT_NV2p1-conditional path in L1's KVM does it has not been traced.
+The ones that differ in 7.3.3: timer_set_traps() writes a guest's counter
+and timer traps to CNTKCTL_EL1 instead of CNTHCTL_EL2; the save of a guest
+hypervisor's CNTHCTL_EL2 takes all of CNTKCTL_EL1; CPACR_EL1 is no longer
+trapped for a guest hypervisor and CPTR_EL2 is saved from it.
 
 Linux 7.3 already carries the id_aa64mmfr4 override register, so this adds
 only the arm64.nv2 alias and makes E2H0 and NV_frac FTR_HIGHER_SAFE, which

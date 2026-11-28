@@ -428,10 +428,9 @@ fn run_s2_tracking_harness(port: &S2Port) -> Vec<String> {
 /// `arm64.nv2` must tell a nested guest it has NV2 and nothing more.
 ///
 /// ID_AA64MMFR4_EL1.NV_frac is 0 NV_NV2, 1 NV2_ONLY, 2 NV2P1, 3 NV3
-/// (arch/arm64/tools/sysreg, Linux 7.3.3). The alias set 2 until 2026-11-27, so every
-/// nested guest believed in FEAT_NV2p1 on hardware without it, and an L1's KVM then
-/// programmed L2's counter traps through CNTKCTL_EL1, which the host does not see:
-/// L2's kernel and L2's user space read counters 73 s apart
+/// (arch/arm64/tools/sysreg, Linux 7.3.3). The alias set 2 until 2026-11-28, so every
+/// nested guest believed in FEAT_NV2p1 on hardware without it, and in L2 the kernel and
+/// user space then read counters 9 to 73 s apart
 /// (`test_nested_l2_user_space_reads_the_kernels_counter` is the runtime side).
 #[test]
 fn the_nv2_boot_parameter_claims_nv2_only() {
