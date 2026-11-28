@@ -284,12 +284,7 @@ pub fn burn_rates(
             let od = on_demand.get(&b.instance_type).copied();
             let price = if b.spot {
                 spot.get(&(region.clone(), b.instance_type.clone()))
-                    .and_then(|zones| {
-                        zones
-                            .get(&b.zone)
-                            .copied()
-                            .or_else(|| zones.values().copied().reduce(f64::max))
-                    })
+                    .and_then(|zones| zones.get(&b.zone).copied())
             } else {
                 od
             };
@@ -872,7 +867,7 @@ mod tests {
             vec![
                 // No spot price known: its on-demand rate.
                 host("i-1", "g4dn.metal", true, "us-east-2a"),
-                // A spot price known for another zone only: the highest zone's.
+                // A spot price known for other zones only: unpriced, its on-demand rate.
                 host("i-2", "g5g.metal", true, "us-east-2c"),
                 // No rate for its type: the highest rate known.
                 host("i-3", "p5.48xlarge", false, "us-east-2a"),
@@ -886,11 +881,12 @@ mod tests {
             ]),
         )]);
         let (rate, why) = burn_rate(&instances, &spot, &on_demand);
-        assert!((rate - (8.0 + 0.6 + 8.0)).abs() < 1e-9, "{rate}");
+        assert!((rate - (8.0 + 2.744 + 8.0)).abs() < 1e-9, "{rate}");
         assert_eq!(
             why.as_deref(),
             Some(
-                "no price for g4dn.metal spot in us-east-2, p5.48xlarge on-demand in us-east-2; \
+                "no price for g4dn.metal spot in us-east-2, g5g.metal spot in us-east-2, \
+                 p5.48xlarge on-demand in us-east-2; \
                  charged at the on-demand or highest rate"
             )
         );
