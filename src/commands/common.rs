@@ -97,6 +97,35 @@ pub const VSOCK_BOOTPLAN_PORT: u32 = 4995;
 /// Must match `fc-agent::vsock::RESTORE_COMPLETE_PORT`.
 pub const VSOCK_RESTORE_COMPLETE_PORT: u32 = 4994;
 
+/// Vsock port the guest agent listens on for the host's nudge after a Cloud Hypervisor
+/// restore. Its vsock device raises no transport reset, so a connection to this port is
+/// the event that tells the agent to read its restore document (#2191). Must match
+/// `fc-agent::vsock::RESTORE_NUDGE_PORT`.
+pub const VSOCK_RESTORE_NUDGE_PORT: u32 = 4993;
+
+/// Connect to the restored guest's nudge port through the VMM's vsock socket and close
+/// again. The guest listener is a kernel socket that the snapshot carries, so the connect
+/// is answered as soon as the guest runs. An error is not fatal: the agent polls as a
+/// backstop, and a restore the nudge did not reach is acknowledged late, not wrongly.
+pub(crate) fn nudge_restored_guest(vsock_socket: &Path) -> Result<()> {
+    use std::io::{Read, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(vsock_socket)
+        .with_context(|| format!("connecting to {}", vsock_socket.display()))?;
+    let timeout = Some(std::time::Duration::from_secs(1));
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+    stream.write_all(format!("CONNECT {VSOCK_RESTORE_NUDGE_PORT}\n").as_bytes())?;
+    let mut answer = [0u8; 32];
+    let n = stream.read(&mut answer)?;
+    let answer = String::from_utf8_lossy(&answer[..n]);
+    anyhow::ensure!(
+        answer.starts_with("OK "),
+        "the guest refused the restore nudge: {}",
+        answer.trim()
+    );
+    Ok(())
+}
+
 /// Minimum required Firecracker version. 1.14.0 is the first whose balloon has
 /// free page reporting: its `PUT /balloon` takes the switch, and its
 /// `GET /vm/config` reply says whether a device has it, which every snapshot and
@@ -5240,6 +5269,25 @@ pub async fn restore_from_snapshot_ch(
             .resume()
             .await
             .context("resuming Cloud Hypervisor after restore")?;
+        // Cloud Hypervisor raises no vsock transport reset on a restore, so the agent
+        // learns of it from this connection instead of its poll (#2191). The restore
+        // document is already on the host's boot-plan listener.
+        match vm_state.config.vsock_socket_path.clone() {
+            Some(vsock_socket) => {
+                let nudged =
+                    tokio::task::spawn_blocking(move || nudge_restored_guest(&vsock_socket)).await;
+                match nudged {
+                    Ok(Ok(())) => debug!(vm_id = %vm_id, "nudged the restored guest"),
+                    Ok(Err(error)) => warn!(
+                        vm_id = %vm_id,
+                        error = %format!("{error:#}"),
+                        "the restore nudge failed; the agent's backstop poll finds the restore"
+                    ),
+                    Err(error) => warn!(vm_id = %vm_id, %error, "the restore nudge task failed"),
+                }
+            }
+            None => warn!(vm_id = %vm_id, "no vsock socket recorded; the restore is not nudged"),
+        }
         // The resume is answered once the restore has finished, so the mapping is there now
         // if it ever will be.
         ensure_ch_mapped_the_memory_file(vm_pid, memory_ino, &clone_ch_dir.join(CH_MEMORY_FILE))?;
@@ -11853,10 +11901,56 @@ ffffb0000000-ffffb0021000 rw-p 00000000 00:00 0 [heap]\n";
             body,
             &[
                 ".resume()",
+                "nudge_restored_guest(&vsock_socket)",
                 "ensure_ch_mapped_the_memory_file(",
                 "save_vm_state_with_network(",
             ],
         );
+    }
+
+    /// The nudge is a vsock CONNECT to the guest's nudge port through the VMM's socket, and a
+    /// refusal is an error the restore logs and survives.
+    #[test]
+    fn the_restore_nudge_connects_to_the_guests_nudge_port() {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("vsock.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut asked = Vec::new();
+            for answer in [&b"OK 1073741824\n"[..], &b"NO\n"[..]] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 64];
+                let n = stream.read(&mut buf).unwrap();
+                asked.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                stream.write_all(answer).unwrap();
+            }
+            asked
+        });
+        nudge_restored_guest(&socket).unwrap();
+        assert!(nudge_restored_guest(&socket).is_err());
+        assert_eq!(
+            server.join().unwrap(),
+            vec![format!("CONNECT {VSOCK_RESTORE_NUDGE_PORT}\n"); 2]
+        );
+    }
+
+    /// The two ends of the nudge name one port, and it is none of the others.
+    #[test]
+    fn the_restore_nudge_port_matches_the_guest_agents() {
+        let agent = include_str!("../../fc-agent/src/vsock.rs");
+        assert!(agent.contains(&format!(
+            "pub const RESTORE_NUDGE_PORT: u32 = {VSOCK_RESTORE_NUDGE_PORT};"
+        )));
+        for other in [
+            VSOCK_STATUS_PORT,
+            VSOCK_OUTPUT_PORT,
+            VSOCK_TTY_PORT,
+            VSOCK_BOOTPLAN_PORT,
+            VSOCK_RESTORE_COMPLETE_PORT,
+        ] {
+            assert_ne!(other, VSOCK_RESTORE_NUDGE_PORT);
+        }
     }
 
     /// `snapshot create --memory-dir`, in create_snapshot_core's order: the directory is made

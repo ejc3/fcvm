@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use tokio::time::{sleep, Duration};
 
 use crate::{
-    bootplan, container, exec, lock_test, mmds, mounts, network, output, proxy, system, thp,
+    bootplan, container, exec, lock_test, mmds, mounts, network, output, proxy, restore_nudge,
+    system, thp,
 };
 
 /// Deadline for a warm start's restore-readiness publication. Generous: the
@@ -243,6 +244,20 @@ pub async fn run() -> Result<()> {
     // The NFS shares the boot mounts, with their mount IDs, for the restore to remount.
     let nfs_mounts = mounts::NfsMountRecords::default();
 
+    // Cloud Hypervisor raises no vsock transport reset on restore, so the host connects to
+    // this port right after it resumes a clone (`restore_nudge`).
+    let restore_nudge = if transport == bootplan::Transport::Vsock {
+        match restore_nudge::spawn() {
+            Ok(rx) => Some(rx),
+            Err(e) => {
+                eprintln!("[fc-agent] WARNING: restore nudge listener not started: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Start the restore-epoch watcher for the active transport: Firecracker polls MMDS,
     // Cloud Hypervisor polls the host's boot-plan vsock port (#632 P2). Both call
     // handle_clone_restore identically when a restore-epoch appears.
@@ -256,6 +271,7 @@ pub async fn run() -> Result<()> {
             exec_rebind_done_notify: exec_rebind_done_notify.clone(),
             egress_gen_rx: egress_gen_rx.clone(),
             vsock_reset,
+            restore_nudge,
             nfs_mounts: nfs_mounts.clone(),
         };
         tokio::spawn(async move {

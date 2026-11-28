@@ -149,6 +149,8 @@ enum RestoreEpochWake {
     ResetSenderClosed,
     /// The output connection was made or dropped, which changes the poll cadence.
     ArmedChanged,
+    /// The host connected to the agent's restore-nudge port after it resumed the guest.
+    RestoreNudge,
 }
 
 /// Latching transport-reset wakeup plus a periodic fallback.
@@ -185,6 +187,10 @@ struct RestoreEpochSchedule {
     /// once the writer has gone.
     armed_interval: Option<Duration>,
     poll_interval: Duration,
+    /// The generation of the host's connections to the restore-nudge port, where the
+    /// listener is bound (Cloud Hypervisor).
+    nudge_rx: Option<tokio::sync::watch::Receiver<u64>>,
+    fetch_failing: bool,
 }
 
 impl RestoreEpochSchedule {
@@ -197,7 +203,7 @@ impl RestoreEpochSchedule {
             crate::bootplan::Transport::Vsock => Duration::from_millis(250),
         };
         // Firecracker queues the transport reset in the device state it saves, so every
-        // restore of it raises one. Cloud Hypervisor keeps its poll as it was.
+        // restore of it raises one. Cloud Hypervisor raises none: its event is the host's restore nudge.
         let armed_interval = match transport {
             crate::bootplan::Transport::Mmds => Some(Self::ARMED_POLL),
             crate::bootplan::Transport::Vsock => None,
@@ -208,13 +214,34 @@ impl RestoreEpochSchedule {
             armed_rx: reset.armed_rx,
             armed_interval,
             poll_interval,
+            nudge_rx: None,
+            fetch_failing: false,
         }
+    }
+
+    /// Wake on the host's restore nudge ([`crate::restore_nudge`]), and poll only as a
+    /// backstop while it can: the restore event reaches the agent as an incoming connection,
+    /// which Cloud Hypervisor delivers where it raises no transport reset.
+    fn with_restore_nudge(mut self, nudge: tokio::sync::watch::Receiver<u64>) -> Self {
+        self.nudge_rx = Some(nudge);
+        self
+    }
+
+    /// A fetch the last wake asked for failed: the retry is the steady poll until one
+    /// succeeds, not the backstop.
+    fn fetch_failed(&mut self) {
+        self.fetch_failing = true;
+    }
+
+    fn fetch_succeeded(&mut self) {
+        self.fetch_failing = false;
     }
 
     async fn wait(&mut self) -> RestoreEpochWake {
         let armed = *self.armed_rx.borrow_and_update();
         let interval = match self.armed_interval {
             Some(armed_interval) if armed => armed_interval,
+            _ if self.nudge_rx.is_some() && !self.fetch_failing => Self::ARMED_POLL,
             _ => self.poll_interval,
         };
 
@@ -225,6 +252,17 @@ impl RestoreEpochSchedule {
                     Ok(()) => RestoreEpochWake::TransportReset,
                     Err(_) => {
                         self.reset_armed = false;
+                        RestoreEpochWake::ResetSenderClosed
+                    }
+                }
+            }
+            changed = async { self.nudge_rx.as_mut().expect("guarded").changed().await },
+                if self.nudge_rx.is_some() => {
+                match changed {
+                    Ok(()) => RestoreEpochWake::RestoreNudge,
+                    Err(_) => {
+                        // The listener task is gone: the steady poll is the only event left.
+                        self.nudge_rx = None;
                         RestoreEpochWake::ResetSenderClosed
                     }
                 }
@@ -273,17 +311,31 @@ pub async fn watch_restore_epoch(
         signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
 
     let mut schedule = RestoreEpochSchedule::new(transport, signals.vsock_reset.clone());
+    if let Some(nudge) = signals.restore_nudge.clone() {
+        schedule = schedule.with_restore_nudge(nudge);
+    }
 
     loop {
-        let after_reset = schedule.wait().await == RestoreEpochWake::TransportReset;
-        if after_reset {
-            eprintln!("[fc-agent] vsock transport reset observed; reading the restore document");
+        let wake = schedule.wait().await;
+        let after_reset = matches!(
+            wake,
+            RestoreEpochWake::TransportReset | RestoreEpochWake::RestoreNudge
+        );
+        match wake {
+            RestoreEpochWake::TransportReset => {
+                eprintln!("[fc-agent] vsock transport reset observed; reading the restore document")
+            }
+            RestoreEpochWake::RestoreNudge => eprintln!(
+                "[fc-agent] restore nudge received from the host; reading the restore document"
+            ),
+            _ => {}
         }
 
         let boundary_is_armed = crate::snapshot_network::boundary_is_armed();
         let metadata_transport = restore_control.select_transport(boundary_is_armed);
         let metadata = match crate::bootplan::fetch_metadata(metadata_transport).await {
             Ok(value) => {
+                schedule.fetch_succeeded();
                 if after_reset {
                     eprintln!(
                         "[fc-agent] restore document read after the transport reset \
@@ -294,6 +346,7 @@ pub async fn watch_restore_epoch(
                 value
             }
             Err(e) => {
+                schedule.fetch_failed();
                 if after_reset {
                     eprintln!(
                         "[fc-agent] the restore document fetch after the transport reset \
@@ -718,6 +771,75 @@ mod tests {
             tokio::time::Instant::now() - before,
             Duration::from_millis(250)
         );
+    }
+
+    /// On Cloud Hypervisor the host connects to the agent's restore-nudge port right after it
+    /// resumes a clone, and that connection is the restore event: the watcher fetches at once
+    /// instead of at the end of the 250 ms sleep the snapshot froze.
+    ///
+    /// RED BEFORE THE FIX: the wait returned PollInterval 250 ms after the nudge.
+    #[tokio::test(start_paused = true)]
+    async fn a_restore_nudge_wakes_the_cloud_hypervisor_watcher_at_once() {
+        let (_reset_tx, reset_rx) = tokio::sync::watch::channel(0u64);
+        let (nudge_tx, nudge_rx) = tokio::sync::watch::channel(0u64);
+        let mut schedule = RestoreEpochSchedule::new(Transport::Vsock, unarmed(reset_rx))
+            .with_restore_nudge(nudge_rx);
+
+        let before = tokio::time::Instant::now();
+        let mut wait = Box::pin(schedule.wait());
+        assert_pending_once(wait.as_mut()).await;
+        nudge_tx.send(1).unwrap();
+        assert_eq!(wait.await, RestoreEpochWake::RestoreNudge);
+        assert_eq!(tokio::time::Instant::now() - before, Duration::ZERO);
+    }
+
+    /// A nudge published before the watcher parks (it was fetching or applying a restore)
+    /// is not lost.
+    #[tokio::test(start_paused = true)]
+    async fn a_restore_nudge_published_before_the_wait_is_not_lost() {
+        let (_reset_tx, reset_rx) = tokio::sync::watch::channel(0u64);
+        let (nudge_tx, nudge_rx) = tokio::sync::watch::channel(0u64);
+        let mut schedule = RestoreEpochSchedule::new(Transport::Vsock, unarmed(reset_rx))
+            .with_restore_nudge(nudge_rx);
+        nudge_tx.send(1).unwrap();
+        assert_eq!(schedule.wait().await, RestoreEpochWake::RestoreNudge);
+    }
+
+    /// With the nudge port bound, the idle poll is only a backstop: an idle clone makes no
+    /// 250 ms fetches, and the backstop is the Firecracker one.
+    #[tokio::test(start_paused = true)]
+    async fn with_the_nudge_port_bound_an_idle_guest_does_not_poll_every_250ms() {
+        let (_reset_tx, reset_rx) = tokio::sync::watch::channel(0u64);
+        let (_nudge_tx, nudge_rx) = tokio::sync::watch::channel(0u64);
+        let mut schedule = RestoreEpochSchedule::new(Transport::Vsock, unarmed(reset_rx))
+            .with_restore_nudge(nudge_rx);
+        let mut wait = Box::pin(schedule.wait());
+        assert_pending_once(wait.as_mut()).await;
+        tokio::time::advance(RestoreEpochSchedule::ARMED_POLL - Duration::from_millis(1)).await;
+        assert_pending_once(wait.as_mut()).await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(wait.await, RestoreEpochWake::PollInterval);
+    }
+
+    /// A fetch that failed after a wake is retried at the steady poll, not at the backstop.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_fetch_is_retried_at_the_steady_poll_not_the_backstop() {
+        let (_reset_tx, reset_rx) = tokio::sync::watch::channel(0u64);
+        let (_nudge_tx, nudge_rx) = tokio::sync::watch::channel(0u64);
+        let mut schedule = RestoreEpochSchedule::new(Transport::Vsock, unarmed(reset_rx))
+            .with_restore_nudge(nudge_rx);
+        schedule.fetch_failed();
+        let before = tokio::time::Instant::now();
+        assert_eq!(schedule.wait().await, RestoreEpochWake::PollInterval);
+        assert_eq!(
+            tokio::time::Instant::now() - before,
+            Duration::from_millis(250)
+        );
+        schedule.fetch_succeeded();
+        let mut wait = Box::pin(schedule.wait());
+        assert_pending_once(wait.as_mut()).await;
+        tokio::time::advance(Duration::from_millis(250)).await;
+        assert_pending_once(wait.as_mut()).await;
     }
 
     async fn assert_pending_once<F>(mut future: Pin<&mut F>)

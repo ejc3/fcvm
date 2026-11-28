@@ -18,6 +18,9 @@ pub const STATUS_PORT: u32 = 4999;
 pub const EXEC_PORT: u32 = 4998;
 pub const OUTPUT_PORT: u32 = 4997;
 pub const RESTORE_COMPLETE_PORT: u32 = 4994;
+/// The port the host connects to after it resumes a restored Cloud Hypervisor guest.
+/// Must match `fcvm::commands::common::VSOCK_RESTORE_NUDGE_PORT`.
+pub const RESTORE_NUDGE_PORT: u32 = 4993;
 pub const EGRESS_PROXY_PORT: u32 = 52000;
 
 /// Implement AsyncRead for a type with `inner: Arc<AsyncFd<OwnedFd>>`.
