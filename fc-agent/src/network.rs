@@ -820,10 +820,26 @@ fn resolv_conf_for(
 ///
 /// Fails when the file cannot be written: a clone published with the preparing
 /// host's resolvers asks servers the restoring host's network may not reach.
-pub fn apply_restore_dns(dns: &crate::types::RestoreDns) -> anyhow::Result<()> {
-    let cmdline = std::fs::read_to_string("/proc/cmdline").context("reading /proc/cmdline")?;
-    apply_restore_dns_at(std::path::Path::new("/etc/resolv.conf"), dns, &cmdline)
+///
+/// Reads and writes files the guest owns, and `/etc/resolv.conf` can be a FIFO, so
+/// the work runs on the blocking pool under `RESTORE_FILE_STEP_LIMIT`.
+pub async fn apply_restore_dns(dns: &crate::types::RestoreDns) -> anyhow::Result<()> {
+    let dns = dns.clone();
+    off_the_runtime_within(
+        "the restore resolvers",
+        RESTORE_FILE_STEP_LIMIT,
+        move || {
+            let cmdline =
+                std::fs::read_to_string("/proc/cmdline").context("reading /proc/cmdline")?;
+            apply_restore_dns_at(std::path::Path::new("/etc/resolv.conf"), &dns, &cmdline)
+        },
+    )
+    .await
 }
+
+/// How long a restore waits for one step that touches a file or mount a workload
+/// can make block for good.
+pub(crate) const RESTORE_FILE_STEP_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn apply_restore_dns_at(
     path: &std::path::Path,
@@ -1361,13 +1377,27 @@ fn swap_host_identity<C: NetlinkChannel>(
 /// Each receive can block for the socket's five-second timeout, and a guest
 /// with one or two vCPUs has that many runtime workers. The exec rebind and
 /// the output writer need them while the restore waits on the kernel.
-async fn off_the_runtime<T: Send + 'static>(
+pub(crate) async fn off_the_runtime<T: Send + 'static>(
     work: &str,
     step: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> anyhow::Result<T> {
     tokio::task::spawn_blocking(step)
         .await
         .with_context(|| format!("{work} did not finish"))?
+}
+
+/// [`off_the_runtime`] for work that a peer can block for good: a FIFO where a
+/// file was, a hung mount. The restore stops waiting after `limit` and fails
+/// closed; the blocking-pool thread stays in the call, which costs the pool one
+/// thread and no runtime worker.
+pub(crate) async fn off_the_runtime_within<T: Send + 'static>(
+    work: &str,
+    limit: std::time::Duration,
+    step: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(limit, off_the_runtime(work, step))
+        .await
+        .map_err(|_| anyhow::anyhow!("{work} did not finish within {limit:?}"))?
 }
 
 /// eth0's interface index and a NETLINK_ROUTE socket to change it with.

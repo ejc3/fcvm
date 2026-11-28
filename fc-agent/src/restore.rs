@@ -158,6 +158,22 @@ pub struct RestoreSignals {
     pub nfs_mounts: crate::mounts::NfsMountRecords,
 }
 
+/// Ask the exec server to re-register its vsock listener.
+///
+/// The flags go first, then the wake, as the exec server's doc comment requires.
+/// The waker returns to the scheduler once before the caller goes on: the woken
+/// task sits in this worker's LIFO slot, which no other worker steals from, so a
+/// caller that blocked its worker next left the exec server unpolled for as long
+/// as the block lasted (15 s in #2156; 1500 of 1500 ms with 2 and with 4 workers,
+/// 0 ms with the yield). Every call that can block is also kept off the workers
+/// (`network::off_the_runtime`), so the yield covers a block that is added later.
+async fn request_exec_rebind(done: &AtomicBool, needed: &AtomicBool, rebind: &Notify) {
+    done.store(false, Ordering::Release);
+    needed.store(true, Ordering::Release);
+    rebind.notify_one();
+    tokio::task::yield_now().await;
+}
+
 /// Per-phase milliseconds for one guest-side restore, carried to the host in
 /// the restore-completion ACK frame so every clone's critical path is
 /// attributed in the host's own logs (guest serial output is not reliably
@@ -323,6 +339,10 @@ fn round_timings(value: &mut serde_json::Value) {
     }
 }
 
+/// How long the restore waits for its NFS remount (identity write, mounts, rebinds)
+/// before it fails closed. A hung server holds a mount call for good.
+const NFS_REMOUNT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// How long a restore waits for the kernel to give the snapshot's NFS clients new identities.
 const NFS_RENEW_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -440,9 +460,12 @@ pub async fn handle_clone_restore(
     // transport reset). Reset confirmation flag, then signal. Set flag BEFORE
     // notify to prevent a race where select! drops the Notified future (see
     // exec.rs doc comment). The wait happens after the network phases below.
-    signals.exec_rebind_done.store(false, Ordering::Release);
-    signals.exec_rebind_needed.store(true, Ordering::Release);
-    signals.exec_rebind.notify_one();
+    request_exec_rebind(
+        &signals.exec_rebind_done,
+        &signals.exec_rebind_needed,
+        &signals.exec_rebind,
+    )
+    .await;
 
     // Pin the neighbour entry BEFORE the boundary reopens the gate. The clone
     // inherits the source's neighbour table, and restore_snapshot_network ends
@@ -476,7 +499,11 @@ pub async fn handle_clone_restore(
     // The daemons that reconnect when egress opens take their MSS from it
     // (`network::apply_guest_mtu`).
     if let Some(mtu) = metadata.guest_mtu {
-        network::apply_guest_mtu(mtu);
+        network::off_the_runtime("the guest MTU", move || {
+            network::apply_guest_mtu(mtu);
+            Ok(())
+        })
+        .await?;
     }
 
     // Take the restoring host's identity: its host identity address on lo, and
@@ -491,11 +518,23 @@ pub async fn handle_clone_restore(
         .await
         .context("restore phase host-identity")?;
     if let Some(ref dns) = identity.dns {
-        network::apply_restore_dns(dns).context("restore phase host-identity resolvers")?;
+        network::apply_restore_dns(dns)
+            .await
+            .context("restore phase host-identity resolvers")?;
     }
     // The restoring run's proxies, or none, in place of the snapshot's: before the restore
     // hook and before a pre-start restore's container starts, which inherits them.
-    crate::system::apply_proxy_settings(&identity.proxy);
+    let proxy = identity.proxy.clone();
+    network::off_the_runtime_within(
+        "the restore proxy settings",
+        network::RESTORE_FILE_STEP_LIMIT,
+        move || {
+            crate::system::apply_proxy_settings(&proxy);
+            Ok(())
+        },
+    )
+    .await
+    .context("restore phase host-identity proxies")?;
     eprintln!(
         "[fc-agent] restore phase=host-identity epoch={restore_epoch} elapsed_ms={:.3}",
         elapsed_ms(identity_started)
@@ -514,7 +553,11 @@ pub async fn handle_clone_restore(
     // the gateway without flushing the neighbour table, whose entries a client
     // can already be using while the cleanup runs.
     let neighbor_started = std::time::Instant::now();
-    network::refresh_gateway_arp();
+    network::off_the_runtime("the gateway ARP probe", || {
+        network::refresh_gateway_arp();
+        Ok(())
+    })
+    .await?;
     phases.neighbor_ms = elapsed_ms(neighbor_started);
 
     let tcp_cleanup_started = std::time::Instant::now();
@@ -698,35 +741,50 @@ pub async fn handle_clone_restore(
         // through the lazy unmount. So the shares are remounted at the other server
         // port (`nfs_remounts`), which every clone namespace forwards to the host's nfsd,
         // as it does the port the snapshot's mounts use.
-        if let Err(error) = crate::mounts::fresh_nfs_client_identity(restore_epoch) {
-            eprintln!("[fc-agent] WARNING: could not give the clone its own NFS client identity: {error:#}");
-        }
-        // No mount record: the boot's check passed the mounts this restore reproduces.
-        // A failure fails the restore closed: the hook below may use the share,
-        // and a mount point that is an ordinary directory would take its writes;
-        // a published clone whose share is missing is the stale state the hook
-        // exists to prevent.
+        //
+        // The identity write, the mounts and the namespace rebinds are file and mount
+        // calls a hung server or a replaced file can hold for good, so they run on the
+        // blocking pool, not on a runtime worker the exec server may need. A mount that
+        // outlasts the bound fails the restore closed, as a failed one does.
         let shares = nfs_remounts(&shares);
-        let remounted_paths = crate::mounts::mount_nfs_shares(&shares, None)
-            .context("remounting NFS shares after restore, so the clone stays unpublished")?;
-        // The remount made new mounts. Their IDs replace the boot's, so a snapshot of this
-        // clone, restored, remounts these and not the ones this restore unmounted.
-        let remounted = crate::mounts::record_nfs_mounts(&shares)
-            .context("recording the NFS shares remounted after restore")?;
-        *signals.nfs_mounts.lock().unwrap_or_else(|e| e.into_inner()) = Some(remounted);
-        // The container bound the snapshot's mounts when it started; give it these.
-        let namespaces = crate::mounts::nfs_mounts_in_other_namespaces(&remounted_paths)?;
-        for (ns, paths) in &namespaces {
-            for path in paths {
-                crate::mounts::rebind_into_namespace(ns, path).context(
-                    "giving the container the remounted NFS share, so the clone stays unpublished",
+        let epoch = restore_epoch.to_string();
+        let (remounted, namespace_count) = network::off_the_runtime_within(
+            "the NFS remount",
+            NFS_REMOUNT_LIMIT,
+            move || {
+                let restore_epoch: &str = &epoch;
+                if let Err(error) = crate::mounts::fresh_nfs_client_identity(restore_epoch) {
+                    eprintln!("[fc-agent] WARNING: could not give the clone its own NFS client identity: {error:#}");
+                }
+                // No mount record: the boot's check passed the mounts this restore reproduces.
+                // A failure fails the restore closed: the hook below may use the share,
+                // and a mount point that is an ordinary directory would take its writes;
+                // a published clone whose share is missing is the stale state the hook
+                // exists to prevent.
+                let remounted_paths = crate::mounts::mount_nfs_shares(&shares, None).context(
+                    "remounting NFS shares after restore, so the clone stays unpublished",
                 )?;
-            }
-        }
-        if !namespaces.is_empty() {
+                // The remount made new mounts. Their IDs replace the boot's, so a snapshot of
+                // this clone, restored, remounts these and not the ones this restore unmounted.
+                let remounted = crate::mounts::record_nfs_mounts(&shares)
+                    .context("recording the NFS shares remounted after restore")?;
+                // The container bound the snapshot's mounts when it started; give it these.
+                let namespaces = crate::mounts::nfs_mounts_in_other_namespaces(&remounted_paths)?;
+                for (ns, paths) in &namespaces {
+                    for path in paths {
+                        crate::mounts::rebind_into_namespace(ns, path).context(
+                            "giving the container the remounted NFS share, so the clone stays unpublished",
+                        )?;
+                    }
+                }
+                Ok((remounted, namespaces.len()))
+            },
+        )
+        .await?;
+        *signals.nfs_mounts.lock().unwrap_or_else(|e| e.into_inner()) = Some(remounted);
+        if namespace_count > 0 {
             eprintln!(
-                "[fc-agent] NFS shares remounted in {} other mount namespace(s)",
-                namespaces.len()
+                "[fc-agent] NFS shares remounted in {namespace_count} other mount namespace(s)"
             );
         }
     }
@@ -797,7 +855,11 @@ pub async fn handle_clone_restore(
     // The container was frozen at the snapshot boundary, so this restore's own page-ins
     // did not queue behind the container's (payload_freeze). It runs again before the
     // hook, which may exec into it.
-    crate::payload_freeze::thaw();
+    network::off_the_runtime("the container thaw", || {
+        crate::payload_freeze::thaw();
+        Ok(())
+    })
+    .await?;
 
     // Publication, last: the plan's restore hook runs now, with egress open,
     // the NFS shares remounted and the egress proxy reconnected, so whatever
@@ -1481,6 +1543,75 @@ mod tests {
         );
     }
 
+    /// #2156: a task woken by a worker that then blocks without returning to the
+    /// scheduler is not polled until the block ends, whatever the worker count. The
+    /// block stands in for a synchronous read of a resolv.conf that is a FIFO.
+    #[test]
+    fn exec_rebind_wake_is_polled_while_the_restore_blocks_its_worker() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        // A hang guard, not a timing assumption: the waiter runs at once when the
+        // wake does not sit behind the block, and the block ends only when released.
+        const HANG_GUARD: Duration = Duration::from_secs(20);
+        for workers in [2usize, 4] {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .enable_all()
+                .build()
+                .unwrap();
+            let rebind = Arc::new(Notify::new());
+            let done = Arc::new(AtomicBool::new(true));
+            let needed = Arc::new(AtomicBool::new(false));
+            let (parked_tx, parked_rx) = mpsc::channel::<()>();
+            let (ran_tx, ran_rx) = mpsc::channel::<()>();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+
+            // The exec server's loop: parked on the notify until asked.
+            let waiter = runtime.spawn({
+                let rebind = rebind.clone();
+                async move {
+                    let mut notified = std::pin::pin!(rebind.notified());
+                    let mut announced = false;
+                    std::future::poll_fn(|cx| {
+                        let poll = std::future::Future::poll(notified.as_mut(), cx);
+                        if poll.is_pending() && !announced {
+                            announced = true;
+                            let _ = parked_tx.send(());
+                        }
+                        poll
+                    })
+                    .await;
+                    let _ = ran_tx.send(());
+                }
+            });
+            parked_rx
+                .recv_timeout(HANG_GUARD)
+                .expect("the exec server task never parked");
+
+            // The restore: asks for the re-register, then blocks its worker.
+            let restore = runtime.spawn({
+                let (rebind, done, needed) = (rebind.clone(), done.clone(), needed.clone());
+                async move {
+                    request_exec_rebind(&done, &needed, &rebind).await;
+                    release_rx.recv_timeout(HANG_GUARD).is_ok()
+                }
+            });
+
+            let polled = ran_rx.recv_timeout(HANG_GUARD);
+            let _ = release_tx.send(());
+            assert!(
+                polled.is_ok(),
+                "{workers} workers: the woken exec server task was not polled while the \
+                 restore blocked its worker"
+            );
+            assert!(
+                runtime.block_on(restore).unwrap(),
+                "the block was never released"
+            );
+            runtime.block_on(waiter).unwrap();
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn exec_rebind_timeout_is_a_restore_readiness_error() {
         let done = AtomicBool::new(false);
@@ -1754,10 +1885,10 @@ mod tests {
             .find(".context(\"restore phase host-identity\")?")
             .expect("the restore path no longer fails closed on a host identity error");
         let dns = body
-            .find("network::apply_restore_dns(dns).context(\"restore phase host-identity resolvers\")?")
+            .find("network::apply_restore_dns(dns)")
             .expect("the restore path no longer gives the guest the restoring host's resolvers, or no longer fails closed when it cannot");
         let proxy = body
-            .find("crate::system::apply_proxy_settings(&identity.proxy);")
+            .find("crate::system::apply_proxy_settings(&proxy);")
             .expect("the restore path no longer gives the guest the restoring run's proxies");
         let boundary = body
             .find("crate::snapshot_network::restore_snapshot_network(")
@@ -1798,6 +1929,58 @@ mod tests {
             start < join && join < publish,
             "the GPU attach must start, then be joined with its error propagated, before \
              the clone publishes: start={start} join={join} publish={publish}"
+        );
+    }
+
+    /// #2156: the restore's task runs on one of the agent's few runtime workers, and
+    /// a call that blocks there holds the exec server's task, the output writer and
+    /// the egress proxy with it. Every synchronous file, mount or process call
+    /// `handle_clone_restore` makes itself goes through `off_the_runtime` (or sits in
+    /// a blocking-pool closure), and `apply_restore_dns` does not read a file on the
+    /// worker. Scans the source of `handle_clone_restore` and `apply_restore_dns`.
+    #[test]
+    fn the_restore_path_makes_no_blocking_call_on_a_runtime_worker() {
+        let body = handle_clone_restore_source();
+        let blocking = [
+            "std::fs::",
+            "std::process::Command",
+            "network::apply_guest_mtu(",
+            "network::refresh_gateway_arp(",
+            "crate::system::apply_proxy_settings(",
+            "crate::payload_freeze::thaw(",
+            "crate::mounts::fresh_nfs_client_identity(",
+            "crate::mounts::mount_nfs_shares(",
+            "crate::mounts::record_nfs_mounts(",
+            "crate::mounts::nfs_mounts_in_other_namespaces(",
+            "crate::mounts::rebind_into_namespace(",
+        ];
+        // Each call may appear only inside a closure handed to one of the helpers.
+        let helpers = [
+            "network::off_the_runtime(",
+            "network::off_the_runtime_within(",
+            "tokio::task::spawn_blocking(",
+        ];
+        for call in blocking {
+            for (at, _) in body.match_indices(call) {
+                let before = &body[..at];
+                let helper = helpers.iter().filter_map(|h| before.rfind(h)).max();
+                let statement = before.rfind(";\n").map_or(0, |i| i + 2);
+                assert!(
+                    helper.is_some_and(|h| h >= statement.saturating_sub(2000)),
+                    "handle_clone_restore calls {call} where it can hold a runtime worker \
+                     (#2156): {}",
+                    &body[at.saturating_sub(80)..(at + 80).min(body.len())]
+                );
+            }
+        }
+        let network = include_str!("network.rs");
+        let start = network
+            .find("pub async fn apply_restore_dns(")
+            .expect("apply_restore_dns is no longer async");
+        let dns = &network[start..start + 700];
+        assert!(
+            dns.contains("off_the_runtime_within("),
+            "apply_restore_dns does its file work on the runtime worker"
         );
     }
 
