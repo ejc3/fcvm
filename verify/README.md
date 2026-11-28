@@ -12,6 +12,21 @@ exists, and proofs for what is designed.
 It was written after two hangs of restored clones (#2125, #2131), to find every way the same
 wake-up can be lost, not only those two.
 
+## The models in this directory
+
+One Lake package, one `lake build`, one CI job. Each model is a library of its own with its own
+search executable and documents. `check-imports.sh` runs before the build (in `make verify` and
+in CI) and fails if a file of any model is not imported by that model's `Axioms.lean`, whose
+sweep looks at everything the modules it imports declare.
+
+| Model | Library, namespace | Search | Documents |
+|---|---|---|---|
+| The guest vCPU wake-up path | `WakeVerify`, `Wake` | `lake exe breaks` | this file, `BREAKS.md`, `REPAIRS.md` |
+| The snapshot and restore network boundary in fc-agent | `GateVerify`, `Gate` | `lake exe gate-breaks` | [`GateVerify/README.md`](GateVerify/README.md), [`GateVerify/BREAKS.md`](GateVerify/BREAKS.md), [`GateVerify/REPAIRS.md`](GateVerify/REPAIRS.md) |
+| A vCPU's timer and interrupt state across a snapshot and a restore on arm64 (the vGIC, the timer, Cloud Hypervisor and the Firecracker fork) | `ResumeVerify`, `Resume` | `lake exe resume-breaks` | [`ResumeVerify/README.md`](ResumeVerify/README.md), [`ResumeVerify/BREAKS.md`](ResumeVerify/BREAKS.md), [`ResumeVerify/REPAIRS.md`](ResumeVerify/REPAIRS.md) |
+
+The rest of this file is about the first.
+
 - `BREAKS.md`: every break the search found, per kernel and VMM variant, with its trace, what it
   is in the real system, and a severity.
 - `REPAIRS.md`: what each break needs changed, where, and the wording proposed.
@@ -69,6 +84,8 @@ make verify-harness   # the model's kernel rules against the kernel's own functi
 | `test-search.sh` | the search program's own gates: 15 cases | 24 s, 0.7 GB |
 | `harness/test-run.sh` | the harness against the kernel's functions, and the harness script's own gates: 8 cases | 15 s after the first fetch |
 | `search-expected.sh quick` | the 19 small searches against `WakeVerify/search.expected` | about 2 min, 1.2 GB |
+| `lake exe gate-seq check ../fc-agent/src/snapshot_network.rs owed` | the boundary model's restore order against the order fc-agent's tests pin, naming this tree's rule book ([`GateVerify/README.md`](GateVerify/README.md), "The model against the code") | under 1 s |
+| `lake exe gate-breaks summary` | the boundary model's search of every default configuration and rule book against `GateVerify/search.expected` | about 10 s |
 
 The toolchain is pinned in `lean-toolchain` (`leanprover/lean4:v4.35.0`; elan installs it on first
 use). Lean's core only: no Mathlib, no other package. The costs are from a shared arm64 dev box
@@ -407,7 +424,8 @@ later time, also while the VM is paused.
 ## arm64
 
 The mechanisms of this model do not exist on arm64 KVM, which is why the arm64 lanes show neither
-hang:
+hang. What arm64 has in their place (the vGIC's state and the timer, across a snapshot and a
+restore) is the third model, [`ResumeVerify`](ResumeVerify/README.md).
 
 - **The halt is WFI, and it is not in `mp_state`.** `kvm_handle_wfx` calls `kvm_vcpu_wfi` and then
   moves the PC past the instruction (arch/arm64/kvm/handle_exit.c:130-178, arm.c:1065-1089). A
@@ -426,13 +444,14 @@ hang:
 ## CI
 
 `.github/workflows/verify.yml`, job `lean` (check name "Lean"), on a hosted runner, on every pull
-request that changes `verify/**` or the kernel patch the harness applies (no base-branch filter,
-so stacked pull requests are checked) and on every push to main. It runs the six steps of `make
-verify` (the table under "Build"), capped at 15 minutes. elan comes from a checksum-pinned release
+request that changes `verify/**`, the kernel patch the harness applies, or
+fc-agent/src/snapshot_network.rs, whose pinned order the boundary model's drift check reads (no
+base-branch filter, so stacked pull requests are checked) and on every push to main. It runs
+the eight steps of `make verify` (the table under "Build"), capped at 15 minutes. elan comes from a checksum-pinned release
 file, the toolchain is the one `lean-toolchain` names, and both are cached with the build
 directory. It is a workflow of its own and is not part of `Summary`.
 `tests/test_ci_workflow_coverage.rs` (`the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main`)
-pins its triggers and each of the six lines of its build step.
+pins its triggers and each of the eight lines of its build step.
 
 A second job, `search`, runs all 76 searches against `search.expected` when the workflow is
 dispatched by hand (`gh workflow run verify.yml --ref <branch>`): run it after a change to

@@ -1,0 +1,6 @@
+plain vCPU, saved counters written: CNTPCT_EL0 reads its saved value plus the sleep; CNTVCT_EL0 reads its saved value plus the sleep
+plain vCPU, KVM_ARM_SET_COUNTER_OFFSET then other values written: CNTPCT_EL0 reads its saved value plus the sleep; CNTVCT_EL0 reads its saved value plus the sleep
+EL2 vCPU, CNTVOFF_EL2 = 0, saved counters written: CNTVOFF_EL2 reads zero after the counter writes and the value written after its own; CNTPCT_EL0 reads its saved value plus the sleep; CNTVCT_EL0 reads its saved value plus the sleep
+EL2 vCPU, CNTVOFF_EL2 = X, saved counters written: CNTVOFF_EL2 reads zero after the counter writes and the value written after its own; CNTPCT_EL0 reads its saved value plus the sleep, less CNTVOFF_EL2; CNTVCT_EL0 reads its saved value plus the sleep, less CNTVOFF_EL2
+EL2 vCPU, CNTVOFF_EL2 = 0, KVM_ARM_SET_COUNTER_OFFSET then other values written: CNTVOFF_EL2 reads zero after the counter writes and the value written after its own; CNTPCT_EL0 reads its saved value plus the sleep; CNTVCT_EL0 reads its saved value plus the sleep
+EL2 vCPU, CNTVOFF_EL2 = X, KVM_ARM_SET_COUNTER_OFFSET then other values written: CNTVOFF_EL2 reads zero after the counter writes and the value written after its own; CNTPCT_EL0 reads its saved value plus the sleep; CNTVCT_EL0 reads its saved value plus the sleep

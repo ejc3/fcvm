@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 rc=0
-for lib in WakeVerify; do
+for lib in WakeVerify GateVerify ResumeVerify; do
   [ -f "$lib/Axioms.lean" ] || { echo "check-imports: $lib/Axioms.lean is missing" >&2; exit 2; }
   n=0
   while IFS= read -r f; do
@@ -54,7 +54,7 @@ done <<<"$declared"
 libglobs=$(awk '/^\[\[/ { inlib = ($0 == "[[lean_lib]]"); name = ""; next }
                 inlib && /^name *=/ { name = $0; gsub(/[" ]/, "", name); sub(/^name=/, "", name) }
                 inlib && /^globs *=/ { g = $0; gsub(/ /, "", g); sub(/^globs=/, "", g); print name "=" g }' lakefile.toml)
-for lib in WakeVerify; do
+for lib in WakeVerify GateVerify ResumeVerify; do
   if ! grep -qxF "$lib" <<<"$declared"; then
     echo "check-imports: lakefile.toml does not declare the library $lib" >&2
     rc=1
@@ -65,7 +65,7 @@ for lib in WakeVerify; do
 done
 # The executables' modules are outside the sweeps: they declare no theorem and no axiom.
 for f in *.lean; do
-  case "$f" in WakeVerify.lean) continue ;; esac
+  case "$f" in WakeVerify.lean | GateVerify.lean | ResumeVerify.lean) continue ;; esac
   if grep -nE '^[[:space:]]*((private|protected|noncomputable|unsafe|partial)[[:space:]]+)*(theorem|lemma|axiom|opaque)[[:space:]]|native_decide|sorry' "$f" >&2; then
     echo "check-imports: $f, an executable's module, declares a theorem or an axiom the sweeps do not see" >&2
     rc=1

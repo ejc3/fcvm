@@ -383,11 +383,15 @@ help:
 	@echo "  install-host-kernel  Build and install host kernel with patches (requires reboot)"
 	@echo "  check-host-kernel-build  Check packages and free space install-host-kernel needs"
 	@echo ""
-	@echo "Formal model (verify/, Lean 4):"
-	@echo "  verify             Check the wake-up model: every proof and every recorded break (lake build),"
-	@echo "                     the axiom sweep, the gate tests and the 19 small searches (7 min from cold, 3 min built; 1.6 GB)"
-	@echo "  verify-search      Run all 76 searches against search.expected (45 min of CPU, 3.3 GB; JOBS=7: 8 min, 3.3 GB each)"
+	@echo "Formal models (verify/, Lean 4):"
+	@echo "  verify             Check the models: every proof and every recorded break (lake build), the axiom"
+	@echo "                     sweeps, the gate tests, the 19 small wake-up searches, the boundary drift check and search"
+	@echo "  verify-search      Run all 76 wake-up searches against search.expected (45 min of CPU, 3.3 GB; JOBS=7: 8 min, 3.3 GB each)"
 	@echo "  verify-harness     Compare the model's kernel rules with the kernel's own functions"
+	@echo "  verify-gate-search Run the exhaustive search of the snapshot network boundary (about 5 seconds)"
+	@echo "  verify-gate-drift  Compare the boundary model's restore order with the order fc-agent's tests pin"
+	@echo "  verify-resume-search Run the exhaustive search of arm64 timer and interrupt state across restore (RESUME_ARGS=traces|spins|mutants)"
+	@echo "  verify-counter-probe Measure what a counter write does on this host's arm64 KVM (needs kvm-arm.mode=nested)"
 	@echo ""
 	@echo "Kernel patches:"
 	@echo "  kernel-patch-create PROFILE=nested NAME=0004-fix FILE=fs/fuse/dir.c"
@@ -1991,11 +1995,11 @@ kernel-patch-edit:
 kernel-patch-validate:
 	./scripts/kernel-patch.sh validate $(PROFILE)
 
-# ---- Formal model of the vCPU wake-up path (verify/) ----
+# ---- Formal models (verify/): the vCPU wake-up path, the snapshot network boundary, arm64 resume ----
 # Lean 4, toolchain pinned in verify/lean-toolchain. elan installs lake under ~/.elan/bin.
 VERIFY_LAKE ?= $(shell command -v lake 2>/dev/null || echo $(HOME)/.elan/bin/lake)
 
-.PHONY: verify verify-search verify-harness verify-lake
+.PHONY: verify verify-search verify-harness verify-lake verify-gate-search verify-gate-drift verify-resume-search verify-counter-probe
 verify-lake:
 	@test -x "$(VERIFY_LAKE)" || { \
 		echo "BLOCKED: lake not found. Install elan (https://github.com/leanprover/elan); it reads verify/lean-toolchain." >&2; \
@@ -2003,7 +2007,8 @@ verify-lake:
 
 # What the CI job (.github/workflows/verify.yml) runs, in the same order. check-imports.sh and
 # check-sweep.sh are what `lake build` cannot check about itself; the two test scripts and the
-# quick comparison are the gates of the search and of the harness (verify/README.md, "CI").
+# quick comparison are the gates of the search and of the harness (verify/README.md, "CI"); the
+# last two are the boundary model's drift check and its search against GateVerify/search.expected.
 verify: verify-lake
 	verify/check-imports.sh
 	cd verify && "$(VERIFY_LAKE)" build
@@ -2011,6 +2016,12 @@ verify: verify-lake
 	PATH="$(dir $(VERIFY_LAKE)):$$PATH" verify/test-search.sh
 	PATH="$(dir $(VERIFY_LAKE)):$$PATH" verify/harness/test-run.sh
 	PATH="$(dir $(VERIFY_LAKE)):$$PATH" verify/search-expected.sh quick
+	cd verify && "$(VERIFY_LAKE)" exe gate-seq check ../fc-agent/src/snapshot_network.rs $(GATE_BOOK)
+	cd verify && LEAN_ABORT_ON_PANIC=1 "$(VERIFY_LAKE)" exe gate-breaks summary | diff GateVerify/search.expected -
+	set -o pipefail; cd verify && LEAN_ABORT_ON_PANIC=1 "$(VERIFY_LAKE)" exe resume-breaks | diff ResumeVerify/search.expected -
+	set -o pipefail; cd verify && LEAN_ABORT_ON_PANIC=1 "$(VERIFY_LAKE)" exe resume-breaks mutants | diff ResumeVerify/mutants.expected -
+	set -o pipefail; cd verify && LEAN_ABORT_ON_PANIC=1 "$(VERIFY_LAKE)" exe resume-breaks traces | ./gen-resume-breaks.py | diff ResumeVerify/Breaks.lean -
+	set -o pipefail; cd verify && LEAN_ABORT_ON_PANIC=1 "$(VERIFY_LAKE)" exe resume-breaks mutants traces | ./gen-resume-breaks.py mutants | diff ResumeVerify/MutantBreaks.lean -
 
 # All 76 searches, compared with verify/WakeVerify/search.expected. JOBS=7 runs one process a
 # rule book. For the step-by-step runs: cd verify && LEAN_ABORT_ON_PANIC=1 lake exe breaks [PATTERN]
@@ -2020,3 +2031,21 @@ verify-search: verify-lake
 
 verify-harness: verify-lake
 	PATH="$(dir $(VERIFY_LAKE)):$$PATH" verify/harness/run.sh
+
+# RESUME_ARGS=traces prints every shortest run; RESUME_ARGS=spins lists the spinning states;
+# RESUME_ARGS=mutants searches each mutant and fails if one has no break.
+verify-resume-search: verify-lake
+	cd verify && "$(VERIFY_LAKE)" exe resume-breaks $(RESUME_ARGS)
+
+# What a userspace write of the guest counters does on this host's KVM (arm64, /dev/kvm,
+# kvm-arm.mode=nested): a measurement of the host kernel, run by hand.
+verify-counter-probe:
+	verify/probe/run.sh
+
+verify-gate-search: verify-lake
+	cd verify && "$(VERIFY_LAKE)" exe gate-breaks $(GATE_ARGS)
+
+# The rule book of this tree's fc-agent (verify/GateVerify/Today.lean).
+GATE_BOOK ?= owed
+verify-gate-drift: verify-lake
+	cd verify && "$(VERIFY_LAKE)" exe gate-seq check ../fc-agent/src/snapshot_network.rs $(GATE_BOOK)

@@ -4389,9 +4389,10 @@ fn host_jobs_install_from_cached_apt_archives_and_save_on_a_miss() {
 /// - `continue-on-error`, an `if:` or an `|| true` on the build step turns a broken proof
 ///   into a pass;
 /// - a build step without `./check-imports.sh` before the build, or without
-///   `./check-sweep.sh`, the two gate tests and the search comparison after it, still builds
-///   every proof and no longer checks what those check: the axiom sweep is not elaborated
-///   again on a restored build directory, and nothing else runs the search or the harness.
+///   `./check-sweep.sh`, the two gate tests, the search comparison, the boundary model's drift
+///   check naming a rule book and its search comparison after it, still builds every proof and
+///   no longer checks what those check: the axiom sweep is not elaborated again on a restored
+///   build directory, and nothing else runs the searches, the harness or the drift check.
 #[test]
 fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
     let wf = parse_workflow("verify.yml");
@@ -4415,7 +4416,13 @@ fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
         .iter()
         .filter_map(Value::as_str)
         .collect();
-    for needed in ["verify/**", ".github/workflows/verify.yml"] {
+    // fc-agent/src/snapshot_network.rs is the source the boundary model's order is compared
+    // with: a change to it has to start the job that makes the comparison.
+    for needed in [
+        "verify/**",
+        ".github/workflows/verify.yml",
+        "fc-agent/src/snapshot_network.rs",
+    ] {
         assert!(
             paths.contains(&needed),
             "verify.yml `pull_request.paths` is {paths:?}; without `{needed}` a change there \
@@ -4511,7 +4518,12 @@ fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
     //   when a file nothing imports is added, so the axiom sweep inside it does not see one;
     // - after the build, the sweep elaborated again whatever the build directory holds, the
     //   tests of the search's and the harness's own gates, and the small searches compared
-    //   with the result the documents quote.
+    //   with the result the documents quote;
+    // - after the build, the boundary model's drift check, naming the rule book of this tree
+    //   (without a name it passes on any order the model knows, an earlier one included), and
+    //   the boundary model's search, compared with the result its documents quote;
+    // - after the build, the resume model's search likewise, its mutants (each of which must
+    //   have a break), and its recorded runs, which must be what its generator makes today.
     let lines: Vec<&str> = script.lines().map(str::trim).collect();
     let line_of = |what: &str, wanted: &dyn Fn(&str) -> bool| -> usize {
         lines
@@ -4539,6 +4551,60 @@ fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
             "`{after}` runs what `lake build` makes, so it must come after it: {script:?}"
         );
     }
+    let drift = line_of(
+        "`lake exe gate-seq check ../fc-agent/src/snapshot_network.rs <rule book>`",
+        &|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            words.len() == 6
+                && words[..5]
+                    == [
+                        "lake",
+                        "exe",
+                        "gate-seq",
+                        "check",
+                        "../fc-agent/src/snapshot_network.rs",
+                    ]
+        },
+    );
+    let search = line_of(
+        "`LEAN_ABORT_ON_PANIC=1 lake exe gate-breaks summary | diff GateVerify/search.expected -`",
+        &|l| {
+            l == "LEAN_ABORT_ON_PANIC=1 lake exe gate-breaks summary | diff GateVerify/search.expected -"
+        },
+    );
+    let resume_search = line_of(
+        "`LEAN_ABORT_ON_PANIC=1 lake exe resume-breaks | diff ResumeVerify/search.expected -`",
+        &|l| {
+            l == "LEAN_ABORT_ON_PANIC=1 lake exe resume-breaks | diff ResumeVerify/search.expected -"
+        },
+    );
+    let resume_mutants = line_of(
+        "`LEAN_ABORT_ON_PANIC=1 lake exe resume-breaks mutants | diff ResumeVerify/mutants.expected -`",
+        &|l| {
+            l == "LEAN_ABORT_ON_PANIC=1 lake exe resume-breaks mutants | diff ResumeVerify/mutants.expected -"
+        },
+    );
+    let resume_runs = line_of(
+        "`LEAN_ABORT_ON_PANIC=1 lake exe resume-breaks traces | ./gen-resume-breaks.py | diff ResumeVerify/Breaks.lean -`",
+        &|l| {
+            l == "LEAN_ABORT_ON_PANIC=1 lake exe resume-breaks traces | ./gen-resume-breaks.py | diff ResumeVerify/Breaks.lean -"
+        },
+    );
+    let resume_mutant_runs = line_of(
+        "`LEAN_ABORT_ON_PANIC=1 lake exe resume-breaks mutants traces | ./gen-resume-breaks.py mutants | diff ResumeVerify/MutantBreaks.lean -`",
+        &|l| {
+            l == "LEAN_ABORT_ON_PANIC=1 lake exe resume-breaks mutants traces | ./gen-resume-breaks.py mutants | diff ResumeVerify/MutantBreaks.lean -"
+        },
+    );
+    assert!(
+        built < drift
+            && built < search
+            && built < resume_search
+            && built < resume_mutants
+            && built < resume_runs
+            && built < resume_mutant_runs,
+        "the drift check and the searches run the executables `lake build` makes: {script:?}"
+    );
 
     // The toolchain is the one verify/lean-toolchain pins, read from the file, and its cache
     // is keyed on that file: a toolchain bump cannot be served the old compiler.

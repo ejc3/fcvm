@@ -293,13 +293,15 @@ it says "a source, and its snapshot is over" by running `--resume-snapshot-netwo
 guest's part is that the request can always be served and that a served request either
 opens the gate or leaves the boundary owed.
 
-Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
-`fc-agent/src/snapshot_network.rs`); they are in guest memory, so in the image:
+Two files under `/run/fcvm` say whose a closed gate is, and a third which prepare may not
+close one (`BoundaryMarks`, `fc-agent/src/snapshot_network.rs`); they are in guest memory, so
+in the image:
 
 | mark | written | removed | while it is there |
 |---|---|---|---|
 | `snapshot-boundary-owed` | by the prepare, under the boundary lock, before the freeze and the gate | by the resume that opened the gate; by a restore when it is dispatched | a resume that fails leaves it, the manifest and the freeze; an fc-agent that starts and finds it opens exec at once, for the resume one-shot alone (`exec::serve_only_the_boundary_resume`) |
 | `restore-under-way` | when a restore's epoch is dispatched, before anything else of the restore | at publication, before the acknowledgement | both one-shots refuse with exit 3, before they wait for the boundary lock, and change nothing; the freeze watchdog does not count its looks |
+| `snapshot-boundary-cancelled` | under the boundary lock, by a resume with a token that finds no `owed` mark | never; the next such resume writes its own token over it | a prepare with that token refuses under the lock, before its mark and its freeze, and changes nothing (#1941) |
 
 - **The host asks until the gate is open** (`reopen_source_network`,
   `src/commands/common.rs`): for 150 s in all, 2 s between tries, every try cut off at
@@ -409,9 +411,30 @@ Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
   lands does not leave the switch on for the next snapshot to capture. The undo writes
   the recorded 0 even if someone set the switch to 1 on purpose meanwhile, and a guest
   whose host died keeps the 1 until its agent restarts or its next snapshot.
-- Not covered: the host's `snapshot create` dying as well (#1936, #1941), and a stray
-  one-shot on a clone before its restore is dispatched, which only the host can refuse
-  (#2138's host half).
+- **A `snapshot create` that dies is undone by its guard** (#1936,
+  `src/commands/snapshot_guard.rs`). A create whose source keeps running spawns
+  `fcvm snapshot source-guard` before its first change. The guard inherits its end of a
+  socket pair, a pidfd of the create, and the create's per-VM snapshot lock (the same open
+  file description, so the flock stays held from the create's death to the end of the
+  undo). The create tells it the prepare is next and the pause is next, and after its own
+  reopen tells it to stand down and waits for it to drop the lock. A guard that never said it
+  was ready fails the create, and a create that cannot tell it of the pause reopens the guest
+  and does not pause. When the create stops otherwise (SIGKILL included) the guard bumps the
+  vsock epoch and resumes the VMM if the pause was asked for, then runs the create's own
+  reopen (`reopen_source_network`, with the state's token and its 150 s bound), so a source
+  it cannot open is left running and recorded gated, as a live create leaves it.
+- **A resume can overtake its own create's prepare.** The guest serves each exec on a task of
+  its own, so the reopen after a prepare the host took for failed, or a guard's reopen, can
+  take the boundary lock while that create's prepare still waits for it. The resume finds no
+  `owed` mark and records its token in `snapshot-boundary-cancelled`; the prepare then finds
+  its token there and refuses. Without it the late prepare closed the gate after the
+  create's last reopen and nothing opened it again.
+  `a_prepare_its_creates_resume_overtook_changes_nothing` pins the guest's half;
+  `test_lifecycle_interleave_killed_snapshot_create_resumes_its_source` and its Cloud
+  Hypervisor twin SIGKILL a create held paused at `snapshot.post_save_pre_resume`.
+- Not covered: a stray one-shot on a clone before its restore is dispatched, which only the
+  host can refuse (#2138's host half), and `--disk-only` and `--gpu-warm` creates killed
+  in their own steps (#1939).
 
 `a_sources_gate_is_reopened_after_its_agent_dies_between_the_prepare_and_the_resume` and
 `a_restoring_clone_refuses_a_prepare_and_stays_frozen_past_the_watchdogs_deadline`
@@ -1869,15 +1892,23 @@ was not identified.
 The "nested tests are too slow/flaky" disables (Jan 2026) traced to TWO snapshot-lifecycle
 bugs, both fixed. Neither was an inherent NV2 limitation:
 
-**1. Timer-domain skew on restore (firecracker fork fix).** Restore replayed CNTVCT/CNTPCT
-(KVM adjusts per-timer offsets, which for HAS_EL2 guests live in CNTVOFF_EL2 storage), then
-replayed CNTVOFF_EL2 — clobbering the adjustment. The guest's monotonic clock jumped forward
-by the host time elapsed since the snapshot, every armed timer CVAL landed in the past, and
-KVM's emulated EL1 timers (NV2 traps these) re-fired in a storm (~14k kvm_timer_emulate/s
-measured) that starved the vCPUs 25-300x. Fix: firecracker owns the VM-wide counter offset
-via `KVM_ARM_SET_COUNTER_OFFSET` — set at boot (zero-based counters), set coherently before
-the register replay on restore, and advanced by the pause duration on resume so the guest
-clock FREEZES while a VM is paused (fcvm's pre-start snapshot pauses VMs for many seconds).
+**1. The guest's clock ran while it was paused (firecracker fork fix).** Nothing owned the
+VM's counter offset, so the guest's counter kept running while the vCPUs were out of
+`KVM_RUN`: a VM resumed in place after a snapshot had its clock ahead by the whole pause, and
+every timer that came due in that time fired at once. A restore's register replay does not
+move the clock forward: on a `CNTVCT`/`CNTPCT` write KVM stores `now - value` in the VM-wide
+physical offset and keeps nothing in `CNTVOFF_EL2` storage (read at v6.18.3 and v7.3.3;
+measured by `verify/probe` on v7.3.3 only), so the counters continue from the saved values,
+except that a saved `CNTVOFF_EL2` of X on the last vCPU replayed leaves the physical counter X
+behind. Why restore-hit boots measured slow before the fix and fast after is not explained by
+this and is open. `kvm_timer_emulate` at about 14k a second can be the exit rate of a guest
+hypervisor without FEAT_ECV (read: both EL1 timers are emulated again on every exit whether
+or not one fires), so that count alone does not show timers firing; the trace's `should_fire`
+field would. Fix: firecracker owns the VM-wide counter offset via `KVM_ARM_SET_COUNTER_OFFSET`.
+It is set at boot (zero-based counters), set before the register replay on restore, and
+advanced by the pause duration on resume, so the guest clock FREEZES while a VM is paused
+(fcvm's pre-start snapshot pauses VMs for many seconds). The reading and the measurement are
+in `verify/ResumeVerify/REPAIRS.md`, 7 (`make verify-counter-probe`).
 
 **2. Event-loop starvation after pause→save→resume (fcvm design fix).** Resuming the VM that
 just produced a snapshot intermittently left Firecracker's single device event-loop thread

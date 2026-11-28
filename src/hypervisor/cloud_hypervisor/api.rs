@@ -39,6 +39,11 @@ impl ChClient {
         }
     }
 
+    /// The API socket this client talks to.
+    pub fn socket_path(&self) -> &std::path::Path {
+        &self.socket_path
+    }
+
     /// Return a clone with a different request timeout (for long ops like snapshot).
     pub fn with_timeout(&self, timeout: Duration) -> Self {
         Self {
