@@ -191,32 +191,32 @@ commit = "65e8301c5c79577b5de49cac640194e954e718ff"
 repo = "ejc3/fcvm"
 
 [[vmm_artifacts.files]]
-name = "cloud-hypervisor-243d1c8ffff4.bin"
-commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
-arch = "x86_64"
-libc = "libc-2.39"
-sha256 = "d8999c7baf176ec124cd48bb4cb5dffe5a584a4e105f0e416232ed27383e35b3"
-
-[[vmm_artifacts.files]]
-name = "cloud-hypervisor-af878066d491.bin"
-commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
+name = "cloud-hypervisor-0d3432785091.bin"
+commit = "65e8301c5c79577b5de49cac640194e954e718ff"
 arch = "x86_64"
 libc = "libc-2.36"
-sha256 = "adb7e3ec2521514c8a3d361e2647f0b81b7ecaaf2eba8eaa998ddb52e811354c"
+sha256 = "45749bacb1529308d289a6e28da645ced24532a2da7a800f31f2aba95a8cb34b"
 
 [[vmm_artifacts.files]]
-name = "cloud-hypervisor-b857d4ccd8bc.bin"
-commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
+name = "cloud-hypervisor-76b9972d1812.bin"
+commit = "65e8301c5c79577b5de49cac640194e954e718ff"
+arch = "x86_64"
+libc = "libc-2.39"
+sha256 = "ef1133bc274443db215ac9adad19ad46b26b7b583d571136987ddd6410ae510e"
+
+[[vmm_artifacts.files]]
+name = "cloud-hypervisor-8667f6d9f138.bin"
+commit = "65e8301c5c79577b5de49cac640194e954e718ff"
 arch = "aarch64"
 libc = "libc-2.36"
-sha256 = "0588ddf36dbdf419ed1e500548dec6809ec9bb7048b218b9d74db9247b8fc4aa"
+sha256 = "c7b286d7a04bc002739014c5a2dc36a4860522865b46a0ca74a1926e367718ef"
 
 [[vmm_artifacts.files]]
-name = "cloud-hypervisor-f65bbba51d6a.bin"
-commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
+name = "cloud-hypervisor-f48503b41b12.bin"
+commit = "65e8301c5c79577b5de49cac640194e954e718ff"
 arch = "aarch64"
 libc = "libc-2.39"
-sha256 = "3d9121a05b45dc55b2f937ac147bec7d90a5805b0faecd3b7e6c45cad92ce963"
+sha256 = "685b997ee9a530661503851ab1cbc184b112e7f4c4a25f3036c7e6e5eaa75da7"
 
 [[vmm_artifacts.files]]
 name = "firecracker-default-22be8e6e2431.bin"
