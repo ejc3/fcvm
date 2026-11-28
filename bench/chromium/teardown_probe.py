@@ -31,9 +31,10 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from reqbench import (  # noqa: E402
-    DirWatch, children_of, clone_cdp_endpoint, find_state, pidfd_open, proc_comm,
-    refuse_unconverted_state_layout,
-    reap_disk, scan_state, wait_port,
+    StateWatch, children_of, clone_cdp_endpoint, fcvm_state_dir, find_state, pidfd_open,
+    proc_comm,
+    require_state_layout,
+    reap_disk, scan_state, vm_runtime_dir, wait_port,
 )
 
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -88,7 +89,8 @@ def reap_rep(row: dict, named: dict, sp, data_dir) -> bool:
                 except (ProcessLookupError, PermissionError):
                     pass
         return True
-    data_root = os.path.dirname(os.path.dirname(data_dir)) if data_dir else ""
+    # data_dir is <data_root>/vm-disks/<bucket>/<vm_id>.
+    data_root = os.path.dirname(os.path.dirname(os.path.dirname(data_dir))) if data_dir else ""
     reaped = reap_disk(row, data_root, sp, data_dir)
     if reaped:
         row["disk_reaped"] = reaped
@@ -147,8 +149,12 @@ def main():
                     help="how long to wait for the clone's state file to appear")
     a = ap.parse_args()
     a.fcvm = os.path.abspath(a.fcvm)
-    state_dir = os.path.join(a.data_root, "state")
-    refuse_unconverted_state_layout(state_dir)
+    # Where this fcvm keeps VM state: its answer, never a join of the data root.
+    try:
+        state_dir = fcvm_state_dir(a.fcvm)
+    except RuntimeError as error:
+        sys.exit(f"teardown_probe: {error}")
+    require_state_layout(state_dir)
 
     rows: list = []
     leaked = False
@@ -167,7 +173,7 @@ def main():
             # Unprivileged, fcvm cannot make the VM's cgroup and refuses --no-swap.
             if os.geteuid() == 0:
                 cmd.append("--no-swap")
-            watch = DirWatch(state_dir)  # registered BEFORE the spawn
+            watch = StateWatch(state_dir)  # registered BEFORE the spawn
             with open(log, "wb") as lf:
                 proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL,
                                         env=dict(os.environ, RUST_LOG="fcvm=debug"))
@@ -193,7 +199,7 @@ def main():
                     print(f"rep {i}: no state -> killing the clone and skipping",
                           file=sys.stderr)
                     continue
-                data_dir = os.path.join(a.data_root, "vm-disks", state.get("vm_id", ""))
+                data_dir = vm_runtime_dir(a.data_root, state.get("vm_id", ""))
                 wait_port(clone_cdp_endpoint(state, a.cdp_port), deadline)
                 time.sleep(0.3)  # settle: measure steady-state teardown, not mid-restore
 
@@ -217,7 +223,7 @@ def main():
                 watch.close()
                 # SIGKILL cannot be caught, so `cleanup_vm` never runs: WE own the
                 # reap of BOTH artifacts. The state file alone is not enough —
-                # nothing in fcvm ever removes `vm-disks/<vm_id>`, which holds a
+                # nothing in fcvm ever removes `vm-disks/<bucket>/<vm_id>`, which holds a
                 # reflink of the golden rootfs and therefore pins the golden
                 # snapshot's extents on btrfs even after `snapshots delete`.
                 if proc.poll() is None:
@@ -250,8 +256,7 @@ def main():
                     # vm_id (and thus the data dir) on this path.
                     sp, state = scan_state(state_dir, proc.pid, name)
                     if state is not None:
-                        data_dir = os.path.join(a.data_root, "vm-disks",
-                                                state.get("vm_id", ""))
+                        data_dir = vm_runtime_dir(a.data_root, state.get("vm_id", ""))
                 leaked |= reap_rep(row, named, sp, data_dir)
                 rows.append(row)
     finally:

@@ -34,6 +34,7 @@ async fn test_state_persistence() {
         created_at: now,
         last_updated: now,
         config: VmConfig {
+            vm_runtime_dir: None,
             image: "nginx:alpine".to_string(),
             vcpu: 2,
             memory_mib: 512,
@@ -160,6 +161,7 @@ async fn test_list_vms() {
             created_at: now,
             last_updated: now,
             config: VmConfig {
+                vm_runtime_dir: None,
                 image: "nginx:alpine".to_string(),
                 vcpu: 1,
                 memory_mib: 256,
@@ -256,6 +258,7 @@ async fn test_load_state_by_name_duplicate_detection() {
             created_at: now,
             last_updated: now,
             config: VmConfig {
+                vm_runtime_dir: None,
                 image: "nginx:alpine".to_string(),
                 vcpu: 1,
                 memory_mib: 256,
@@ -347,6 +350,7 @@ async fn test_load_state_by_name_duplicate_detection() {
         created_at: now,
         last_updated: now,
         config: VmConfig {
+            vm_runtime_dir: None,
             image: "nginx:alpine".to_string(),
             vcpu: 1,
             memory_mib: 256,
@@ -506,6 +510,7 @@ fn make_vm_state(vm_id: &str, name: &str, pid: u32) -> VmState {
         created_at: Timestamp::now(),
         last_updated: Timestamp::now(),
         config: VmConfig {
+            vm_runtime_dir: None,
             image: "test:latest".to_string(),
             vcpu: 1,
             memory_mib: 256,
@@ -905,7 +910,7 @@ async fn a_loopback_address_another_user_holds_is_not_handed_out() {
         1,
         512,
     );
-    let allocated = manager.allocate_loopback_ip(&mut state).await;
+    let allocated = manager.allocate_loopback_ip(&mut state);
     let _ = manager.delete_state("vm-root-lease").await;
     let _ = holder.kill();
     let _ = holder.wait();
@@ -964,7 +969,7 @@ fn many_other_vms(dir: &std::path::Path, count: usize) {
         std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
         std::fs::write(path.with_extension("json.lock"), b"").unwrap();
     }
-    std::fs::write(dir.join("sweep.stamp"), b"now").unwrap();
+    manager.set_sweep_stamp(std::time::Duration::ZERO).unwrap();
 }
 
 /// Watch `dir` and every directory under it (the buckets the other VMs' states are in) for
@@ -1032,12 +1037,8 @@ async fn starting_a_vm_reads_no_other_vms_state() {
     let manager = StateManager::new(temp_dir.path().to_path_buf());
     manager.init().await.unwrap();
     many_other_vms(temp_dir.path(), 2000);
-    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-    std::fs::File::options()
-        .write(true)
-        .open(temp_dir.path().join("sweep.stamp"))
-        .unwrap()
-        .set_modified(long_ago)
+    manager
+        .set_sweep_stamp(std::time::Duration::from_secs(3600))
         .unwrap();
     let _sweeping = nix::fcntl::Flock::lock(
         std::fs::File::create(temp_dir.path().join("sweep.lock")).unwrap(),
@@ -1049,7 +1050,7 @@ async fn starting_a_vm_reads_no_other_vms_state() {
     let mut vm = VmState::new("vm-start".to_string(), "alpine:latest".to_string(), 1, 512);
     vm.name = Some("start".to_string());
     manager.claim_name(&mut vm).await.unwrap();
-    manager.allocate_loopback_ip(&mut vm).await.unwrap();
+    manager.allocate_loopback_ip(&mut vm).unwrap();
     vm.status = VmStatus::Running;
     manager.save_state(&vm).await.unwrap();
     let opened = watch.opens();
@@ -1078,7 +1079,7 @@ async fn starting_and_stopping_a_vm_truncates_no_lock_file() {
             let mut vm = VmState::new(id.to_string(), "alpine:latest".to_string(), 1, 512);
             vm.name = Some("same-name".to_string());
             manager.claim_name(&mut vm).await.unwrap();
-            manager.allocate_loopback_ip(&mut vm).await.unwrap();
+            manager.allocate_loopback_ip(&mut vm).unwrap();
             vm.status = VmStatus::Running;
             manager.save_state(&vm).await.unwrap();
             manager.delete_state(id).await.unwrap();
@@ -1184,7 +1185,7 @@ fn of_many_concurrent_claims_of_one_name_exactly_one_wins_and_addresses_differ()
                         VmState::new("vm-own".to_string(), "alpine:latest".to_string(), 1, 512);
                     barrier.wait();
                     let won = manager.claim_name(&mut contender).await.is_ok();
-                    let ip = own_manager.allocate_loopback_ip(&mut own).await.unwrap();
+                    let ip = own_manager.allocate_loopback_ip(&mut own).unwrap();
                     (won, ip)
                 })
             })
@@ -1226,7 +1227,7 @@ async fn rootless_launch_child() {
     );
     vm.name = Some("rootless".to_string());
     manager.claim_name(&mut vm).await.unwrap();
-    manager.allocate_loopback_ip(&mut vm).await.unwrap();
+    manager.allocate_loopback_ip(&mut vm).unwrap();
     vm.status = VmStatus::Running;
     manager.save_state(&vm).await.unwrap();
     assert_eq!(
@@ -1263,7 +1264,7 @@ async fn a_rootless_launch_writes_its_state_after_a_root_launch_in_the_same_dire
     let mut root_vm = VmState::new("vm-root".to_string(), "alpine:latest".to_string(), 1, 512);
     root_vm.name = Some("root".to_string());
     manager.claim_name(&mut root_vm).await.unwrap();
-    manager.allocate_loopback_ip(&mut root_vm).await.unwrap();
+    manager.allocate_loopback_ip(&mut root_vm).unwrap();
     manager.save_state(&root_vm).await.unwrap();
     // A root VM that held the owner's name and was killed: its slot, handed to the state
     // directory's owner as a root claim hands it, with the dead VM's token in it. The
@@ -1278,13 +1279,9 @@ async fn a_rootless_launch_writes_its_state_after_a_root_launch_in_the_same_dire
     std::fs::write(slot.join("4000000000.1.vm-crashed"), b"").unwrap();
     // The sweep is due, so the owner's claim rewrites the stamp root's claim wrote.
     let stamp = state.join("sweep.stamp");
-    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-    std::fs::File::options()
-        .write(true)
-        .open(&stamp)
-        .unwrap()
-        .set_modified(long_ago)
-        .unwrap();
+    let hour = std::time::Duration::from_secs(3600);
+    manager.set_sweep_stamp(hour).unwrap();
+    let aged = std::fs::read_to_string(&stamp).unwrap();
 
     let binary = base.path().join("test_state_manager");
     std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
@@ -1296,7 +1293,16 @@ async fn a_rootless_launch_writes_its_state_after_a_root_launch_in_the_same_dire
         .env("FCVM_TEST_ROOTLESS_STATE_DIR", &state)
         .output()
         .unwrap();
-    let swept_at = std::fs::metadata(&stamp).unwrap().modified().unwrap();
+    let after_the_owner = std::fs::read_to_string(&stamp).unwrap();
+    // The reverse: the sweep is due again, and root's claim rewrites the stamp the owner
+    // wrote.
+    manager.set_sweep_stamp(hour).unwrap();
+    let aged_again = std::fs::read_to_string(&stamp).unwrap();
+    let mut second = VmState::new("vm-root-2".to_string(), "alpine:latest".to_string(), 1, 512);
+    second.name = Some("root-2".to_string());
+    manager.claim_name(&mut second).await.unwrap();
+    let after_root = std::fs::read_to_string(&stamp).unwrap();
+    manager.delete_state("vm-root-2").await.unwrap();
     manager.delete_state("vm-root").await.unwrap();
 
     assert!(
@@ -1305,9 +1311,26 @@ async fn a_rootless_launch_writes_its_state_after_a_root_launch_in_the_same_dire
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // A stamp is `<boot id> <nanoseconds since boot>` of the sweep that last began. An aged
+    // one is another boot's when this host has been up for less than its age.
+    let this_boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    let newer = |stamp: &str, than: &str| {
+        let parts = |stamp: &str| -> (String, u64) {
+            let (boot, began) = stamp.split_once(' ').unwrap();
+            (boot.to_string(), began.parse().unwrap())
+        };
+        let (stamp, than) = (parts(stamp), parts(than));
+        stamp.0 == this_boot.trim() && (than.0 != stamp.0 || stamp.1 > than.1)
+    };
     assert!(
-        swept_at > long_ago + std::time::Duration::from_secs(60),
-        "the owner's claim could not rewrite the sweep stamp root wrote"
+        newer(&after_the_owner, &aged),
+        "the owner's claim could not rewrite the sweep stamp root wrote: {aged:?} then \
+         {after_the_owner:?}"
+    );
+    assert!(
+        newer(&after_root, &aged_again),
+        "root's claim did not rewrite the sweep stamp the owner wrote: {aged_again:?} then \
+         {after_root:?}"
     );
 }
 
@@ -1384,7 +1407,7 @@ async fn a_dead_state_without_a_name_entry_does_not_hide_the_live_vm_by_name() {
     )
     .unwrap();
     // A sweep ran just now, so this claim does not sweep the dead state away.
-    std::fs::write(temp_dir.path().join("sweep.stamp"), b"now").unwrap();
+    manager.set_sweep_stamp(std::time::Duration::ZERO).unwrap();
     let mut live = VmState::new("vm-live".to_string(), "alpine:latest".to_string(), 1, 512);
     live.name = Some("web".to_string());
     manager.claim_name(&mut live).await.unwrap();
@@ -1527,4 +1550,492 @@ async fn readers_never_see_a_state_being_written() {
     // A writer that failed ended the loop early; its panic is reported here.
     writer.await.unwrap();
     manager.delete_state("vm-busy").await.unwrap();
+}
+
+/// Leasing a loopback address writes no state: the lease is the abstract socket, and a
+/// save of its own here was one of six state writes in every start. A start leases before
+/// its name claim, whose write carries the address
+/// (`a_starts_first_state_carries_its_loopback_address`).
+#[tokio::test]
+async fn leasing_a_loopback_address_writes_no_state() {
+    use std::os::unix::fs::MetadataExt;
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+    let mut vm = VmState::new("vm-lease".to_string(), "alpine:latest".to_string(), 1, 512);
+    vm.name = Some("lease".to_string());
+    manager.claim_name(&mut vm).await.unwrap();
+    let state_file = manager.state_file("vm-lease");
+    let before = std::fs::metadata(&state_file).unwrap();
+
+    let ip = manager.allocate_loopback_ip(&mut vm).unwrap();
+    assert_eq!(vm.config.network.loopback_ip.as_deref(), Some(ip.as_str()));
+    let after = std::fs::metadata(&state_file).unwrap();
+    assert_eq!(
+        (before.ino(), before.mtime(), before.mtime_nsec()),
+        (after.ino(), after.mtime(), after.mtime_nsec()),
+        "leasing the address rewrote the state file"
+    );
+    assert_eq!(
+        manager
+            .load_state("vm-lease")
+            .await
+            .unwrap()
+            .config
+            .network
+            .loopback_ip,
+        None
+    );
+
+    // The launch's next save persists it.
+    manager.save_state(&vm).await.unwrap();
+    assert_eq!(
+        manager
+            .load_state("vm-lease")
+            .await
+            .unwrap()
+            .config
+            .network
+            .loopback_ip,
+        Some(ip)
+    );
+    manager.delete_state("vm-lease").await.unwrap();
+}
+
+/// A start leases its loopback address before it claims its name, so the VM's first
+/// state carries it. A restore's published port listens on the address before the
+/// restore's next state write (`restore.post_network_pre_resume` holds there), and a VM
+/// listed without the address its ports are on cannot be reached by whoever listed it:
+/// `test_lifecycle_interleave_early_connection_cannot_poison_restored_ingress` and
+/// `test_restored_clone_udp_port_is_closed_until_the_restore_ack` read it at that hold.
+/// Once kept, the lease goes with the state.
+#[tokio::test]
+async fn a_starts_first_state_carries_its_loopback_address() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+    let mut vm = VmState::new("vm-first".to_string(), "alpine:latest".to_string(), 1, 512);
+    vm.name = Some("first".to_string());
+
+    let lease = manager.lease_loopback_ip_for_claim(&mut vm).unwrap();
+    let ip = vm.config.network.loopback_ip.clone();
+    assert!(ip.is_some());
+    manager.claim_name(&mut vm).await.unwrap();
+    lease.keep();
+    assert_eq!(
+        manager
+            .load_state("vm-first")
+            .await
+            .unwrap()
+            .config
+            .network
+            .loopback_ip,
+        ip,
+        "the state the name claim wrote does not hold the address"
+    );
+    assert!(StateManager::holds_loopback_lease("vm-first"));
+    manager.delete_state("vm-first").await.unwrap();
+    assert!(!StateManager::holds_loopback_lease("vm-first"));
+}
+
+/// A start that leases an address and then fails at its name claim gives the address
+/// back, and so does one whose future is dropped before the claim has written the state:
+/// neither has a state for `delete_state` to release it with.
+#[tokio::test]
+async fn a_start_that_fails_at_its_name_claim_gives_its_loopback_address_back() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+    let named = |vm_id: &str| {
+        let mut vm = VmState::new(vm_id.to_string(), "alpine:latest".to_string(), 1, 512);
+        vm.name = Some("wanted".to_string());
+        vm
+    };
+    // The name's owner is this process, which is alive.
+    let mut owner = named("vm-owner");
+    manager.claim_name(&mut owner).await.unwrap();
+
+    let mut refused = named("vm-refused");
+    let start = async {
+        let lease = manager.lease_loopback_ip_for_claim(&mut refused)?;
+        manager.claim_name(&mut refused).await?;
+        lease.keep();
+        anyhow::Ok(())
+    };
+    assert!(start.await.is_err(), "the name is taken by a live VM");
+    assert!(
+        !StateManager::holds_loopback_lease("vm-refused"),
+        "a start refused at its name claim kept its loopback address"
+    );
+
+    let mut dropped = named("vm-dropped");
+    let lease = manager.lease_loopback_ip_for_claim(&mut dropped).unwrap();
+    assert!(StateManager::holds_loopback_lease("vm-dropped"));
+    drop(lease);
+    assert!(!StateManager::holds_loopback_lease("vm-dropped"));
+
+    manager.delete_state("vm-owner").await.unwrap();
+}
+
+/// A state write that cannot be completed (a full tmpfs) fails, and the state that was published stays whole. The write goes to a
+/// temporary file first, so a reader never sees a state cut short. The file size limit
+/// stands in for the full filesystem: both fail the write of the temporary file.
+#[tokio::test]
+async fn a_state_write_that_fails_leaves_the_published_state_whole() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+    let mut vm = VmState::new("vm-full".to_string(), "alpine:latest".to_string(), 1, 512);
+    vm.name = Some("full".to_string());
+    manager.claim_name(&mut vm).await.unwrap();
+    let before = std::fs::read(manager.state_file("vm-full")).unwrap();
+
+    // SIGXFSZ ignored, so a write past the limit returns EFBIG and does not kill the test.
+    unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+    let mut old = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut old) }, 0);
+    let small = libc::rlimit {
+        rlim_cur: 64,
+        rlim_max: old.rlim_max,
+    };
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &small) }, 0);
+    let updated = manager
+        .update_health_status("vm-full", fcvm::state::HealthStatus::Healthy, None)
+        .await;
+    vm.status = VmStatus::Running;
+    let saved = manager.save_state(&vm).await;
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &old) }, 0);
+
+    assert!(
+        updated.is_err(),
+        "an update that could not be written reported success"
+    );
+    assert!(
+        saved.is_err(),
+        "a save that could not be written reported success"
+    );
+    assert_eq!(
+        std::fs::read(manager.state_file("vm-full")).unwrap(),
+        before,
+        "a failed write changed the published state"
+    );
+    let read = manager.load_state("vm-full").await.unwrap();
+    assert_eq!(read.health_status, fcvm::state::HealthStatus::Unknown);
+
+    // With room again the same writes succeed.
+    manager
+        .update_health_status("vm-full", fcvm::state::HealthStatus::Healthy, None)
+        .await
+        .unwrap();
+    manager.delete_state("vm-full").await.unwrap();
+}
+
+/// A start under a umask of 077 leaves every directory 0755, every lock file 0666 and the
+/// state and the name token 0644. Root and the store's owner share a state directory, and
+/// a bucket or a claim made with the umask's mode shut out the one that did not make it.
+#[tokio::test]
+async fn a_start_under_umask_077_makes_nothing_with_the_umasks_mode() {
+    use std::os::unix::fs::MetadataExt;
+    let temp_dir = TempDir::new().unwrap();
+    let state_dir = temp_dir.path().join("state");
+    let old = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+    let manager = StateManager::new(state_dir.clone());
+    let started = async {
+        manager.init().await?;
+        let mut vm = VmState::new("vm-umask".to_string(), "alpine:latest".to_string(), 1, 512);
+        vm.name = Some("umask".to_string());
+        manager.claim_name(&mut vm).await?;
+        manager
+            .update_health_status("vm-umask", HealthStatus::Healthy, None)
+            .await
+    }
+    .await;
+    nix::sys::stat::umask(old);
+    started.unwrap();
+
+    let mut wrong = Vec::new();
+    let mut dirs = vec![state_dir.clone()];
+    while let Some(dir) = dirs.pop() {
+        let mode = std::fs::metadata(&dir).unwrap().mode() & 0o7777;
+        if mode != 0o755 {
+            wrong.push(format!("{} is {mode:o}, not 755", dir.display()));
+        }
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            let metadata = entry.metadata().unwrap();
+            if metadata.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let expected = if name.ends_with(".lock") || name == "sweep.stamp" {
+                0o666
+            } else {
+                0o644
+            };
+            let mode = metadata.mode() & 0o7777;
+            if mode != expected {
+                wrong.push(format!("{} is {mode:o}, not {expected:o}", path.display()));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "made with the umask's mode:\n{}",
+        wrong.join("\n")
+    );
+    manager.delete_state("vm-umask").await.unwrap();
+}
+
+/// A VM id whose state bucket is `bucket`, so two launches can be put in one bucket.
+#[cfg(feature = "privileged-tests")]
+fn vm_id_in_bucket(prefix: &str, bucket: &str) -> String {
+    (0..)
+        .map(|n| format!("{prefix}-{n}"))
+        .find(|id| fcvm::state::manager::bucket_of(id) == bucket)
+        .unwrap()
+}
+
+/// `root_and_the_stores_owner_each_start_on_a_runtime_directory_the_other_made`, run as
+/// root in the parent and as the store's owner through `setpriv`. With
+/// `FCVM_TEST_BIND_DATA_DIR` set it binds that data directory, with
+/// `FCVM_TEST_BIND_RUN` standing in for `/run`, and does a VM's start and stop there;
+/// without it, it returns at once.
+#[tokio::test]
+async fn bound_launch_child() {
+    let Ok(data_dir) = std::env::var("FCVM_TEST_BIND_DATA_DIR") else {
+        return;
+    };
+    let run = std::env::var("FCVM_TEST_BIND_RUN").unwrap();
+    let vm_id = std::env::var("FCVM_TEST_BIND_VM_ID").unwrap();
+    bound_launch(
+        std::path::Path::new(&data_dir),
+        std::path::Path::new(&run),
+        &vm_id,
+        true,
+    )
+    .await;
+}
+
+/// What a launch does to the state of `data_dir`: locate its runtime directory with `run`
+/// standing in for `/run`, bind it, claim a name with a leased address, save, publish
+/// health, sweep, and with `stop` delete the state. Returns the state directory.
+async fn bound_launch(
+    data_dir: &std::path::Path,
+    run: &std::path::Path,
+    vm_id: &str,
+    stop: bool,
+) -> std::path::PathBuf {
+    use fcvm::runtime_dir::{bind, locate, Access, Host};
+    let host = Host::current().unwrap();
+    let located = locate(None, None, data_dir, run, &host);
+    let runtime = bind(data_dir, &located, Access::Write, &host)
+        .unwrap()
+        .expect("a writer binds the store");
+    let state_dir = runtime.dir.join("state");
+    let manager = StateManager::new(state_dir.clone());
+    manager.init().await.unwrap();
+    let mut vm = VmState::new(vm_id.to_string(), "alpine:latest".to_string(), 1, 512);
+    vm.name = Some(format!("name-of-{vm_id}"));
+    let lease = manager.lease_loopback_ip_for_claim(&mut vm).unwrap();
+    manager.claim_name(&mut vm).await.unwrap();
+    lease.keep();
+    vm.status = VmStatus::Running;
+    manager.save_state(&vm).await.unwrap();
+    manager
+        .update_health_status(vm_id, HealthStatus::Healthy, None)
+        .await
+        .unwrap();
+    manager.sweep_stale().await;
+    assert_eq!(
+        manager.load_state(vm_id).await.unwrap().health_status,
+        HealthStatus::Healthy
+    );
+    if stop {
+        manager.delete_state(vm_id).await.unwrap();
+    }
+    state_dir
+}
+
+/// Root and the owner of a store share its runtime directory, whichever of them is first
+/// to bind it in a boot, in both places a store's states can be by default:
+///
+/// - root first, no base: root makes `<run>/fcvm-<owner>` for the owner, and the states
+///   are under it;
+/// - the owner first, no base: the states are in `<data_dir>/runtime`, and root follows
+///   the store's record there;
+/// - the owner first, the base made beforehand as `sudo fcvm setup` and the tmpfiles.d
+///   rule make it: the states are under the base.
+///
+/// Whatever root makes on the way (the base, the place, this boot's directory, `state/`,
+/// a bucket, a claim directory) must be the owner's to write in afterwards, and what the
+/// owner makes must pass root's ownership check. Both launches put their VM in the same
+/// state bucket. The owner's launches run as uid 65534 through `setpriv`, from a copy of
+/// this test binary that uid can read.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn root_and_the_stores_owner_each_start_on_a_runtime_directory_the_other_made() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let top = TempDir::new().unwrap();
+    std::fs::set_permissions(top.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let binary = top.path().join("test_state_manager");
+    std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let nobody = Some(nix::unistd::Uid::from_raw(65534));
+    let nogroup = Some(nix::unistd::Gid::from_raw(65534));
+    let as_owner = |data: &std::path::Path, run: &std::path::Path, vm_id: &str| {
+        let output = std::process::Command::new("setpriv")
+            .args(["--reuid=65534", "--regid=65534", "--clear-groups", "--"])
+            .arg(&binary)
+            .args(["--exact", "bound_launch_child", "--nocapture"])
+            .env("FCVM_TEST_BIND_DATA_DIR", data)
+            .env("FCVM_TEST_BIND_RUN", run)
+            .env("FCVM_TEST_BIND_VM_ID", vm_id)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "the owner's launch of {vm_id} failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    for (name, root_first, base_made, on_store) in [
+        ("root-first", true, false, false),
+        ("owner-first", false, false, true),
+        ("owner-first-with-a-base", false, true, false),
+    ] {
+        let case = top.path().join(name);
+        let (data, run) = (case.join("data"), case.join("run"));
+        std::fs::create_dir_all(&data).unwrap();
+        // The store is the owner's; `run` is root's and nobody else writes it, as /run is.
+        std::fs::create_dir_all(&run).unwrap();
+        nix::unistd::chown(&data, nobody, nogroup).unwrap();
+        let base = run.join("fcvm-65534");
+        if base_made {
+            std::fs::create_dir(&base).unwrap();
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+            nix::unistd::chown(&base, nobody, nogroup).unwrap();
+        }
+        let (root_vm, owner_vm, owner_again) = (
+            vm_id_in_bucket("vm-root", "a"),
+            vm_id_in_bucket("vm-owner", "a"),
+            vm_id_in_bucket("vm-again", "a"),
+        );
+
+        if !root_first {
+            as_owner(&data, &run, &owner_vm);
+        }
+        // Root's VM stays up while the owner starts and stops one in the same bucket.
+        let state_dir = bound_launch(&data, &run, &root_vm, false).await;
+        let place = if on_store {
+            data.join("runtime")
+        } else {
+            base.clone()
+        };
+        assert!(
+            state_dir.starts_with(&place),
+            "{name}: the states are in {}, not under {}",
+            state_dir.display(),
+            place.display()
+        );
+        assert_eq!(
+            fcvm::runtime_dir::bound_to(&data).unwrap().as_deref(),
+            state_dir.parent(),
+            "{name}: what a tool is told about this data directory"
+        );
+        as_owner(&data, &run, &owner_again);
+        StateManager::new(state_dir.clone())
+            .delete_state(&root_vm)
+            .await
+            .unwrap();
+        as_owner(&data, &run, &owner_vm);
+
+        // Nothing root made on the way to the states stayed root's directory.
+        use std::os::unix::fs::MetadataExt;
+        let mut dirs = vec![place];
+        while let Some(dir) = dirs.pop() {
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().uid(),
+                65534,
+                "{name}: {} is not the store owner's",
+                dir.display()
+            );
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                if entry.file_type().unwrap().is_dir() {
+                    dirs.push(entry.path());
+                }
+            }
+        }
+    }
+}
+
+/// What `sudo fcvm setup` installs for a store's owner: the base under `/run`, the
+/// owner's and closed to everyone else, and the tmpfiles.d rule that makes it the same at
+/// every boot. With it the owner's first start of a boot goes under the base with no root
+/// step, which is what `owner-first-with-a-base` above starts from.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn setup_makes_the_owners_base_and_the_rule_that_makes_it_at_boot() {
+    use fcvm::runtime_dir::{install_base, locate, Host, Place};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let top = TempDir::new().unwrap();
+    let (data, run, rules) = (
+        top.path().join("data"),
+        top.path().join("run"),
+        top.path().join("tmpfiles.d"),
+    );
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&run).unwrap();
+    nix::unistd::chown(
+        &data,
+        Some(nix::unistd::Uid::from_raw(65534)),
+        Some(nix::unistd::Gid::from_raw(65533)),
+    )
+    .unwrap();
+    let host = Host::current().unwrap();
+    // Under a umask that would close the rule to systemd-tmpfiles' reader.
+    let old = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+    let installed = install_base(&data, &run, &rules, &host);
+    nix::sys::stat::umask(old);
+    let (base, rule) = installed.unwrap();
+
+    assert_eq!(base, run.join("fcvm-65534"));
+    let made = std::fs::metadata(&base).unwrap();
+    assert_eq!(
+        (made.uid(), made.gid(), made.permissions().mode() & 0o7777),
+        (65534, 65533, 0o700)
+    );
+    assert_eq!(rule, rules.join("fcvm-65534.conf"));
+    let text = std::fs::read_to_string(&rule).unwrap();
+    assert_eq!(
+        text.lines().last(),
+        Some(format!("d {} 0700 65534 65533 -", base.display()).as_str()),
+        "{text}"
+    );
+    assert!(text
+        .lines()
+        .all(|line| line.starts_with('#') || line.starts_with("d ")));
+    assert_eq!(
+        std::fs::metadata(&rule).unwrap().permissions().mode() & 0o7777,
+        0o644
+    );
+    // Installing again changes nothing.
+    assert_eq!(
+        install_base(&data, &run, &rules, &host).unwrap(),
+        (base, rule)
+    );
+
+    // The owner, with no root step from here on, is given the tmpfs.
+    let owner = Host {
+        euid: 65534,
+        ..host
+    };
+    assert_eq!(locate(None, None, &data, &run, &owner).place, Place::Run);
 }

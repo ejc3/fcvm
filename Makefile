@@ -23,7 +23,7 @@ CARGO_BIN ?= cargo
 # exclusively before pruning idle artifacts, so age-check -> delete cannot race
 # a build.  `override` prevents `make CARGO=cargo ...` from silently bypassing
 # the safety protocol; CARGO_BIN remains available for toolchain selection.
-override CARGO = "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN) $(CARGO_LOCAL_CONFIG)
+override CARGO = "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN) $(CARGO_LOCAL_CONFIG) $(CARGO_CI_CONFIG)
 
 # Custom dependencies bin directory
 CUSTOM_DEPS_BIN := /mnt/fcvm-btrfs/deps/bin
@@ -47,6 +47,17 @@ test-runner-acceptance:
 .PHONY: test-ci-scope
 test-ci-scope:
 	python3 scripts/test-ci-stack-scope.py
+
+# scripts/ci-pool/ci_pool.py (pooled CI, docs/ci-pool.md) against a fake gh and temporary
+# git repositories. Needs git, jq and Python 3.9 or later; no network.
+.PHONY: test-ci-pool
+test-ci-pool:
+	python3 scripts/test-ci-pool.py
+
+# scripts/vmm-artifacts.py (vmm.yml's publisher and digest recorder) against fixtures. No network.
+.PHONY: test-vmm-artifacts
+test-vmm-artifacts:
+	python3 scripts/test-vmm-artifacts.py
 
 # scripts/check-runner-kernel.py against fixture repositories. Needs git 2.29 and Python 3.11.4
 # (tomllib, tarfile's extraction filter, fetch --no-write-fetch-head) or later.
@@ -73,6 +84,16 @@ CONTAINER_ARCH ?= $(shell uname -m)
 # Per-mode data directories (prevents UID conflicts between test modes)
 ROOT_DATA_DIR := /mnt/fcvm-btrfs/root
 CONTAINER_DATA_DIR := /mnt/fcvm-btrfs/container
+# Where fcvm inside the test container keeps its VM states (FCVM_RUNTIME_DIR). The
+# container's fcvm is root with a /run of its own, made new for every run, so by default
+# its states would go there, and the data directory, which outlives the run, records where
+# its states are: the next run in the same boot would be refused a data directory whose
+# runtime directory it cannot see. So the container is given a base on the store, the same
+# in every run. It is short because the namespace pool binds each slot's pasta control
+# socket at <base>/<key>/boot-<boot>/netpool/<user>/slots/<n>/pasta.ctl, which must fit
+# sockaddr_un's 107 bytes: under $(CONTAINER_DATA_DIR)/runtime-dirs it was 114 and every
+# pool test timed out (the pool now refuses such a base at start).
+CONTAINER_RUNTIME_DIR := /mnt/fcvm-btrfs/crt
 
 # Test options: FILTER=pattern STREAM=1 LIST=1 IGNORED=1
 FILTER ?=
@@ -101,12 +122,14 @@ endif
 # Nested tests are the arm64 long pole and do NOT parallelize — they degrade ~3.7x under
 # mutual contention (measured before #770 dropped the dsb(sy) patch; see the
 # [test-groups.nested-tests] comment in .config/nextest.toml), so concurrency can't shrink
-# them. Instead CI runs four that cover the distinct nested risks and skips the rest
+# them. Instead CI runs five that cover the distinct nested risks and skips the rest
 # (which still run locally with a normal `make test-root`):
 #   - test_nested_run_fcvm_inside_vm  : nesting works at all + /dev/kvm usable in the guest
 #   - test_nested_l2_with_large_files : FUSE-over-FUSE data integrity at unbounded max_write
 #   - test_nested_l2_nfs              : the NFS-share data path under nesting
 #   - test_vsock_integrity_nested     : 2.5 GB of L2 vsock traffic checked byte for byte (arm64)
+#   - test_nested_l2_user_space_reads_the_kernels_counter : L1's and L2's EL0 counter against
+#                                       the kernel's, 17 to 110 s (arm64; #2249)
 # Skipped in CI (still run locally): test_nested_l2_fuse (FUSE path is covered by large_files),
 # test_nested_l2_network_fuse / _network_nfs (iperf throughput — the slowest AND flakiest under
 # any contention), test_utimensat_pjdfstest_nested_kernel, the three L3 tests (627 to 810 s
@@ -119,8 +142,8 @@ endif
 CI ?=
 ifndef FILTER
 ifeq ($(CI),true)
-# Base test-root CI filter: the nested subset (exclude all nested except the 3 kept).
-CI_ROOT_BASE := (not (package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))) | test(=test_nested_run_fcvm_inside_vm) | test(=test_nested_l2_with_large_files) | test(=test_nested_l2_nfs) | test(=test_vsock_integrity_nested))
+# Base test-root CI filter: the nested subset (exclude all nested except the five kept).
+CI_ROOT_BASE := (not (package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))) | test(=test_nested_run_fcvm_inside_vm) | test(=test_nested_l2_with_large_files) | test(=test_nested_l2_nfs) | test(=test_vsock_integrity_nested) | test(=test_nested_l2_user_space_reads_the_kernels_counter))
 ifeq ($(FCVM_NO_SNAPSHOT),)
 # SnapshotEnabled mode (FCVM_NO_SNAPSHOT unset): ALSO drop test_nested_l2_with_large_files.
 # It guards FUSE-over-FUSE DATA INTEGRITY (the corruption the dropped #630 DSB patches once
@@ -180,6 +203,11 @@ MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # Use one absolute path for Cargo, provenance, and the container bind mount.
 FUSE_BACKEND_RS_OVERRIDE_PATH := $(if $(strip $(FUSE_BACKEND_RS_OVERRIDE)),$(shell realpath -m -- "$(FUSE_BACKEND_RS_OVERRIDE)"))
 CARGO_LOCAL_CONFIG = $(if $(FUSE_BACKEND_RS_OVERRIDE_PATH),--config 'patch."https://github.com/ejc3/fuse-backend-rs.git".fuse-backend-rs.path="$(FUSE_BACKEND_RS_OVERRIDE_PATH)"')
+# CI's build profile for this workspace (ci.yml sets FCVM_CI_PROFILE=light): codegen-units=16 and
+# no LTO, given to this workspace's cargo commands only. Environment overrides
+# (CARGO_PROFILE_RELEASE_*) would also reach the Firecracker and Cloud Hypervisor builds that
+# `fcvm setup` runs, which keep their own profiles. Unset, cargo builds the shipped profile.
+CARGO_CI_CONFIG = $(if $(filter light,$(FCVM_CI_PROFILE)),--config profile.release.codegen-units=16 --config 'profile.release.lto="off"')
 # cargo-deny 0.18.9 cannot consume Cargo's CLI patch configuration.
 ifneq ($(FUSE_BACKEND_RS_OVERRIDE_PATH),)
 ifneq ($(filter lint,$(MAKECMDGOALS)),)
@@ -192,7 +220,7 @@ endif
 # (a prerequisite of every build/test target).
 export CARGO_TARGET_DIR := target
 # Cargo does not forward global --config to external subcommands.
-NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) $(CARGO_LOCAL_CONFIG) --release
+NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) $(CARGO_LOCAL_CONFIG) $(CARGO_CI_CONFIG) --release
 TEST_CONFIG_WRAPPER := ./scripts/with-test-config.sh
 # sudo resets the environment, so a caller's FCVM_CONFIG_DIR has to be passed
 # through explicitly; without it `fcvm setup` under sudo regenerates and reads
@@ -260,6 +288,8 @@ TEST_LOG_DIR := /tmp/fcvm-test-logs
 # as arguments instead would need FILTER's own quotes (-E 'test(...)') quoted again.
 # Without this, `make container-test-unit FILTER=x` ran every test.
 CONTAINER_TEST_OPTIONS := -e FILTER -e STREAM -e LIST -e IGNORED
+# CI's build profile (CARGO_CI_CONFIG); unset outside CI, so the container builds the shipped one.
+CONTAINER_TEST_OPTIONS += -e FCVM_CI_PROFILE
 
 # Container run command (base)
 # Note: Use -v instead of --device for /dev/kvm to preserve group permissions in rootless mode
@@ -278,7 +308,7 @@ CONTAINER_RUN_BASE := "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" \
 	--ulimit nofile=65536:65536 --ulimit nproc=-1:-1 \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT) \
-	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR) $(CONTAINER_TEST_OPTIONS)
+	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR) -e FCVM_RUNTIME_DIR=$(CONTAINER_RUNTIME_DIR) $(CONTAINER_TEST_OPTIONS)
 
 # Container run with high process limits (for parallel test suites)
 CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=65536
@@ -411,12 +441,7 @@ help:
 	@echo "  bench-start-rate-churn                The start rate held with ALIVE clones up, each for LIFETIME, in a namespace pool (PREP=, OUT=, ALIVE=, LIFETIME=, CONCURRENCY=, DURATION=)"
 	@echo "  bench-start-pieces[-build]            One piece of a clone start, N times at C (PIECE=, OUT=, COUNT=, CONCURRENCY=, ALIVE=)"
 	@echo ""
-	@echo "CI merge train (pooled CI for a batch of PRs, see docs/ci-train.md):"
-	@echo "  train-create PRS=\"689 690\"  Build the ci-train branch from a batch of PRs"
-	@echo "  train-dispatch     Push the train and dispatch ONE full CI matrix for the batch"
-	@echo "  train-status       Show the train run's state"
-	@echo "  train-land         After a green run, merge every batch PR in order"
-	@echo "  train-bisect       Split a red train into two half-trains (recurse with TRAIN=ci-train-a)"
+	@echo "Pooled CI (docs/ci-pool.md): python3 scripts/ci-pool/ci_pool.py build|publish|flush|status|bisect|land|cost|failures"
 	@echo ""
 	@echo "Other:"
 	@echo "  lint               Run linting (auto-installs tools if needed)"
@@ -511,8 +536,12 @@ check-disk: cargo-target-link
 # Clean leftover test data (VM disks, snapshots, state files)
 # Preserves cached assets (kernels, rootfs, initrd, image-cache)
 # CRITICAL: Uses fcvm's proper cleanup commands to handle btrfs CoW correctly
+# CLEAN_PRUNE=0 skips `fcvm snapshots prune` and therefore the build it needs; the rm lines
+# below remove the same directories. The Container job uses it: it builds fcvm only inside
+# the container. cargo-target-link stays: TARGET_LEASE_SHELL refuses to run without target/.
+CLEAN_PRUNE ?= 1
 clean-test-data: private SHELL := $(TARGET_LEASE_SHELL)
-clean-test-data: build
+clean-test-data: cargo-target-link $(if $(filter 1,$(CLEAN_PRUNE)),build)
 	@echo "==> Killing stale VM processes from previous runs..."
 	@sudo pkill -9 firecracker 2>/dev/null; sudo pkill -9 pasta 2>/dev/null; sudo kill -9 $$(pgrep -x sleep -P 1) 2>/dev/null; sleep 1; true
 	@echo "==> Cleaning stale network namespaces..."
@@ -525,10 +554,10 @@ clean-test-data: build
 	@mount | grep fuse | grep -E '/tmp|/var/tmp' | cut -d' ' -f3 | xargs -r -I{} fusermount3 -u -z {} 2>/dev/null || true
 	@echo "==> Cleaning snapshots via fcvm (handles btrfs CoW properly)..."
 	@# Use fcvm's snapshot prune for proper cleanup - handles reflinks correctly
-	sudo ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
+	[ "$(CLEAN_PRUNE)" != 1 ] || sudo ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
 	@# Also clean per-mode directories
-	sudo FCVM_DATA_DIR=$(ROOT_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
-	sudo FCVM_DATA_DIR=$(CONTAINER_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
+	[ "$(CLEAN_PRUNE)" != 1 ] || sudo FCVM_DATA_DIR=$(ROOT_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
+	[ "$(CLEAN_PRUNE)" != 1 ] || sudo FCVM_DATA_DIR=$(CONTAINER_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
 	@# Fallback: remove any snapshots that prune couldn't parse (stale/incompatible configs)
 	sudo rm -rf /mnt/fcvm-btrfs/snapshots/*
 	sudo rm -rf $(ROOT_DATA_DIR)/snapshots/* $(CONTAINER_DATA_DIR)/snapshots/*
@@ -536,9 +565,17 @@ clean-test-data: build
 	sudo rm -rf /mnt/fcvm-btrfs/vm-disks/*
 	sudo rm -rf $(ROOT_DATA_DIR)/vm-disks/* $(CONTAINER_DATA_DIR)/vm-disks/*
 	@echo "==> Cleaning state files..."
-	sudo rm -rf /mnt/fcvm-btrfs/state/vms /mnt/fcvm-btrfs/state/names /mnt/fcvm-btrfs/state/pids /mnt/fcvm-btrfs/state/*.lock
-	sudo rm -rf $(ROOT_DATA_DIR)/state/vms $(ROOT_DATA_DIR)/state/names $(ROOT_DATA_DIR)/state/pids $(ROOT_DATA_DIR)/state/*.lock
-	sudo rm -rf $(CONTAINER_DATA_DIR)/state/vms $(CONTAINER_DATA_DIR)/state/names $(CONTAINER_DATA_DIR)/state/pids $(CONTAINER_DATA_DIR)/state/*.lock
+	@# The VMs were killed above, so their states (in the runtime directories) and each
+	@# data directory's record of its runtime directory go together: the next fcvm binds
+	@# a new one. What an older layout kept in the data directory goes too.
+	@# A runtime directory is /run/fcvm-<uid>/<key> or <data_dir>/runtime, the key being
+	@# 16 hex digits of the SHA-256 of the data directory's canonical path
+	@# (src/runtime_dir.rs).
+	for d in /mnt/fcvm-btrfs $(ROOT_DATA_DIR) $(CONTAINER_DATA_DIR); do \
+		key=$$(printf %s "$$(realpath -m $$d)" | sha256sum | cut -c1-16); \
+		sudo rm -rf /run/fcvm-*/$$key $$d/runtime $(CONTAINER_RUNTIME_DIR) \
+			$$d/state/runtime $$d/state/vms $$d/state/names $$d/state/pids $$d/state/*.json* $$d/state/sweep.*; \
+	done
 	@echo "==> Removing root owner records that root does not own..."
 	@# A reclaim/0 owned by another uid was written by a rootless container's root (host uid
 	@# 1000), and every root fcvm on this host refuses it. Root's own records stay for reclaim.
@@ -1766,15 +1803,19 @@ bench-protocol: build
 bench-quick: BENCH_ARGS := --sample-size 10 --warm-up-time 1 --measurement-time 3
 bench-quick: bench
 
-# VM benchmarks (exec, clone) - require KVM, Firecracker, setup
+# VM benchmarks (exec, clone) - require KVM, Firecracker, setup. Each benchmark runs once
+# (criterion's --test). They are built as `cargo test --release` with test-root's features
+# and package set, not with `cargo bench`: the bench profile is a separate profile, so
+# `cargo bench` rebuilt the workspace crates after test-root had built them (7.6 to 7.9
+# min in the SnapshotEnabled lanes, run 45935858819). This way only the two bench
+# binaries are compiled.
+BENCH_VM_CARGO = CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
+	$(CARGO) test --release --features privileged-tests
 bench-vm: build setup-default
 	@echo "==> Running VM benchmarks..."
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	$(CARGO) bench --bench exec -- --test
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	$(CARGO) bench --bench clone -- --test
+	$(BENCH_VM_CARGO) --bench exec -- --test
+	$(BENCH_VM_CARGO) --bench clone -- --test
 
 # Hugepages benchmark: compare clone speed with 4KB vs 2MB pages
 # Full mode: 32GB VM, 16GB dirty memory (~20 min)
@@ -1921,36 +1962,6 @@ update-dependency: cargo-target-link
 .PHONY: dependency-metadata
 dependency-metadata: cargo-target-link
 	@$(CARGO) metadata --format-version 1 $(METADATA_FLAGS)
-
-# CI merge train - pooled CI for a batch of independent low-risk PRs.
-# One full CI matrix validates the whole batch instead of one per PR.
-# Protocol, cost math, and when (not) to pool: docs/ci-train.md
-# TRAIN selects the branch (default ci-train; bisect halves are ci-train-a/-b).
-TRAIN ?= ci-train
-
-.PHONY: train-create train-dispatch train-status train-land train-bisect
-train-create:
-	@if [ -n "$(CONTINUE)" ]; then \
-		./scripts/ci-train.sh --branch $(TRAIN) create --continue; \
-	elif [ -n "$(PRS)" ]; then \
-		./scripts/ci-train.sh --branch $(TRAIN) create $(PRS); \
-	else \
-		echo 'ERROR: PRS required (e.g., make train-create PRS="689 690"),'; \
-		echo '       or CONTINUE=1 to resume after a manual conflict resolution'; \
-		exit 1; \
-	fi
-
-train-dispatch:
-	./scripts/ci-train.sh --branch $(TRAIN) dispatch
-
-train-status:
-	./scripts/ci-train.sh --branch $(TRAIN) status
-
-train-land:
-	./scripts/ci-train.sh --branch $(TRAIN) land
-
-train-bisect:
-	./scripts/ci-train.sh --branch $(TRAIN) bisect
 
 fmt: cargo-target-link
 	$(CARGO) fmt

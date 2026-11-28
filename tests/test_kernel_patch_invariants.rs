@@ -425,6 +425,33 @@ fn run_s2_tracking_harness(port: &S2Port) -> Vec<String> {
 /// git starts `gc --auto` in the background after the commit. `validate` then
 /// removes its work directory while that gc still writes into `.git`, and the
 /// removal fails with "Directory not empty", failing every validate run.
+/// `arm64.nv2` must tell a nested guest it has NV2 and nothing more.
+///
+/// ID_AA64MMFR4_EL1.NV_frac is 0 NV_NV2, 1 NV2_ONLY, 2 NV2P1, 3 NV3
+/// (arch/arm64/tools/sysreg, Linux 7.3.3). The alias set 2 until 2026-11-28, so every
+/// nested guest believed in FEAT_NV2p1 on hardware without it, and in L2 the kernel and
+/// user space then read counters 9 to 73 s apart
+/// (`test_nested_l2_user_space_reads_the_kernels_counter` is the runtime side).
+#[test]
+fn the_nv2_boot_parameter_claims_nv2_only() {
+    let patch = include_str!("../kernel/patches-arm64/mmfr4-override.vm.patch");
+    let aliases: Vec<&str> = patch
+        .lines()
+        .filter(|line| line.starts_with('+') && line.contains("\"arm64.nv2\""))
+        .collect();
+    assert_eq!(
+        aliases.len(),
+        1,
+        "the patch adds the arm64.nv2 alias once: {aliases:?}"
+    );
+    assert!(
+        aliases[0].contains("\"id_aa64mmfr4.nv_frac=1\""),
+        "arm64.nv2 must set ID_AA64MMFR4_EL1.NV_frac to 1 (NV2_ONLY); 2 is NV2P1 and 3 is NV3, \
+         features the CPUs fcvm runs on do not have: {}",
+        aliases[0]
+    );
+}
+
 #[test]
 fn the_kernel_source_repository_runs_no_background_gc() {
     let script = fs::read_to_string(

@@ -1629,7 +1629,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     crate::storage::validate_new_snapshot_name(&snapshot_name)?;
 
     // Connect to running VM
-    let socket_path = paths::vm_runtime_dir(&vm_state.vm_id).join("firecracker.sock");
+    let socket_path = vm_state.vm_runtime_dir().join("firecracker.sock");
 
     // Check if socket exists
     if !socket_path.exists() {
@@ -1640,7 +1640,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     }
 
     // Check VM disk exists
-    let vm_disk_path = paths::vm_runtime_dir(&vm_state.vm_id).join("disks/rootfs.raw");
+    let vm_disk_path = vm_state.vm_runtime_dir().join("disks/rootfs.raw");
     if !vm_disk_path.exists() {
         anyhow::bail!("VM disk not found at {}", vm_disk_path.display());
     }
@@ -1702,7 +1702,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     // exclusive through its atomic replacement, and a distinct diff parent is held shared
     // through the base copy/merge. Both locks are acquired in canonical path order so two
     // creates with inverse target/parent relationships cannot deadlock.
-    tokio::fs::create_dir_all(paths::snapshot_dir())
+    crate::paths::ensure_dir_async(paths::snapshot_dir())
         .await
         .context("creating snapshot directory")?;
     let mut expected_parent_name = vm_state.config.snapshot_name.clone();
@@ -2213,7 +2213,8 @@ fn ensure_gpu_snapshot_mode(gpus: &[String], disk_only: bool, gpu_warm: bool) ->
 /// map: the guest mounted every mapping when it booted, the restore keeps those mounts, and
 /// a clone cannot add or drop one. The vsock port stays the snapshot's. A volume's inode
 /// table names files by their path under the mount, so the guest's open files are found
-/// again in the new directory when it holds the same tree.
+/// again in the new directory when it holds the same tree; a restore refuses a directory
+/// that lacks one (`moved_volumes_missing_paths`).
 fn clone_volumes(
     snapshot: &[crate::storage::snapshot::SnapshotVolumeConfig],
     requested: &[String],
@@ -2258,6 +2259,47 @@ fn clone_volumes(
         volume.host_path = mapping.host_path;
     }
     Ok(volumes)
+}
+
+/// The files a moved read-only volume's guest holds that its new host directory lacks, as
+/// (guest path, path under the mount). `requested` are `--map HOST:GUEST:ro` specs that
+/// `clone_volumes` accepted; `snap_dir` holds the snapshot's inode tables
+/// (`volume::inode_table_file_name`). A restore looks each table path up in the directory it
+/// serves, and one it cannot find leaves an inode the guest holds answering EIO.
+pub(crate) fn moved_volumes_missing_paths(
+    snapshot: &[crate::storage::snapshot::SnapshotVolumeConfig],
+    requested: &[String],
+    snap_dir: &Path,
+) -> Vec<(String, String)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut missing = Vec::new();
+    for spec in requested {
+        let Ok(mapping) = super::podman::VolumeMapping::parse(spec) else {
+            continue;
+        };
+        let Some(volume) = snapshot.iter().find(|v| v.guest_path == mapping.guest_path) else {
+            continue;
+        };
+        // Served from the directory the snapshot recorded, the volume is not moved.
+        if volume.host_path == mapping.host_path {
+            continue;
+        }
+        let table = snap_dir.join(crate::volume::inode_table_file_name(volume.vsock_port));
+        // Without a table the guest's inodes answer an error in any clone, moved or not.
+        let Ok(json) = std::fs::read_to_string(&table) else {
+            continue;
+        };
+        for path in fuse_pipe::inode_table_paths(&json) {
+            let on_host = mapping.host_path.join(std::ffi::OsStr::from_bytes(&path));
+            if std::fs::symlink_metadata(&on_host).is_err() {
+                missing.push((
+                    volume.guest_path.clone(),
+                    String::from_utf8_lossy(&path).into_owned(),
+                ));
+            }
+        }
+    }
+    missing
 }
 
 /// A warm GPU snapshot's CUDA processes wait, checkpointed, for as many GPUs as the
@@ -2398,7 +2440,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     // serving the memory inode it opened at startup; allowing the tag to be
     // deleted/recreated underneath it would make its public snapshot name point
     // at a different disk/memory generation than the bytes it actually serves.
-    tokio::fs::create_dir_all(paths::snapshot_dir())
+    crate::paths::ensure_dir_async(paths::snapshot_dir())
         .await
         .context("creating snapshot directory")?;
     let _snapshot_generation_lock = super::common::acquire_snapshot_dir_lock(
@@ -3139,7 +3181,7 @@ async fn cmd_snapshot_run_inner(
     // while atomically replacing the directory, so a concurrent re-create of this tag
     // can never swap generations under us mid-restore (mixed disk/memory) or remove
     // the directory between our reads.
-    tokio::fs::create_dir_all(paths::snapshot_dir())
+    crate::paths::ensure_dir_async(paths::snapshot_dir())
         .await
         .context("creating snapshot directory")?;
     let snapshot_shared_lock = super::common::acquire_snapshot_dir_lock(
@@ -3178,7 +3220,25 @@ async fn cmd_snapshot_run_inner(
             &snapshot_name,
         )?;
     }
-    snapshot_config.metadata.volumes = clone_volumes(&snapshot_config.metadata.volumes, &args.map)?;
+    let recorded_volumes = snapshot_config.metadata.volumes.clone();
+    snapshot_config.metadata.volumes = clone_volumes(&recorded_volumes, &args.map)?;
+    // A moved directory must hold every file the snapshot's guest holds in that volume: a
+    // restore answers EIO for one it cannot find (#2239).
+    if let Some(generation) = snapshot_config.memory_path.parent() {
+        let missing = moved_volumes_missing_paths(&recorded_volumes, &args.map, generation);
+        if !missing.is_empty() {
+            let named: Vec<String> = missing
+                .iter()
+                .map(|(volume, path)| format!("{volume}/{path}"))
+                .collect();
+            bail!(
+                "--map: the snapshot's guest holds {}, which the directory given for {} lacks. \
+                 A moved read-only map must hold every file the guest held at the snapshot",
+                named.join(", "),
+                missing[0].0
+            );
+        }
+    }
 
     // Where this clone publishes its ports, settled before anything is allocated: a
     // --publish the snapshot cannot serve fails here with nothing to clean up.
@@ -3271,6 +3331,7 @@ async fn cmd_snapshot_run_inner(
         firecracker_args: runtime_config.effective_firecracker_args().as_deref(),
         unsupported: None,
         kernel_profile: snapshot_config.metadata.kernel_profile.as_deref(),
+        passthrough_devices: args.gpu.len(),
     })?;
     crate::commands::common::require_confined_filter(&decision, &runtime_config)?;
 
@@ -3282,8 +3343,8 @@ async fn cmd_snapshot_run_inner(
     //
     // What VMs of processes killed without teardown left on the host goes first. The
     // clone's data directory is recorded before anything creates it, so a SIGKILLed
-    // clone leaves it to the next launch to reclaim (crate::reclaim).
-    crate::reclaim::reclaim_abandoned().await;
+    // clone leaves it to the next sweep to reclaim (crate::reclaim).
+    crate::reclaim::reclaim_abandoned_if_due().await;
     let vm_id = generate_vm_id();
     let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
@@ -3524,14 +3585,37 @@ async fn cmd_snapshot_run_inner(
         };
     }
 
+    // A clone that publishes ports on a loopback address of its own leases the address
+    // before its first state is written, so that state carries it: the published port
+    // listens before the restore writes the state again (`restore.post_network_pre_resume`
+    // holds there), and whoever lists the clone in between must find where it listens.
+    let leases_loopback_ip = match snapshot_config.metadata.network_mode {
+        FcNetworkMode::Rootless => true,
+        FcNetworkMode::Routed => RoutedNetwork::mappings_need_loopback_ip(&port_mappings),
+        FcNetworkMode::Bridged => false,
+    };
+    let loopback_lease = if leases_loopback_ip {
+        Some(setup_try!(state_manager
+            .lease_loopback_ip_for_claim(&mut vm_state)
+            .context("allocating loopback IP")))
+    } else {
+        None
+    };
+
     // The clone's first state is written here, under its name, and refused when a
-    // live VM already has that name.
+    // live VM already has that name. It records the clone's runtime directory from the
+    // start: the memory server writes why it refused or killed this clone's VMM there.
+    vm_state.config.vm_runtime_dir = Some(data_dir.clone());
     setup_try!(state_manager
         .claim_name(&mut vm_state)
         .await
         .context("claiming the VM name"));
+    // The state holds the address now, and gives it back when it is deleted.
+    if let Some(lease) = loopback_lease {
+        lease.keep();
+    }
 
-    setup_try!(tokio::fs::create_dir_all(&data_dir)
+    setup_try!(paths::create_vm_runtime_dir(&vm_id)
         .await
         .context("creating VM data directory"));
 
@@ -3805,21 +3889,20 @@ async fn cmd_snapshot_run_inner(
                 .preflight_check()
                 .context("routed mode preflight check failed"));
             if net.needs_loopback_ip() {
-                let loopback_ip = setup_try!(state_manager
-                    .allocate_loopback_ip(&mut vm_state)
-                    .await
-                    .context("allocating loopback IP for routed clone"));
+                let loopback_ip = setup_try!(vm_state.config.network.loopback_ip.clone().context(
+                    "a routed clone with a port on its loopback address has no address \
+                     leased before its name claim"
+                ));
                 net = net.with_loopback_ip(loopback_ip);
             }
             Box::new(net)
         }
         FcNetworkMode::Rootless => {
-            // For rootless mode, allocate loopback IP atomically with state persistence
-            // This prevents race conditions when starting multiple clones concurrently
-            let loopback_ip = setup_try!(state_manager
-                .allocate_loopback_ip(&mut vm_state)
-                .await
-                .context("allocating loopback IP"));
+            // Leased before the name claim, whose state write carries it.
+            let loopback_ip =
+                setup_try!(vm_state.config.network.loopback_ip.clone().context(
+                    "a rootless clone has no loopback address leased before its name claim"
+                ));
 
             // With bridge mode, guest IP is always 10.0.2.100 on pasta network
             // Each clone runs in its own namespace, so no IP conflict.
@@ -4253,6 +4336,7 @@ async fn cmd_snapshot_run_inner(
         hugepages,
         extra_disks: snapshot_config.metadata.extra_disks.clone(),
         snapshot_dir: Some(snapshot_dir),
+        cloud_hypervisor_version: snapshot_config.metadata.cloud_hypervisor_version.clone(),
     };
 
     // Run clone setup using shared restore function
@@ -6155,7 +6239,7 @@ async fn clone_vsock_base(vsock_dir: Option<&str>, data_dir: &Path) -> Result<Pa
     let parent = socket_path
         .parent()
         .expect("a custom vsock socket path always has a parent");
-    tokio::fs::create_dir_all(parent)
+    crate::paths::ensure_dir_async(parent)
         .await
         .with_context(|| format!("creating vsock dir: {:?}", parent))?;
     // A caller-owned directory can hold a stale socket from a previous
@@ -6284,6 +6368,7 @@ async fn cmd_snapshot_run_raw(
         firecracker_args: args.firecracker_args.as_deref(),
         unsupported: Some("clones of raw VM snapshots do not support confinement yet"),
         kernel_profile: None,
+        passthrough_devices: args.gpu.len(),
     })?;
     anyhow::ensure!(
         port_mappings.is_empty(),
@@ -6297,7 +6382,7 @@ async fn cmd_snapshot_run_raw(
         "restoring a raw VM"
     );
 
-    crate::reclaim::reclaim_abandoned().await;
+    crate::reclaim::reclaim_abandoned_if_due().await;
     let vm_id = generate_vm_id();
     let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
@@ -6336,15 +6421,17 @@ async fn cmd_snapshot_run_raw(
     let ch_bin = super::common::find_cloud_hypervisor()?;
 
     let data_dir = paths::vm_runtime_dir(&vm_id);
+    vm_state.config.vm_runtime_dir = Some(data_dir.clone());
     vm_state.config.rdp_socket = Some(super::vm::rdp_socket_path(&data_dir));
     if let Err(e) = async {
         state_manager
             .claim_name(&mut vm_state)
             .await
             .context("claiming the VM name")?;
-        tokio::fs::create_dir_all(&data_dir)
+        paths::create_vm_runtime_dir(&vm_id)
             .await
             .context("creating VM data directory")
+            .map(|_| ())
     }
     .await
     {
@@ -6400,6 +6487,7 @@ async fn cmd_snapshot_run_raw(
         hugepages: false,
         extra_disks: meta.extra_disks.clone(),
         snapshot_dir: Some(paths::snapshot_dir().join(&snapshot_name)),
+        cloud_hypervisor_version: meta.cloud_hypervisor_version.clone(),
     };
     // The clone's first boot is generation 0 of its own id, served from before it resumes.
     if let Err(e) = super::vm::write_generation(&data_dir, &vm_id, 0) {
@@ -7793,6 +7881,7 @@ mod tests {
             image_disk_identity: None,
             hypervisor: Default::default(),
             firecracker_bin: None,
+            cloud_hypervisor_version: None,
             balloon_mib: None,
             balloon_free_page_reporting: false,
             page_reporting_order: None,
@@ -8084,6 +8173,71 @@ mod tests {
             vsock_port: port,
             portable: true,
         }
+    }
+
+    /// A moved read-only volume whose new directory lacks a file the snapshot's guest holds
+    /// (a path in the volume's inode table) is found before anything starts: a restore
+    /// would serve EIO for that inode. A volume that is not moved, or a directory that holds
+    /// the whole tree, finds nothing (#2239).
+    #[test]
+    fn a_moved_volume_whose_directory_lacks_a_held_path_is_found() {
+        let snap = tempfile::tempdir().unwrap();
+        let recorded = tempfile::tempdir().unwrap();
+        let here = tempfile::tempdir().unwrap();
+        std::fs::write(
+            snap.path().join(crate::volume::inode_table_file_name(5000)),
+            r#"{"handle_base":3,"paths":{"1":"","77":"sub/held","78":"kept"},"gone":{"79":"old"}}"#,
+        )
+        .unwrap();
+        std::fs::write(here.path().join("kept"), "").unwrap();
+        let snapshot = vec![
+            volume(recorded.path(), "/var/creds", true, 5000),
+            volume(recorded.path(), "/data", false, 5001),
+        ];
+        let moved = format!("{}:/var/creds:ro", here.path().display());
+        assert_eq!(
+            moved_volumes_missing_paths(&snapshot, &requested(&[moved.as_str()]), snap.path()),
+            [("/var/creds".to_string(), "sub/held".to_string())]
+        );
+        assert!(moved_volumes_missing_paths(&snapshot, &[], snap.path()).is_empty());
+        let unmoved = format!("{}:/var/creds:ro", recorded.path().display());
+        assert!(
+            moved_volumes_missing_paths(&snapshot, &requested(&[unmoved.as_str()]), snap.path())
+                .is_empty(),
+            "a volume served from the directory the snapshot recorded is not moved"
+        );
+        std::fs::create_dir(here.path().join("sub")).unwrap();
+        std::fs::write(here.path().join("sub/held"), "").unwrap();
+        assert!(
+            moved_volumes_missing_paths(&snapshot, &requested(&[moved.as_str()]), snap.path())
+                .is_empty()
+        );
+    }
+
+    /// The two restores that move a read-only volume check its directory before they start
+    /// anything: `snapshot run --map` refuses, between choosing the volumes and choosing the
+    /// ports, and a pre-start cache hit checks before it restores, so it can boot cold
+    /// instead (#2239).
+    #[test]
+    fn moved_volumes_are_checked_before_anything_starts() {
+        let source = include_str!("snapshot.rs");
+        let body = &source[source.find("async fn cmd_snapshot_run_inner(").unwrap()..];
+        let check = body
+            .find("moved_volumes_missing_paths(")
+            .expect("snapshot run does not check a moved volume's directory");
+        assert!(body.find("clone_volumes(").unwrap() < check);
+        assert!(check < body.find("clone_port_mappings(").unwrap());
+
+        let podman = include_str!("podman/mod.rs");
+        let hit = podman
+            .find("\"Pre-start snapshot hit! Restoring from cached snapshot\"")
+            .unwrap();
+        let branch = &podman[..hit];
+        let branch = &branch[branch.rfind("if restores_pre_start(").unwrap()..];
+        assert!(
+            branch.contains("moved_volumes_missing_paths("),
+            "a pre-start hit does not check its moved volumes before it restores"
+        );
     }
 
     /// Without --map a clone serves the snapshot's host directories. With it, a requested
@@ -10418,6 +10572,32 @@ mod watchdog_exit_classification_tests {
                 "{name} repeated within 2000 clones"
             );
         }
+    }
+
+    /// A clone leases its loopback address before it claims its name, so its first state
+    /// carries the address: the restore's published port listens on it before the state
+    /// is written again, and `test_lifecycle_interleave_early_connection_cannot_poison_restored_ingress`
+    /// reads the address from the state at that point. Nothing after the claim leases one.
+    #[test]
+    fn a_clone_leases_its_loopback_address_before_its_name_claim() {
+        let source = include_str!("snapshot.rs");
+        let body = &source[source.find("async fn cmd_snapshot_run_inner(").unwrap()..];
+        let lease = body
+            .find(".lease_loopback_ip_for_claim(&mut vm_state)")
+            .expect("snapshot run leases the clone's loopback address");
+        let claim = body
+            .find(".claim_name(&mut vm_state)")
+            .expect("snapshot run claims the clone's name");
+        let kept = body.find("lease.keep();").expect("the lease is kept");
+        assert!(lease < claim && claim < kept);
+        let end = claim
+            + body[claim..]
+                .find("\nasync fn ")
+                .unwrap_or(body.len() - claim);
+        assert!(
+            !body[claim..end].contains("allocate_loopback_ip("),
+            "an address leased after the name claim is in no state until the next write"
+        );
     }
 
     /// Every error after the clone claims its name must go through `setup_try!`, which

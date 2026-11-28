@@ -317,8 +317,261 @@
                 "syscall": "getpid"
             },
             {
-                "comment": "glibc's open on x86_64 (musl uses open, which the fork's filter lists)",
+                "comment": "glibc's open on x86_64 (musl uses open, which the fork's filter lists; in the vmm class the fork's filter lists openat as well)",
                 "syscall": "openat"
+            },
+            {
+                "comment": "glibc's epoll_wait on x86_64 (musl uses epoll_pwait, which the fork's filter lists)",
+                "syscall": "epoll_wait"
+            }
+        ],
+        "filter_action": "allow"
+    },
+    "blk_worker": {
+        "default_action": "trap",
+        "filter": [
+            {
+                "comment": "Used to canonicalize VMDK descriptor paths during drive patch",
+                "syscall": "stat"
+            },
+            {
+                "comment": "Used to open VMDK descriptor directories and extents during drive patch",
+                "syscall": "openat"
+            },
+            {
+                "syscall": "epoll_ctl"
+            },
+            {
+                "comment": "SyncFileEngine seeks to the request offset before each read/write",
+                "syscall": "lseek"
+            },
+            {
+                "comment": "Locking the Arc<Mutex<ThreadedWorker>> data path",
+                "syscall": "futex"
+            },
+            {
+                "comment": "Called for expanding the heap",
+                "syscall": "brk"
+            },
+            {
+                "comment": "Used for re-allocating large memory regions, for example vectors",
+                "syscall": "mremap"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "libc::MADV_DONTNEED",
+                        "index": 2,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 4
+                    }
+                ],
+                "comment": "Triggered by musl for some customer workloads",
+                "syscall": "madvise"
+            },
+            {
+                "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication",
+                "syscall": "sched_yield"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "libc::MAP_ANONYMOUS | libc::MAP_PRIVATE",
+                        "index": 3,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 34
+                    },
+                    {
+                        "comment": "Ensure PROT_EXEC is not set",
+                        "index": 2,
+                        "op": {
+                            "masked_eq": 4
+                        },
+                        "type": "dword",
+                        "val": 0
+                    }
+                ],
+                "comment": "Allocator growth during I/O",
+                "syscall": "mmap"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "libc::MAP_SHARED",
+                        "index": 3,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1
+                    },
+                    {
+                        "comment": "Ensure PROT_EXEC is not set",
+                        "index": 2,
+                        "op": {
+                            "masked_eq": 4
+                        },
+                        "type": "dword",
+                        "val": 0
+                    }
+                ],
+                "comment": "Used for reading the timezone in LocalTime::now()",
+                "syscall": "mmap"
+            },
+            {
+                "syscall": "munmap"
+            },
+            {
+                "syscall": "sigaltstack"
+            },
+            {
+                "syscall": "rt_sigprocmask"
+            },
+            {
+                "syscall": "rt_sigreturn"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "SIGABRT",
+                        "index": 0,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 6
+                    }
+                ],
+                "comment": "rt_sigaction is used by libc::abort during a panic to install the default handler for SIGABRT",
+                "syscall": "rt_sigaction"
+            },
+            {
+                "comment": "Worker thread exit on Finish",
+                "syscall": "exit"
+            },
+            {
+                "comment": "Used by the fatal signal handlers (vmm::signal_handler::exit_with_code) to terminate the process",
+                "syscall": "exit_group"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "SIGABRT",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 6
+                    }
+                ],
+                "comment": "tkill is used by libc::abort during a panic to raise SIGABRT",
+                "syscall": "tkill"
+            },
+            {
+                "syscall": "epoll_pwait"
+            },
+            {
+                "syscall": "read"
+            },
+            {
+                "syscall": "write"
+            },
+            {
+                "syscall": "fsync"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 3
+                    }
+                ],
+                "comment": "Used by the VirtIO block device to punch holes for discard on regular backing files",
+                "syscall": "fallocate"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "BLKDISCARD",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 4727
+                    }
+                ],
+                "comment": "Used by the VirtIO block device to pass discard through to block-device backing files",
+                "syscall": "ioctl"
+            },
+            {
+                "syscall": "open"
+            },
+            {
+                "syscall": "close"
+            },
+            {
+                "comment": "Rust std uses it during panic to print the thread id.",
+                "syscall": "gettid"
+            },
+            {
+                "comment": "Used for metrics and logging, via the helpers in utils/src/time.rs. It's not called on some platforms, because of vdso optimisations.",
+                "syscall": "clock_gettime"
+            },
+            {
+                "args": [
+                    {
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 0
+                    }
+                ],
+                "comment": "Needed for rate limiting and metrics",
+                "syscall": "timerfd_settime"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "FCNTL_F_SETFD",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 2
+                    },
+                    {
+                        "comment": "FCNTL_FD_CLOEXEC",
+                        "index": 2,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1
+                    }
+                ],
+                "comment": "Used by snapshotting, drive patching and rescanning",
+                "syscall": "fcntl"
+            },
+            {
+                "comment": "Used by disk update",
+                "syscall": "fstat"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "SIGABRT",
+                        "index": 2,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 6
+                    }
+                ],
+                "comment": "glibc's raise and abort (musl uses tkill)",
+                "syscall": "tgkill"
+            },
+            {
+                "comment": "glibc's raise and pthread_kill pass its own pid to tgkill (musl's tkill takes none)",
+                "syscall": "getpid"
+            },
+            {
+                "comment": "glibc's stat and lstat on x86_64 (musl uses stat and lstat, which the fork's filter lists)",
+                "syscall": "newfstatat"
             },
             {
                 "comment": "glibc's epoll_wait on x86_64 (musl uses epoll_pwait, which the fork's filter lists)",
@@ -798,6 +1051,18 @@
             {
                 "args": [
                     {
+                        "comment": "KVM_SET_USER_MEMORY_REGION, Used by VFIO passthrough BAR relocation",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1075883590
+                    }
+                ],
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
                         "comment": "SIGABRT",
                         "index": 2,
                         "op": "eq",
@@ -813,7 +1078,7 @@
                 "syscall": "getpid"
             },
             {
-                "comment": "glibc's open on x86_64 (musl uses open, which the fork's filter lists)",
+                "comment": "glibc's open on x86_64 (musl uses open, which the fork's filter lists; in the vmm class the fork's filter lists openat as well)",
                 "syscall": "openat"
             }
         ],
@@ -823,7 +1088,7 @@
         "default_action": "trap",
         "filter": [
             {
-                "comment": "Used when creating snapshots in vmm:persist::snapshot_memory_to_file through std::fs::File::metadata",
+                "comment": "Used when creating snapshots in vmm::vstate::vm::snapshot_memory_to_path through std::fs::File::metadata",
                 "syscall": "stat"
             },
             {
@@ -840,6 +1105,9 @@
             },
             {
                 "syscall": "open"
+            },
+            {
+                "syscall": "openat"
             },
             {
                 "syscall": "read"
@@ -1042,19 +1310,6 @@
             {
                 "args": [
                     {
-                        "comment": "advice, the fourth argument of fadvise64(fd, offset, len, advice) on x86_64: POSIX_FADV_RANDOM",
-                        "index": 3,
-                        "op": "eq",
-                        "type": "dword",
-                        "val": 1
-                    }
-                ],
-                "comment": "POSIX_FADV_RANDOM on a drive's backing file when it is opened, so the host reads only what the guest asked for",
-                "syscall": "fadvise64"
-            },
-            {
-                "args": [
-                    {
                         "comment": "libc::MPOL_DEFAULT",
                         "index": 2,
                         "op": "eq",
@@ -1071,6 +1326,19 @@
                 ],
                 "comment": "Returns guest memory to the default NUMA policy when its window out of NUMA balancing ends (vstate::memory::defer_numa_balancing)",
                 "syscall": "mbind"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "advice, the fourth argument of fadvise64(fd, offset, len, advice) on x86_64: POSIX_FADV_RANDOM",
+                        "index": 3,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1
+                    }
+                ],
+                "comment": "POSIX_FADV_RANDOM on a drive's backing file when it is opened, so the host reads only what the guest asked for",
+                "syscall": "fadvise64"
             },
             {
                 "args": [
@@ -1380,6 +1648,19 @@
             {
                 "args": [
                     {
+                        "comment": "TUNGETIFF",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 2147767506
+                    }
+                ],
+                "comment": "Needed for checking an inherited tap queue during net hotplug",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
                         "comment": "TIOCGWINSZ",
                         "index": 1,
                         "op": "eq",
@@ -1526,19 +1807,6 @@
                     }
                 ],
                 "comment": "Needed for opening tap device during net hotplug",
-                "syscall": "ioctl"
-            },
-            {
-                "args": [
-                    {
-                        "comment": "TUNGETIFF",
-                        "index": 1,
-                        "op": "eq",
-                        "type": "dword",
-                        "val": 2147767506
-                    }
-                ],
-                "comment": "Needed for checking an inherited tap queue during net hotplug",
                 "syscall": "ioctl"
             },
             {
@@ -1696,10 +1964,6 @@
                 ],
                 "comment": "glibc's timed wait on a process-shared futex",
                 "syscall": "futex"
-            },
-            {
-                "comment": "glibc's open on x86_64 (musl uses open, which the fork's filter lists)",
-                "syscall": "openat"
             },
             {
                 "comment": "glibc's stat and lstat on x86_64 (musl uses stat and lstat, which the fork's filter lists)",

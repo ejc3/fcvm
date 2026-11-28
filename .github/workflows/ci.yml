@@ -11,6 +11,10 @@ on:
           - both
           - host
           - container
+      lanes:
+        description: 'Self-hosted lanes to run, by exact job name, separated by spaces or commas (empty: all)'
+        type: string
+        default: ''
   # No `branches:` filter. That filter matches the PR's BASE branch, and stacked
   # PRs (the documented default in AGENTS.md) are based on the previous PR's
   # branch, not main — so `branches: [main]` skipped every job below for exactly
@@ -132,17 +136,27 @@ jobs:
   # Next.js build, and Playwright (Chromium and WebKit) against the mock fleet,
   # which needs ffmpeg for its H.264 encoder.
   fleet-web:
-    name: Fleet Web
+    name: Fleet Web (${{ matrix.shard }})
     needs: [changes]
     if: ${{ needs.changes.outputs.web == 'true' }}
     runs-on: ubuntu-latest
+    # The browser suite is seven Playwright configs, each with its own mock fleet and page,
+    # run one after another: 23 min of the job's 26 (run 45931415934; the main config 10.7,
+    # minecraft 5.9, windows 2.4, phones 2.0, potato 0.7, mirror 0.4). Each shard runs one
+    # package.json script, and `pnpm test:e2e` is those scripts in order, so local runs and
+    # CI run the same configs (fleet_web_shards_run_every_playwright_config pins it). The
+    # lint, unit and Worker steps run in the shortest shard.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [wall, phones-windows, minecraft-potato-mirror]
     # Playwright's own image carries Chromium, WebKit and their libraries, so
     # the job installs nothing with apt: the Azure mirror stalled apt for 13 to
     # 30 minutes in four runs on 2026-10-22. Tag and digest of 1.64.0, the
     # @playwright/test version in fleet/web/package.json.
     container:
       image: mcr.microsoft.com/playwright:v1.64.0-noble@sha256:06a9939e57531807f8d5fd76ce44b53165ffb7d7501d87ab10e285c20b1e971f
-    # The suite takes about 5 minutes; anything that hangs fails instead of waiting.
+    # The longest shard takes about 12 minutes; anything that hangs fails instead of waiting.
     timeout-minutes: 30
     defaults:
       run:
@@ -211,27 +225,31 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Lint and typecheck
+        if: matrix.shard == 'phones-windows'
         run: pnpm lint && pnpm typecheck
       - name: Unit tests
+        if: matrix.shard == 'phones-windows'
         run: pnpm test
       - name: Build
         run: pnpm build
       - name: Browser tests
-        run: pnpm test:e2e
+        run: pnpm test:e2e:${{ matrix.shard }}
       # A failed browser test keeps its Playwright trace under test-results (trace:
       # "retain-on-failure"); without this it dies with the runner (#1348).
       - name: Upload Playwright traces
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fleet-web-test-results
+          name: fleet-web-test-results-${{ matrix.shard }}
           path: fleet/web/test-results
           if-no-files-found: ignore
           retention-days: 14
       # The staging deploy ships this Worker; it must serve the page, not only build.
       - name: Build the Worker
+        if: matrix.shard == 'phones-windows'
         run: pnpm cf:build
       - name: Serve the built Worker
+        if: matrix.shard == 'phones-windows'
         run: scripts/worker-smoke.sh 24110
 
   # Lints every workflow file. Lives here, not in claude-lint.yml, so `Summary`
@@ -274,6 +292,10 @@ jobs:
         run: make test-runner-acceptance
       - name: Test the pull request scope and stack coverage
         run: make test-ci-scope
+      - name: Test the pool tool
+        run: make test-ci-pool
+      - name: Test the VMM build publisher and digest recorder
+        run: make test-vmm-artifacts
       - name: Test the runner kernel check
         run: make test-runner-kernel
       - name: Test cached release downloads
@@ -428,21 +450,28 @@ jobs:
           bash fleet/phone-app/test-build-apk.sh
           bash fleet/phone-app/test-gradle-dist.sh
 
-  # Plans which self-hosted jobs this run needs.
+  # Plans which self-hosted jobs this run needs (scripts/ci-pool/ci_pool.py plan).
   #
   # A pull_request runs every arm64 job and ONE x64 job, Host-Root-x64-SnapshotEnabled.
   # It runs the privileged suite through a snapshot miss and then a restore, which is
   # where the x86-specific code lives (KVM setup, vCPU state save and restore). The other
-  # three x64 jobs run paths the arm64 jobs already cover on every PR.
+  # three x64 jobs run paths the arm64 jobs already cover on every PR. A change to the
+  # VMM's confinement adds Host-x64.
   #
-  # A push to main runs every job that has NOT already succeeded on a PR run of the same
-  # tree. A fast-forward or rebase merge keeps the PR tip's tree, so main runs exactly
-  # the x64 jobs the PR left out, and x86 still gets its full matrix before a release.
-  # If that PR run skipped the matrix altogether (its `changes` job found nothing the
-  # matrix can check), main skips it too.
+  # A push to main runs every job not already proven for its tree: a job of the same name
+  # that succeeded, on its first attempt, in a run of this workflow on a commit with the
+  # pushed commit's tree, and that never failed in any run on that commit. The commits
+  # looked at are the pushed commit's other parents and the heads of the pull requests
+  # GitHub ties to it, so the evidence is found whatever else ran since, and a lane counts
+  # even when another job of that run failed. Changes are judged against main as it was
+  # before the push. A run
+  # proves nothing when the landing changes a file that defines the lanes (this workflow,
+  # the Makefile, the scripts, the nextest configuration): a pull request runs its own
+  # copy of those. If a pull request's run of that tree skipped the matrix by its own
+  # scope, main skips it too.
   #
-  # Anything else - workflow_dispatch, the Build Kernels workflow_run, a push whose tree
-  # never passed on a PR - runs the full matrix.
+  # A workflow_dispatch runs the lanes named in its `lanes` input, all of them by default.
+  # Anything else, and every lookup that fails, runs the full matrix.
   skip-check:
     name: Skip Check
     needs: [changes]
@@ -464,103 +493,10 @@ jobs:
           EVENT: ${{ github.event_name }}
           REPO: ${{ github.repository }}
           CONFINE: ${{ needs.changes.outputs.confine }}
-        run: |
-          set -euo pipefail
-          # Names of the jobs that already passed for this tree on a PR, one per line.
-          PASSED=""
-          if [ "$EVENT" = "push" ]; then
-            TREE_SHA=$(git rev-parse 'HEAD^{tree}')
-            echo "Current tree SHA: $TREE_SHA"
-            # GitHub Actions results are check runs, not commit statuses, so the
-            # legacy status API never reports them. Look for successful runs of
-            # this CI workflow on a PR whose head commit has the same tree SHA.
-            if ! RUNS=$(gh run list --repo "$REPO" --workflow ci.yml --event pull_request \
-                --status success --limit 30 --json databaseId,headSha \
-                --jq '.[] | "\(.databaseId) \(.headSha)"'); then
-              echo "Could not list workflow runs, running the full matrix"
-              RUNS=""
-            fi
-            while read -r run sha; do
-              [ -n "$run" ] || continue
-              if ! COMMIT_TREE=$(gh api "repos/$REPO/git/commits/$sha" --jq '.tree.sha'); then
-                echo "Could not look up commit $sha, ignoring it"
-                continue
-              fi
-              [ "$COMMIT_TREE" = "$TREE_SHA" ] || continue
-              if ! NAMES=$(gh api "repos/$REPO/actions/runs/$run/jobs" --paginate \
-                  --jq '.jobs[] | select(.conclusion == "success" or .conclusion == "skipped") | .name'); then
-                echo "Could not list the jobs of run $run, ignoring it"
-                continue
-              fi
-              # Only a run that tested something counts. A draft's or a lower stack
-              # PR's run skips every job and still succeeds, under a Summary named
-              # "Summary (deferred)"; reusing it would skip the whole matrix here.
-              if ! grep -qxF Summary <<< "$NAMES"; then
-                echo "Run $run tested nothing (no passing Summary), ignoring it"
-                continue
-              fi
-              echo "Tree SHA $TREE_SHA already passed CI on PR commit $sha (run $run)"
-              PASSED="$PASSED"$'\n'"$NAMES"
-            done <<< "$RUNS"
-          fi
-          # A matrix job skipped by its `if:` is reported under its unexpanded name,
-          # with the literal matrix.arch placeholder in it. In a passing PR run that
-          # means `changes` skipped the matrix for this tree.
-          MATRIX_SKIPPED=false
-          if grep -q 'matrix\.arch' <<< "$PASSED"; then
-            MATRIX_SKIPPED=true
-          fi
-          want() {
-            case "$EVENT" in
-              pull_request)
-                case "$1" in
-                  *-arm64 | *-arm64-* | Host-Root-x64-SnapshotEnabled) return 0 ;;
-                  # The x86_64 seccomp policy is exercised under real confinement only by
-                  # Host-x64's test-confine step: a PR that touches confinement runs it.
-                  Host-x64) [ "$CONFINE" = true ] ;;
-                  *) return 1 ;;
-                esac
-                ;;
-              push)
-                [ "$MATRIX_SKIPPED" = false ] && ! grep -qxF -- "$1" <<< "$PASSED"
-                ;;
-              *) return 0 ;;
-            esac
-          }
-          host=""
-          host_root=""
-          container=""
-          planned=""
-          for arch in arm64 x64; do
-            if want "Host-$arch"; then
-              host="$host${host:+,}\"$arch\""
-              planned="$planned Host-$arch"
-            fi
-            for mode in SnapshotDisabled SnapshotEnabled; do
-              want "Host-Root-$arch-$mode" || continue
-              # SnapshotDisabled runs the suite once with FCVM_NO_SNAPSHOT=1.
-              # SnapshotEnabled runs it twice on one runner: a snapshot miss, then a hit.
-              if [ "$mode" = SnapshotDisabled ]; then nosnap=1; runs=1; else nosnap=""; runs=2; fi
-              host_root="$host_root${host_root:+,}{\"arch\":\"$arch\",\"mode\":\"$mode\",\"fcvm_no_snapshot\":\"$nosnap\",\"test_runs\":\"$runs\"}"
-              planned="$planned Host-Root-$arch-$mode"
-            done
-            if want "Container-$arch"; then
-              container="$container${container:+,}\"$arch\""
-              planned="$planned Container-$arch"
-            fi
-          done
-          echo "Self-hosted jobs for this $EVENT:${planned:- none}"
-          # A matrix with no combinations fails the run instead of skipping the job, so
-          # every list comes with a flag the job's `if:` checks first.
-          {
-            echo "host={\"arch\":[$host]}"
-            echo "host_run=$([ -n "$host" ] && echo true || echo false)"
-            echo "host_root={\"include\":[$host_root]}"
-            echo "host_root_run=$([ -n "$host_root" ] && echo true || echo false)"
-            echo "container={\"arch\":[$container]}"
-            echo "container_run=$([ -n "$container" ] && echo true || echo false)"
-            echo "skip=$([ -z "$planned" ] && echo true || echo false)"
-          } >> "$GITHUB_OUTPUT"
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
+          LANES: ${{ github.event.inputs.lanes }}
+        run: python3 scripts/ci-pool/ci_pool.py plan
 
   # Runner 0: Lint (default GitHub runner, no KVM needed)
   # Fast checks: fmt, clippy, audit, deny
@@ -656,6 +592,11 @@ jobs:
     needs: [changes]
     if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
+    # The CI build profile, as in the Host job, set through the environment: this job runs
+    # cargo directly and builds nothing else.
+    env:
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_LTO: "off"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -698,18 +639,31 @@ jobs:
         env:
           FCVM_FIRECRACKER_BIN: /usr/local/bin/fc-mock
           RUST_LOG: "fcvm=debug,health-monitor=info,fuser=warn,fuse_backend_rs=warn,passthrough=warn"
+        # --lib and --test name the binaries that hold the tests the filter selects, so cargo
+        # builds those and not the other ~120 test binaries: the build of all of them took
+        # 37.8 of this job's 39 min to run 9 tests (run 45935858819).
+        # the_mock_vmm_job_builds_the_binaries_its_filter_selects pins the list against the sources.
         run: |
           cargo nextest run --release -p fcvm --profile fc-mock \
             --features privileged-tests \
+            --lib --test test_fc_mock --test test_health_monitor \
+            --test test_kernel_patch_invariants --test test_nested_harness_invariants \
             -E 'package(fcvm) & (test(/fc_mock/) | test(/state_manager/) | test(/health_monitor/) | test(/no_sudo/)) & not test(=test_fc_mock_sanity) & not test(=test_fc_mock_container_launch)'
 
   # Runner 1a: Host (bare metal with KVM)
-  # Runs: test-unit → test-fast (quick tests, no privileged)
+  # Runs: test-all (unit tests and the rootless VM tests, no privileged) and test-confine
   # Self-hosted runners with nested virtualization (ARM64: c7g.metal, x86: c5.metal)
   host:
     name: Host-${{ matrix.arch }}
     needs: [changes, skip-check]
-    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.host_run == 'true' && needs.changes.outputs.code == 'true' }}
+    # A pull request from a fork runs no self-hosted job, even once its run is approved:
+    # the jobs run its code with passwordless sudo on instances that later serve main,
+    # kernels.yml and the fleet smoke (#2223). The same guard is on host-root and
+    # container; self_hosted_jobs_refuse_fork_pull_requests pins it. A pull_request run
+    # uses the workflow from the merge commit, so a fork that edits this file can drop the
+    # guard; that edit is in the diff the maintainer approves. The boundary fork code
+    # cannot edit is the runner pool (ejc3/aws#1102).
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.event.inputs.job != 'container' && needs.skip-check.outputs.host_run == 'true' && needs.changes.outputs.code == 'true' }}
     # A rerun asks for an on-demand host once the fleet serves the label (ejc3/aws
     # #802, turned on with the repository variable ON_DEMAND_RERUNS): the first
     # attempt of a job that a spot reclaim killed is retried where no reclaim can end
@@ -725,6 +679,13 @@ jobs:
       fail-fast: false
       # arm64 and x64, as planned by skip-check (arm64 only on a pull_request).
       matrix: ${{ fromJSON(needs.skip-check.outputs.host) }}
+    # The CI build profile (the Makefile's CARGO_CI_CONFIG; ci_builds_use_the_light_profile_but_one_lane):
+    # codegen-units=16 and no LTO for this workspace instead of the shipped 1 and thin.
+    # Measured on one 96-vCPU arm64 box (c8g.24xlarge): make build 420 -> 128 s,
+    # test-root's test build 546 -> 132 s. Host-Root-arm64-SnapshotDisabled and Packaging
+    # keep the shipped profile.
+    env:
+      FCVM_CI_PROFILE: light
     steps:
       # Fix ownership of root-owned files from previous test runs (sudo cargo test)
       - name: Fix workspace permissions (pre-checkout)
@@ -807,7 +768,7 @@ jobs:
         id: apt-prep
         run: |
           # The package list lives here only; later steps read it from the environment.
-          APT_PACKAGES="fuse3 libfuse3-dev libclang-dev clang musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch podman skopeo busybox-static cpio zstd autoconf automake libtool cmake libseccomp-dev nfs-kernel-server flex bison bc libelf-dev libssl-dev"
+          APT_PACKAGES="fuse3 libfuse3-dev libclang-dev clang musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch podman skopeo busybox-static cpio zstd autoconf automake libtool cmake libseccomp-dev nfs-kernel-server flex bison bc libelf-dev libssl-dev strace"
           {
             echo "APT_PACKAGES=$APT_PACKAGES"
             echo "APT_DIR=${{ runner.temp }}/apt-archives"
@@ -964,9 +925,11 @@ jobs:
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
-      - name: test-unit
-        working-directory: fcvm
-        run: make test-unit
+      # One test build for the job: test-all and test-confine both compile the default
+      # features. No test is gated on a missing integration feature, so test-unit's tests (no
+      # features) and test-fast's (integration-fast) are all in that build; each extra feature
+      # set was a full rebuild of the workspace (11.0 to 12.8 min each, run 45935858819).
+      # ci_jobs_build_one_test_feature_set pins it.
       - name: setup-fcvm
         working-directory: fcvm
         run: make setup-fcvm
@@ -982,28 +945,28 @@ jobs:
           sudo chmod 666 /dev/kvm
       # #61: provision the optional Cloud Hypervisor backend so the
       # --hypervisor cloud-hypervisor sanity tests run (instead of skipping).
-      # Built from the [cloud_hypervisor] fork (SVE register fix, CH #8268) and
-      # content-addressed under assets_dir, exactly like the firecracker fork.
+      # Built from the commit [cloud_hypervisor] pins (upstream main) and
+      # content-addressed under assets_dir, like the firecracker fork.
       # The assets dir (/mnt/fcvm-btrfs) persists across runs, so this rebuilds
-      # only when the fork commit moves (a new content-addressed filename);
-      # otherwise it is an instant no-op, like the kernel/rootfs/firecracker setup.
+      # only when the pinned commit changes (a new content-addressed filename);
+      # otherwise it returns without the network, like the kernel/rootfs/firecracker setup.
       - name: Build Cloud Hypervisor backend
         working-directory: fcvm
         run: ./target/release/fcvm setup --cloud-hypervisor
       - name: test-packaging-e2e
         working-directory: fcvm
         run: ./scripts/test-packaging-e2e.sh ./target/release/fcvm
-      - name: test-fast
+      - name: test-all
         working-directory: fcvm
-        run: make test-fast
+        run: make test-all
       # --confine's gate: the rootless VM tests with every VMM confined and its syscall
       # allowlist enforcing, each run once, through scripts/confine-gate.sh: it fails on a
       # failed test, on any VMM the policy stopped, on a test that did not assert its VMM
       # confined, and on a filter that matches fewer tests than the Makefile pins. On both
       # architectures: each has its own policy, and its own libc call shapes. Host-x64 runs
-      # on a pull request only when the change touches confinement (changes.confine). The step took
-      # 12 min on arm64 (run 45517811464; 10 of them building the default-feature test
-      # binaries, which test-fast does not build); the cap is twice that.
+      # on a pull request only when the change touches confinement (changes.confine). The step
+      # reuses test-all's build; when it built its own, it took 12 min on arm64 (run
+      # 45517811464); the cap is twice that.
       - name: test-confine
         timeout-minutes: 25
         working-directory: fcvm
@@ -1014,6 +977,32 @@ jobs:
         if: always()
         working-directory: fcvm
         run: ./scripts/ci-stray-vm-guard.sh post
+      # Host memory, load and swap for the day, and the kernel's out-of-memory kill count.
+      # sysstat samples every 10 minutes, so a peak of a minute or two can fall between
+      # samples: Committed_AS and oom_kill are what still show it afterwards. Before this
+      # no artifact of any lane recorded host memory (#2199).
+      - name: Capture host load record
+        if: always()
+        run: |
+          {
+            echo "### /proc/loadavg at capture time"
+            cat /proc/loadavg
+            echo "### nproc"
+            nproc
+            echo "### sar -q (run queue and load average, whole day)"
+            LC_ALL=C sar -q 2>&1 || echo "sar -q unavailable"
+            echo "### sar -u (CPU utilisation, whole day)"
+            LC_ALL=C sar -u 2>&1 || echo "sar -u unavailable"
+            echo "### sar -r (memory, whole day)"
+            LC_ALL=C sar -r 2>&1 || echo "sar -r unavailable"
+            echo "### sar -S (swap, whole day)"
+            LC_ALL=C sar -S 2>&1 || echo "sar -S unavailable"
+            echo "### /proc/meminfo at capture time"
+            grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree|Committed_AS):' /proc/meminfo
+            echo "### oom_kill since boot (/proc/vmstat)"
+            grep -E '^oom_kill ' /proc/vmstat || echo "oom_kill not reported"
+          } > /tmp/fcvm-test-logs/host-load.log 2>&1 || true
+          echo "load at capture: $(cat /proc/loadavg) on $(nproc) CPUs"
       - name: Save disk I/O record
         if: always()
         run: |
@@ -1075,7 +1064,7 @@ jobs:
   host-root:
     name: Host-Root-${{ matrix.arch }}-${{ matrix.mode }}
     needs: [changes, skip-check]
-    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.host_root_run == 'true' && needs.changes.outputs.code == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.event.inputs.job != 'container' && needs.skip-check.outputs.host_root_run == 'true' && needs.changes.outputs.code == 'true' }}
     # A rerun asks for an on-demand host once the fleet serves the label (ejc3/aws
     # #802, turned on with the repository variable ON_DEMAND_RERUNS): the first
     # attempt of a job that a spot reclaim killed is retried where no reclaim can end
@@ -1090,6 +1079,9 @@ jobs:
       matrix: ${{ fromJSON(needs.skip-check.outputs.host_root) }}
     env:
       FCVM_NO_SNAPSHOT: ${{ matrix.fcvm_no_snapshot }}
+      # The CI build profile (the Makefile's CARGO_CI_CONFIG), but this lane builds the
+      # shipped one, so a test still runs the shipped codegen.
+      FCVM_CI_PROFILE: ${{ (matrix.arch == 'arm64' && matrix.mode == 'SnapshotDisabled') && 'shipped' || 'light' }}
     steps:
       # Fix ownership of root-owned files from previous test runs (sudo cargo test)
       - name: Fix workspace permissions (pre-checkout)
@@ -1180,7 +1172,7 @@ jobs:
         id: apt-prep
         run: |
           # The package list lives here only; later steps read it from the environment.
-          APT_PACKAGES="fuse3 libfuse3-dev libclang-dev clang musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch podman skopeo busybox-static cpio zstd autoconf automake libtool cmake libseccomp-dev nfs-kernel-server flex bison bc libelf-dev libssl-dev"
+          APT_PACKAGES="fuse3 libfuse3-dev libclang-dev clang musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch podman skopeo busybox-static cpio zstd autoconf automake libtool cmake libseccomp-dev nfs-kernel-server flex bison bc libelf-dev libssl-dev strace"
           {
             echo "APT_PACKAGES=$APT_PACKAGES"
             echo "APT_DIR=${{ runner.temp }}/apt-archives"
@@ -1397,6 +1389,14 @@ jobs:
             LC_ALL=C sar -q 2>&1 || echo "sar -q unavailable"
             echo "### sar -u (CPU utilisation, whole day)"
             LC_ALL=C sar -u 2>&1 || echo "sar -u unavailable"
+            echo "### sar -r (memory, whole day)"
+            LC_ALL=C sar -r 2>&1 || echo "sar -r unavailable"
+            echo "### sar -S (swap, whole day)"
+            LC_ALL=C sar -S 2>&1 || echo "sar -S unavailable"
+            echo "### /proc/meminfo at capture time"
+            grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree|Committed_AS):' /proc/meminfo
+            echo "### oom_kill since boot (/proc/vmstat)"
+            grep -E '^oom_kill ' /proc/vmstat || echo "oom_kill not reported"
           } > /tmp/fcvm-test-logs/host-load.log 2>&1 || true
           echo "load at capture: $(cat /proc/loadavg) on $(nproc) CPUs"
       - name: Save disk I/O record
@@ -1446,15 +1446,18 @@ jobs:
   container:
     name: Container-${{ matrix.arch }}
     needs: [changes, skip-check]
-    if: ${{ github.event.inputs.job != 'host' && needs.skip-check.outputs.container_run == 'true' && needs.changes.outputs.code == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.event.inputs.job != 'host' && needs.skip-check.outputs.container_run == 'true' && needs.changes.outputs.code == 'true' }}
     # A rerun asks for an on-demand host once the fleet serves the label (ejc3/aws
     # #802, turned on with the repository variable ON_DEMAND_RERUNS): the first
     # attempt of a job that a spot reclaim killed is retried where no reclaim can end
     # it again (#834).
     runs-on: ${{ fromJSON(vars.ON_DEMAND_RERUNS == 'true' && github.run_attempt > 1 && format('["self-hosted","Linux","{0}","on-demand"]', matrix.arch) || format('["self-hosted","Linux","{0}"]', matrix.arch)) }}
-    # Longest of the last 6 successful runs: 21 min. ~3x headroom.
+    # Measured on main's push runs: 47 min warm (run 45887790668) and 57 min with a
+    # cold build (run 45686406677); run 45931415934 needed a cold build and a rebuild
+    # of the test image (its Containerfile pins changed) and was cut at 60 min with
+    # about 6 min of container-test left. 100 is 1.5x that 66 min.
     # See the Host job comment for why the 6h default is not acceptable here.
-    timeout-minutes: 60
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       # arm64 and x64, as planned by skip-check (arm64 only on a pull_request).
@@ -1463,6 +1466,8 @@ jobs:
       packages: write
     env:
       CONTAINER_ARCH: ${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}
+      # The CI build profile; the Makefile passes it into the container.
+      FCVM_CI_PROFILE: light
     steps:
       # Fix ownership of root-owned files from previous test runs (sudo cargo test)
       - name: Fix workspace permissions (pre-checkout)
@@ -1565,14 +1570,16 @@ jobs:
           path: ${{ github.workspace }}/cargo-cache
           key: container-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('fcvm/Cargo.lock') }}
           restore-keys: container-cargo-${{ runner.os }}-${{ runner.arch }}-
+      # CLEAN_PRUNE=0: this job builds fcvm only inside the container, so the host-side clean
+      # skips `fcvm snapshots prune` and the host build it needed (7.5 to 9.3 min, runs
+      # 45931415934 and 45935858819); the same recipe removes those directories with rm.
       - name: Clean test data
         working-directory: fcvm
-        run: make clean-test-data || true
-      - name: container-test-unit
-        env:
-          CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
-        working-directory: fcvm
-        run: make container-test-unit
+        run: make clean-test-data CLEAN_PRUNE=0 || true
+      # No container-test-unit step: its tests (no features) are all in container-test's build
+      # (the default features), and the step compiled the workspace once more to run them
+      # (11.6 to 13.0 min). container-setup-fcvm builds fcvm in the container first.
+      # ci_jobs_build_one_test_feature_set pins it.
       - name: container-setup-fcvm
         env:
           CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
@@ -1622,12 +1629,26 @@ jobs:
   # named "Summary (deferred)", so a reader or a tool looking for a passing
   # Summary on that commit finds none.
   summary:
-    name: ${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || 'Summary' }}
+    # A dispatch that named some lanes ran only those, so its report is "Summary (some
+    # lanes)": a passing `Summary` on a commit always means every lane its event takes.
+    # A fork's run skips every self-hosted job, so its report is not `Summary`: neither the
+    # required check nor ci_pool.py may read it as a run that tested the lanes.
+    name: ${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'Summary (fork, no self-hosted lanes)' || (github.event.inputs.lanes && 'Summary (some lanes)' || 'Summary') }}
     needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, fleet-renderer, fleet-minecraft, fleet-web, host, host-root, container]
-    if: always()
+    # Summary reports on every run but one that was itself cancelled: superseded by a newer
+    # run of the same pull request, or stopped by a person. Under
+    # `always()` such a run left a failed `Summary` on the head for good. GitHub sometimes
+    # starts two runs for one push; the second cancels the first, and on a lower member of
+    # a stack the first run's failed `Summary` then stood beside the second's
+    # `Summary (deferred)`, which no later check replaces (2026-11-26: five of nine heads
+    # of one push). `cancelled()` is true only when the RUN was cancelled. A job that ends
+    # `cancelled` while the run goes on (its own `timeout-minutes`, a lost runner) leaves it
+    # false, so Summary still runs and the gate step below fails it. A run with no Summary
+    # passed nothing: `ci_pool.py` reads lanes and never takes an absent Summary for a pass.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
-      # `if: always()` is what lets this job report on a run whose tests failed —
+      # A status function in the `if:` is what lets this job report on a run whose tests failed,
       # and it is also why Summary's own result says nothing about theirs unless
       # it looks. Without this step Summary reported success over genuinely failed
       # gating jobs in 8 of the last 40 runs (Lint, Container-*, Host-Root-*), so
@@ -1699,12 +1720,16 @@ jobs:
       - name: Report skipped
         if: needs.skip-check.outputs.skip == 'true'
         run: echo "::notice::Skipped self-hosted tests — every self-hosted job already passed for this tree on a PR branch"
+      - name: Report fork
+        if: ${{ !(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        run: echo "::notice::A fork's pull request runs no self-hosted job, so this run tested none of the lanes"
       # When the test matrix was skipped, no artifacts exist and there is
       # nothing to analyze; downloading would fail on the missing directory.
+      # A fork's run skipped the self-hosted jobs, so it has no artifacts to analyse.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        if: needs.skip-check.outputs.skip != 'true'
+        if: needs.skip-check.outputs.skip != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
       - name: Download all artifacts
-        if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true'
+        if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: /tmp/ci-artifacts
@@ -1714,30 +1739,34 @@ jobs:
       # green for those PRs — it is the required check that proves the gate
       # ran, not a claim that the matrix did.
       - name: Analyze CI run
-        if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true'
+        if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
 
-  # The top of a stack tests every lower PR's commits. When its run passes, each
-  # lower PR whose head is an ancestor of this head gets a "Stack CI" success
-  # status naming this run, which is what says that PR was tested.
+  # States what this run showed as a `ci/pool` commit status (scripts/ci-pool/ci_pool.py
+  # mark). A run that tested nothing (a draft, a lower member of a pool) puts `pending` on
+  # its head, so the pull request does not read as passed on the strength of
+  # `Summary (deferred)`. A run that passed puts `success` on its head and on the head of
+  # every lower member of its pool that it contains. A run that failed puts `failure` on
+  # its own head only.
+  #
+  # The status is a display. What main skips after a landing is decided from the runs
+  # themselves (the skip-check job), so a pull request that edits this job gains nothing.
   #
   # `!cancelled()` is what lets this job run at all. Without a status function
   # GitHub adds success() to the condition, and success() is false when a job
   # anywhere before this one in the needs graph was skipped. Summary waits for
-  # jobs most PRs skip (the bench and fleet tests), so this job was skipped on
-  # every stack. Summary's own result is still required below.
-  stack-coverage:
-    name: Stack coverage
+  # jobs most PRs skip (the bench and fleet tests).
+  pool-status:
+    name: Pool status
     needs: [changes, summary]
     if: >-
       !cancelled() &&
       github.event_name == 'pull_request' &&
-      needs.changes.outputs.run == 'true' &&
-      needs.summary.result == 'success' &&
-      github.event.pull_request.base.ref != github.event.repository.default_branch &&
+      github.event.action != 'closed' &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
       pull-requests: read
       statuses: write
@@ -1745,13 +1774,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Mark the lower PRs of this stack as tested
+      - name: State what this run showed
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RAN: ${{ needs.changes.outputs.run }}
+          REASON: ${{ needs.changes.outputs.reason }}
+          SUMMARY: ${{ needs.summary.result }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: bash scripts/ci-stack-coverage.sh
+        run: python3 scripts/ci-pool/ci_pool.py mark

@@ -121,6 +121,7 @@ impl ColdRun {
         let prefix = Self::name_prefix(run);
         fcvm::state::StateManager::new(fcvm::paths::state_dir())
             .state_files()
+            .expect("listing the state files")
             .into_iter()
             .filter_map(|p| {
                 let state: fcvm::state::VmState =
@@ -352,7 +353,10 @@ impl Scenario for ColdRun {
                     failed.push(Failure::new(
                         "leak",
                         None,
-                        format!("VM directory vm-disks/{vm_id} outlived its VM"),
+                        format!(
+                            "VM directory vm-disks/{}/{vm_id} outlived its VM",
+                            fcvm::paths::vm_bucket(vm_id)
+                        ),
                     ));
                     let _ = std::fs::remove_dir_all(&dir);
                 }

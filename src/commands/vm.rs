@@ -580,7 +580,7 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
 
     // What VMs of processes killed without teardown left goes first, then this VM's
     // runtime directory is recorded before anything creates it (crate::reclaim).
-    crate::reclaim::reclaim_abandoned().await;
+    crate::reclaim::reclaim_abandoned_if_due().await;
     let vm_id = generate_vm_id();
     let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
@@ -595,9 +595,9 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
         firecracker_args: None,
         unsupported: Some("fcvm vm run does not support confinement yet"),
         kernel_profile: None,
+        passthrough_devices: 0,
     })?;
-    let data_dir = paths::vm_runtime_dir(&vm_id);
-    tokio::fs::create_dir_all(&data_dir)
+    let data_dir = paths::create_vm_runtime_dir(&vm_id)
         .await
         .context("creating VM data directory")?;
 
@@ -620,6 +620,7 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
     // No vsock device: nothing in the guest listens on one. The restore machinery still
     // keys the source VM's directory off the path its vsock socket would have had, which is
     // the directory that holds the disk and the console log a restore redirects.
+    vm_state.config.vm_runtime_dir = Some(data_dir.clone());
     vm_state.config.vsock_socket_path = None;
     vm_state.config.source_vsock_socket_path = Some(data_dir.join("vsock.sock"));
 

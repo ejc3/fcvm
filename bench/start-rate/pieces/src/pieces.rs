@@ -82,7 +82,8 @@ pub struct PieceArgs {
     /// attach also changes the device's offload features, which the bridge above it follows.
     #[arg(long, default_value_t = 1)]
     pub tap_warm_cycles: u32,
-    /// The pool's socket (`<data_dir>/netpool/<user>/pool.sock`) for the netpool piece.
+    /// The pool's socket (`socket` in the output of `fcvm netpool stats`) for the netpool
+    /// piece.
     #[arg(long)]
     pub netpool_socket: Option<PathBuf>,
     /// The tap-attach piece prepares namespaces with the TAP and the bridge and no pasta
@@ -239,7 +240,7 @@ async fn isolated_network(held: &mut Held) -> Result<u32> {
     Ok(pid)
 }
 
-/// The clone's runtime directory (`vm-disks/<vm_id>`), as `cmd_snapshot_run_inner` makes it.
+/// The clone's runtime directory (`vm-disks/<bucket>/<vm_id>`), as `cmd_snapshot_run_inner` makes it.
 async fn runtime_dir(held: &mut Held) -> Result<PathBuf> {
     let dir = fcvm::paths::vm_runtime_dir(&held.vm_id);
     tokio::fs::create_dir_all(&dir).await?;
@@ -379,7 +380,7 @@ async fn op(args: &PieceArgs, held: &mut Held) -> Result<Stages> {
             // Held from the claim on, so teardown deletes the record if a later step fails.
             let manager = held.state.insert(manager);
             let t = Instant::now();
-            manager.allocate_loopback_ip(&mut vm_state).await?;
+            manager.allocate_loopback_ip(&mut vm_state)?;
             stages.push(("loopback", ms(t)));
             let t = Instant::now();
             manager
@@ -659,6 +660,7 @@ fn vmm_request() -> fcvm::confine::Request<'static> {
         firecracker_args: None,
         unsupported: Some("the start-rate pieces harness measures unconfined VMMs"),
         kernel_profile: None,
+        passthrough_devices: 0,
     }
 }
 

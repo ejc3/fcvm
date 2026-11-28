@@ -209,7 +209,7 @@ fn ci_runs_on_pull_requests_regardless_of_base_branch() {
 /// even waits for it.
 ///
 /// Membership in `summary.needs` is necessary but NOT sufficient: `needs` only
-/// makes Summary *wait*, and with `if: always()` Summary then reports its own
+/// makes Summary *wait*, and with `if: !cancelled()` Summary then reports its own
 /// result regardless of theirs. `summary_fails_when_a_gating_job_fails` below
 /// covers the second half.
 /// Skipping draft PRs is only safe if marking one ready re-triggers CI.
@@ -483,8 +483,10 @@ fn fleet_web_uploads_the_playwright_traces_of_a_failed_run() {
         .expect("`fleet-web` has no steps");
     let browser = steps
         .iter()
-        .position(|s| s.get("run").and_then(Value::as_str) == Some("pnpm test:e2e"))
-        .expect("`fleet-web` no longer runs `pnpm test:e2e`");
+        .position(|s| {
+            s.get("run").and_then(Value::as_str) == Some("pnpm test:e2e:${{ matrix.shard }}")
+        })
+        .expect("`fleet-web` no longer runs its shard's browser tests");
     let upload = steps
         .iter()
         .position(|s| {
@@ -1882,7 +1884,7 @@ fn summary_fails_when_a_gating_job_fails() {
 
     assert!(
         !conds.is_empty(),
-        "ci.yml's `summary` job never inspects `needs.*.result`. With `if: always()` it \
+        "ci.yml's `summary` job never inspects `needs.*.result`. With `if: !cancelled()` it \
          therefore reports success no matter what its gating jobs did — observed in 8 of the \
          last 40 runs, including one where Lint failed. Add a step conditioned on \
          `contains(needs.*.result, 'failure')` that exits non-zero."
@@ -3435,26 +3437,18 @@ fn job_set(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(|name| name.to_string()).collect()
 }
 
-/// Run skip-check's planning step with fake `gh` and `git` on PATH and return what it
-/// wrote to `$GITHUB_OUTPUT`. The fake `gh` reports one successful PR run, whose commit
-/// has this push's tree when `pr_tree_matches`, with `pr_jobs` as that run's jobs. Any
-/// other `gh` or `git` call fails the step.
-fn run_matrix_plan(
-    event: &str,
-    pr_tree_matches: bool,
-    pr_jobs: &[&str],
-) -> BTreeMap<String, String> {
-    run_matrix_plan_for(event, pr_tree_matches, pr_jobs, false)
+/// Run skip-check's planning step and return what it wrote to `$GITHUB_OUTPUT`. The step
+/// runs `scripts/ci-pool/ci_pool.py plan`. A fake `gh` on PATH fails every call, so a push
+/// finds no evidence. What a push does with evidence (lanes proven for its tree, a run that
+/// skipped the matrix by its scope, a deferred run, a landing that edits the workflow) is
+/// tested where the planner lives: `scripts/test-ci-pool.py`, run by `make test-ci-pool`.
+fn run_matrix_plan(event: &str) -> BTreeMap<String, String> {
+    run_matrix_plan_for(event, false)
 }
 
 /// [`run_matrix_plan`], saying whether the `changes` job found the pull request touching
 /// the VMM's confinement (`needs.changes.outputs.confine`).
-fn run_matrix_plan_for(
-    event: &str,
-    pr_tree_matches: bool,
-    pr_jobs: &[&str],
-    touches_confinement: bool,
-) -> BTreeMap<String, String> {
+fn run_matrix_plan_for(event: &str, touches_confinement: bool) -> BTreeMap<String, String> {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let ci = parse_workflow("ci.yml");
     let run = workflow_job(&ci, "skip-check")
@@ -3474,32 +3468,14 @@ fn run_matrix_plan_for(
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("temp dir");
-    for (name, body) in [
-        (
-            "gh",
-            r#"#!/bin/bash
-case "$1 $2" in
-  'run list') echo '101 feedface' ;;
-  'api repos/o/r/git/commits/feedface') echo "$FAKE_PR_TREE" ;;
-  'api repos/o/r/actions/runs/101/jobs') printf '%s\n' "$FAKE_PR_JOBS" ;;
-  *) echo "unexpected: gh $*" >&2; exit 1 ;;
-esac
-"#,
-        ),
-        (
-            "git",
-            r#"#!/bin/bash
-if [ "$*" = 'rev-parse HEAD^{tree}' ]; then echo push-tree; exit 0; fi
-echo "unexpected: git $*" >&2
-exit 1
-"#,
-        ),
-    ] {
-        let path = dir.join(name);
-        std::fs::write(&path, body).expect("write fake command");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("make fake command executable");
-    }
+    let gh = dir.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/bash\necho \"no answer for: gh $*\" >&2\nexit 1\n",
+    )
+    .expect("write the fake gh");
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fake gh executable");
     let out_file = dir.join("github_output");
     std::fs::write(&out_file, "").expect("seed GITHUB_OUTPUT");
     let path = format!(
@@ -3510,24 +3486,19 @@ exit 1
     let result = std::process::Command::new("bash")
         .arg("-c")
         .arg(&run)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("PATH", path)
+        .env("GH", &gh)
         .env("EVENT", event)
         .env("REPO", "o/r")
+        .env("SHA", "0000000000000000000000000000000000000000")
+        .env("LANES", "")
         .env(
             "CONFINE",
             if touches_confinement { "true" } else { "false" },
         )
         .env("GH_TOKEN", "unused")
         .env("GITHUB_OUTPUT", &out_file)
-        .env(
-            "FAKE_PR_TREE",
-            if pr_tree_matches {
-                "push-tree"
-            } else {
-                "another-tree"
-            },
-        )
-        .env("FAKE_PR_JOBS", pr_jobs.join("\n"))
         .output()
         .expect("run the skip-check planner");
     assert!(
@@ -3617,7 +3588,7 @@ fn planned_jobs(outputs: &BTreeMap<String, String>) -> BTreeSet<String> {
 /// where the x86-specific KVM and vCPU state code lives.
 #[test]
 fn a_pull_request_runs_every_arm64_job_and_one_x64_job() {
-    let jobs = planned_jobs(&run_matrix_plan("pull_request", false, &[]));
+    let jobs = planned_jobs(&run_matrix_plan("pull_request"));
     let x64: BTreeSet<String> = jobs.iter().filter(|j| j.contains("x64")).cloned().collect();
     assert_eq!(
         x64,
@@ -3647,7 +3618,7 @@ fn a_pull_request_runs_every_arm64_job_and_one_x64_job() {
 /// reads it as `needs.changes.outputs.confine`.
 #[test]
 fn a_pull_request_that_touches_confinement_also_runs_host_x64() {
-    let jobs = planned_jobs(&run_matrix_plan_for("pull_request", false, &[], true));
+    let jobs = planned_jobs(&run_matrix_plan_for("pull_request", true));
     let x64: BTreeSet<String> = jobs.iter().filter(|j| j.contains("x64")).cloned().collect();
     assert_eq!(
         x64,
@@ -3686,93 +3657,43 @@ fn a_pull_request_that_touches_confinement_also_runs_host_x64() {
     }
 }
 
-/// Main runs whatever its PR run of the same tree did not.
-///
-/// Together the two runs are the full matrix, so x86 is still fully tested before a
-/// release, and nothing that already passed on the PR runs again on main. Other jobs in
-/// the PR run's list (Lint here) must not change the plan.
+/// Nothing is assumed without evidence: a push whose evidence cannot be read, a manual
+/// dispatch that names no lane and the Build Kernels trigger all run everything.
 #[test]
-fn main_runs_the_x64_jobs_its_pull_request_left_out() {
-    let pr = planned_jobs(&run_matrix_plan("pull_request", false, &[]));
-    let mut reported: Vec<&str> = pr.iter().map(String::as_str).collect();
-    reported.push("Lint");
-    reported.push("Summary");
-    let main = planned_jobs(&run_matrix_plan("push", true, &reported));
-    assert!(
-        pr.is_disjoint(&main),
-        "main re-ran jobs that already passed on the PR: {:?}",
-        pr.intersection(&main).collect::<Vec<_>>()
-    );
-    let both: BTreeSet<String> = pr.union(&main).cloned().collect();
-    assert_eq!(
-        both,
-        job_set(&SELF_HOSTED_JOBS),
-        "the PR run and the main run together must cover the full matrix"
-    );
-}
-
-/// Nothing is assumed without a passing PR run of the same tree: a push whose tree never
-/// passed on a PR, a manual dispatch and the Build Kernels trigger all run everything.
-#[test]
-fn runs_without_a_passing_pull_request_tree_get_the_full_matrix() {
-    assert_eq!(
-        planned_jobs(&run_matrix_plan("push", false, &SELF_HOSTED_JOBS)),
-        job_set(&SELF_HOSTED_JOBS),
-        "a push whose tree never passed on a PR must run the full matrix"
-    );
-    for event in ["workflow_dispatch", "workflow_run"] {
+fn a_push_without_evidence_and_every_other_event_get_the_full_matrix() {
+    for event in ["push", "workflow_dispatch", "workflow_run"] {
         assert_eq!(
-            planned_jobs(&run_matrix_plan(event, false, &[])),
+            planned_jobs(&run_matrix_plan(event)),
             job_set(&SELF_HOSTED_JOBS),
             "{event} must run the full matrix"
         );
     }
 }
 
-/// When the matching PR run already covered everything, main runs nothing: either that
-/// run had the full matrix, or its `changes` job skipped the matrix, which the jobs API
-/// reports under the unexpanded matrix names.
+/// What main skips is decided by `scripts/ci-pool/ci_pool.py plan` from the evidence of
+/// earlier runs, and those rules are tested in `scripts/test-ci-pool.py`. That file must
+/// therefore run in CI, in the job that runs on every pull request that runs CI.
 #[test]
-fn main_skips_the_matrix_when_its_pull_request_needed_nothing_more() {
-    let mut passed: Vec<&str> = SELF_HOSTED_JOBS.to_vec();
-    passed.push("Summary");
+fn the_planners_own_tests_run_on_every_pull_request() {
+    let ci = parse_workflow("ci.yml");
+    let runs_them = workflow_job(&ci, "actionlint")["steps"]
+        .as_sequence()
+        .expect("`actionlint` has no steps")
+        .iter()
+        .any(|step| {
+            step.get("run").and_then(Value::as_str) == Some("make test-ci-pool")
+                && step.get("continue-on-error").is_none()
+                && step.get("if").is_none()
+        });
     assert!(
-        planned_jobs(&run_matrix_plan("push", true, &passed)).is_empty(),
-        "every self-hosted job already passed for this tree, so main must run none"
+        runs_them,
+        "ci.yml's actionlint job must run `make test-ci-pool`, and fail when it fails"
     );
-    let skipped = [
-        "Host-${{ matrix.arch }}",
-        "Host-Root-${{ matrix.arch }}-${{ matrix.mode }}",
-        "Container-${{ matrix.arch }}",
-        "Lint",
-        "Summary",
-    ];
+    let makefile = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Makefile"))
+        .expect("Makefile");
     assert!(
-        planned_jobs(&run_matrix_plan("push", true, &skipped)).is_empty(),
-        "the PR run skipped the matrix for this tree, so main must skip it too"
-    );
-}
-
-/// A PR run that tested nothing is not evidence for main. A draft's or a lower stack PR's
-/// run skips every job (so the jobs API reports the unexpanded matrix names, the same as
-/// a run whose `changes` job skipped the matrix) and succeeds under a Summary named
-/// "Summary (deferred)". Reusing it would skip every self-hosted job on main.
-#[test]
-fn main_ignores_a_pull_request_run_that_tested_nothing() {
-    let deferred = [
-        "Changes",
-        "Skip Check",
-        "Host-${{ matrix.arch }}",
-        "Host-Root-${{ matrix.arch }}-${{ matrix.mode }}",
-        "Container-${{ matrix.arch }}",
-        "Lint",
-        "actionlint",
-        "Summary (deferred)",
-    ];
-    assert_eq!(
-        planned_jobs(&run_matrix_plan("push", true, &deferred)),
-        job_set(&SELF_HOSTED_JOBS),
-        "main reused a deferred PR run and skipped self-hosted jobs nothing tested"
+        makefile.contains("test-ci-pool:\n\tpython3 scripts/test-ci-pool.py\n"),
+        "`make test-ci-pool` must run scripts/test-ci-pool.py"
     );
 }
 
@@ -4651,5 +4572,858 @@ fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
                 .iter()
                 .all(|k| k.contains("hashFiles('verify/lean-toolchain')")),
         "the ~/.elan cache must be keyed on verify/lean-toolchain: {toolchain_caches:?}"
+    );
+}
+
+/// The cargo tools the `cargo install` lines of `text` install, each with the versions it
+/// is pinned to (`tool@version`), or `None` for an install that names no version.
+fn cargo_installs(text: &str) -> BTreeMap<String, BTreeSet<Option<String>>> {
+    let mut installs: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
+    for line in text.lines() {
+        let Some((_, arguments)) = line.split_once("cargo install ") else {
+            continue;
+        };
+        for word in arguments.split_whitespace() {
+            if !word.starts_with("cargo-") {
+                continue;
+            }
+            let (tool, version) = match word.split_once('@') {
+                Some((tool, version)) => (tool, Some(version.to_string())),
+                None => (word, None),
+            };
+            installs
+                .entry(tool.to_string())
+                .or_default()
+                .insert(version);
+        }
+    }
+    installs
+}
+
+#[test]
+fn cargo_installs_reads_pinned_and_unpinned_tools() {
+    let installs = cargo_installs(concat!(
+        "RUN cargo install cargo-nextest cargo-deny@0.18.9 --locked\n",
+        "          which cargo-deny || cargo install cargo-deny@0.18.9 --locked\n",
+        "          which cargo-audit || cargo install cargo-audit@0.22.0 --locked\n",
+        "  # Verifies cargo install works without source tree access\n",
+    ));
+    let versions =
+        |tool: &str| -> Vec<Option<&str>> { installs[tool].iter().map(|v| v.as_deref()).collect() };
+    assert_eq!(installs.len(), 3);
+    assert_eq!(versions("cargo-nextest"), [None]);
+    assert_eq!(versions("cargo-deny"), [Some("0.18.9")]);
+    assert_eq!(versions("cargo-audit"), [Some("0.22.0")]);
+}
+
+/// The test container installs the cargo tools at the versions the workflows install.
+///
+/// The Containerfile once installed them with no version. The image's layer was cached,
+/// so nothing rebuilt it, until the newest cargo-deny needed a newer rustc than the
+/// image's: from then on any change that rebuilt the layer failed every container lane
+/// (#2205). The host lanes had been pinned all along, in the workflows.
+#[test]
+fn the_test_container_installs_the_cargo_tools_the_workflows_pin() {
+    let read = |path: PathBuf| {
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    };
+    let mut pinned: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
+    for workflow in ["ci.yml", "weekly.yml"] {
+        for (tool, versions) in cargo_installs(&read(workflow_path(workflow))) {
+            pinned.entry(tool).or_default().extend(versions);
+        }
+    }
+    for tool in ["cargo-nextest", "cargo-audit", "cargo-deny"] {
+        assert!(
+            pinned.contains_key(tool),
+            "no workflow installs {tool}: this test read nothing to compare with"
+        );
+    }
+    for (tool, versions) in &pinned {
+        assert!(
+            versions.len() == 1 && versions.iter().all(Option::is_some),
+            "the workflows install {tool} at {versions:?}: one version, in every step"
+        );
+    }
+    let containerfile = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Containerfile");
+    let in_container = cargo_installs(&read(containerfile));
+    assert!(
+        !in_container.is_empty(),
+        "the Containerfile installs no cargo tool: this test read nothing to compare"
+    );
+    for (tool, versions) in &in_container {
+        assert_eq!(
+            Some(versions),
+            pinned.get(tool),
+            "the Containerfile installs {tool} at {versions:?} and the workflows at {:?}",
+            pinned.get(tool)
+        );
+    }
+}
+
+/// The condition every self-hosted job of a pull_request-triggered workflow carries: true for
+/// every other event, and for a pull request only when its head branch is in this
+/// repository.
+const NOT_A_FORK: &str = "(github.event_name != 'pull_request' || \
+                          github.event.pull_request.head.repo.full_name == github.repository)";
+
+/// The self-hosted jobs a fork's pull request could reach in one workflow, with how many
+/// self-hosted jobs of pull-request-triggered workflows were read. Under `pull_request` a job
+/// must start its `if` with [`NOT_A_FORK`] as a conjunct. Under `pull_request_target` no
+/// self-hosted job is accepted at all: that event runs with the base repository's secrets
+/// and write token, and [`NOT_A_FORK`] reads only `pull_request`, so it is true there for
+/// every fork.
+fn fork_guard_findings(name: &str, workflow: &Value) -> (usize, Vec<String>) {
+    let on = triggers(workflow);
+    let events: Vec<&str> = match on {
+        Value::String(event) => vec![event.as_str()],
+        Value::Sequence(events) => events.iter().filter_map(Value::as_str).collect(),
+        Value::Mapping(events) => events.keys().filter_map(Value::as_str).collect(),
+        _ => panic!("{name}: cannot read its `on:`"),
+    };
+    let target = events.contains(&"pull_request_target");
+    if !target && !events.contains(&"pull_request") {
+        return (0, Vec::new());
+    }
+    let mut checked = 0;
+    let mut findings = Vec::new();
+    let jobs = workflow["jobs"].as_mapping().expect("jobs");
+    for (id, job) in jobs {
+        let id = id.as_str().unwrap_or_default();
+        match runner_of(job) {
+            Ok(Runner::GitHub) => continue,
+            Ok(Runner::Ours) | Ok(Runner::Caller(_)) | Err(_) => {}
+        }
+        checked += 1;
+        if target {
+            findings.push(format!(
+                "{name}: job {id} is not GitHub-hosted in a pull_request_target workflow"
+            ));
+            continue;
+        }
+        let condition = job.get("if").and_then(Value::as_str).unwrap_or_default();
+        let inner = condition
+            .trim()
+            .strip_prefix("${{")
+            .and_then(|c| c.strip_suffix("}}"))
+            .unwrap_or(condition)
+            .trim();
+        // The guard must be a conjunct of the whole condition, not inside an `||`.
+        let guarded = inner == NOT_A_FORK
+            || inner
+                .strip_prefix(NOT_A_FORK)
+                .is_some_and(|rest| rest.trim_start().starts_with("&&") && !rest.contains("||"));
+        if !guarded {
+            findings.push(format!("{name}: job {id} has `if: {condition}`"));
+        }
+    }
+    (checked, findings)
+}
+
+/// [`fork_guard_findings`] on workflows written for it: the guard is accepted under
+/// `pull_request` and refused under `pull_request_target`, where it does not exclude forks.
+#[test]
+fn the_fork_guard_check_refuses_self_hosted_jobs_under_pull_request_target() {
+    let workflow = |on: &str, condition: &str| -> Value {
+        serde_norway::from_str(&format!(
+            "on: {on}\njobs:\n  lane:\n    runs-on: [self-hosted, Linux, ARM64]\n    if: ${{{{ {condition} }}}}\n    steps: []\n  hosted:\n    runs-on: ubuntu-latest\n    steps: []\n"
+        ))
+        .expect("fixture parses")
+    };
+    let guarded = format!("{NOT_A_FORK} && github.event.inputs.job != 'container'");
+    assert_eq!(
+        fork_guard_findings("pr.yml", &workflow("pull_request", &guarded)),
+        (1, vec![])
+    );
+    let (_, unguarded) = fork_guard_findings("pr.yml", &workflow("pull_request", "true"));
+    assert_eq!(unguarded.len(), 1, "{unguarded:?}");
+    let (_, target) = fork_guard_findings("target.yml", &workflow("pull_request_target", &guarded));
+    assert_eq!(
+        target.len(),
+        1,
+        "a guarded self-hosted job under pull_request_target: {target:?}"
+    );
+    let (_, both) = fork_guard_findings(
+        "both.yml",
+        &workflow("[pull_request, pull_request_target]", &guarded),
+    );
+    assert_eq!(both.len(), 1, "{both:?}");
+    assert_eq!(
+        fork_guard_findings("push.yml", &workflow("push", "true")),
+        (0, vec![])
+    );
+}
+
+/// A pull request from a fork runs no job on a runner of ours, even once a maintainer has
+/// approved its run. `pull_request` runs the fork's code, the self-hosted jobs run it with
+/// passwordless sudo, and the instance then serves jobs on main, kernels.yml (which holds
+/// `contents: write`) and the fleet smoke (environment secrets): #2223. A job that calls
+/// another workflow is held to the same rule, since its called jobs may be self-hosted.
+#[test]
+fn self_hosted_jobs_refuse_fork_pull_requests() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut findings = Vec::new();
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("read .github/workflows") {
+        let path = entry.expect("dir entry").path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if !(name.ends_with(".yml") || name.ends_with(".yaml")) {
+            continue;
+        }
+        let (count, found) = fork_guard_findings(&name, &parse_workflow(&name));
+        checked += count;
+        findings.extend(found);
+    }
+    assert!(
+        checked >= 3,
+        "found {checked} self-hosted jobs in pull_request workflows; expected at least host, \
+         host-root and container in ci.yml"
+    );
+    assert!(
+        findings.is_empty(),
+        "self-hosted jobs a fork's pull request can reach; each must start its `if` with \
+         {NOT_A_FORK} &&: {findings:#?}"
+    );
+
+    // Summary analyses the self-hosted jobs' artifacts. A fork's run has none, and the
+    // analysis fails on a missing directory, so those steps must not run for it either.
+    let ci = parse_workflow("ci.yml");
+    let mut artifact_steps = 0;
+    for step in workflow_job(&ci, "summary")["steps"]
+        .as_sequence()
+        .expect("summary steps")
+    {
+        let downloads = step
+            .get("uses")
+            .and_then(Value::as_str)
+            .is_some_and(|u| u.starts_with("actions/download-artifact@"));
+        let analyses = step
+            .get("run")
+            .and_then(Value::as_str)
+            .is_some_and(|r| r.contains("analyze_ci_vms.py"));
+        if downloads || analyses {
+            artifact_steps += 1;
+            assert!(
+                condition_of(step).contains(NOT_A_FORK),
+                "Summary step {:?} reads the self-hosted artifacts on a fork's run too",
+                step.get("name")
+            );
+        }
+    }
+    assert_eq!(
+        artifact_steps, 2,
+        "found {artifact_steps} artifact steps in Summary"
+    );
+}
+
+fn read_file(path: PathBuf) -> String {
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+/// The Makefile's rules as `target -> (prerequisites, recipe lines)`. Only plain
+/// `name: prerequisites` rules are read; a target-specific variable line
+/// (`name: private SHELL := ...`) is skipped.
+fn makefile_rules(makefile: &str) -> BTreeMap<String, (Vec<String>, Vec<String>)> {
+    let mut rules: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in makefile.lines() {
+        if let Some(recipe) = line.strip_prefix('\t') {
+            if let Some(name) = &current {
+                rules
+                    .entry(name.clone())
+                    .or_default()
+                    .1
+                    .push(recipe.to_string());
+            }
+            continue;
+        }
+        current = None;
+        let Some((head, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if head.is_empty()
+            || !head
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            || rest.starts_with('=')
+            || rest.contains(":=")
+            || rest.contains("?=")
+        {
+            continue;
+        }
+        let prerequisites = rest
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        rules
+            .entry(head.to_string())
+            .or_default()
+            .0
+            .extend(prerequisites);
+        current = Some(head.to_string());
+    }
+    rules
+}
+
+/// The run-only test targets (`_test-*`) that `target` reaches, through its prerequisites
+/// and the targets its recipe names, transitively.
+fn run_only_test_targets(
+    rules: &BTreeMap<String, (Vec<String>, Vec<String>)>,
+    target: &str,
+) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![target.to_string()];
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some((prerequisites, recipe)) = rules.get(&name) else {
+            continue;
+        };
+        // A recipe names other targets only where it runs make (`$(MAKE)` or `make`): the
+        // words after that, up to the end of the command. Other words are text and paths.
+        let named = recipe
+            .iter()
+            .flat_map(|line| make_targets(&line.replace("$(MAKE)", "make")))
+            .filter(|word| rules.contains_key(word.trim_end_matches(';')))
+            .map(|word| word.trim_end_matches(';').to_string());
+        for next in prerequisites.iter().cloned().chain(named) {
+            if next.starts_with("_test-") {
+                found.insert(next.clone());
+            }
+            pending.push(next);
+        }
+    }
+    found
+}
+
+/// The cargo features a run-only test target compiles the workspace with, read from its
+/// recipe: the package defaults unless it passes `--no-default-features`, plus every
+/// `--features` list.
+fn compiled_features(
+    rules: &BTreeMap<String, (Vec<String>, Vec<String>)>,
+    defaults: &BTreeSet<String>,
+    run_only: &str,
+) -> BTreeSet<String> {
+    let recipe = rules
+        .get(run_only)
+        .unwrap_or_else(|| panic!("the Makefile has no {run_only} rule"))
+        .1
+        .join(" ");
+    let mut features = if recipe.contains("--no-default-features") {
+        BTreeSet::new()
+    } else {
+        defaults.clone()
+    };
+    let words: Vec<&str> = recipe.split_whitespace().collect();
+    for pair in words.windows(2) {
+        if pair[0] == "--features" {
+            features.extend(pair[1].split(',').map(str::to_string));
+        }
+    }
+    features
+}
+
+fn default_features() -> BTreeSet<String> {
+    let manifest = read_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"));
+    let manifest: toml::Table = manifest.parse().expect("Cargo.toml parses");
+    manifest["features"]["default"]
+        .as_array()
+        .expect("Cargo.toml has [features] default")
+        .iter()
+        .map(|f| f.as_str().expect("feature name").to_string())
+        .collect()
+}
+
+/// The make targets a step's commands name: the words after each `make`, up to the end of
+/// that command, without variable assignments and options.
+fn make_targets(run: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in run.lines() {
+        let line = line.split('#').next().unwrap_or_default();
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let mut i = 0;
+        while i < words.len() {
+            if words[i].rsplit('/').next() == Some("make") {
+                for word in &words[i + 1..] {
+                    if ["||", "&&", ";", "|"].contains(word) {
+                        break;
+                    }
+                    if !word.contains('=') && !word.starts_with('-') {
+                        targets.push(word.to_string());
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    targets
+}
+
+/// Every distinct cargo feature set is a full rebuild of the workspace crates: 11 to 13.7
+/// minutes for the test binaries on the self-hosted runners (runs 45931415934 and
+/// 45935858819). A job that compiles its tests twice, once for a set whose tests are all in
+/// the other, pays that for no test it would not run anyway: the Host job's test-unit step
+/// was one (no features, a subset of test-fast's integration-fast).
+#[test]
+fn ci_jobs_build_one_test_feature_set() {
+    let makefile = read_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Makefile"));
+    let rules = makefile_rules(&makefile);
+    let defaults = default_features();
+    let features_of = |target: &str| -> Option<BTreeSet<String>> {
+        let run_only = run_only_test_targets(&rules, target);
+        assert!(
+            run_only.len() <= 1,
+            "make {target} reaches several run-only test targets: {run_only:?}"
+        );
+        run_only
+            .first()
+            .map(|t| compiled_features(&rules, &defaults, t))
+    };
+
+    // The reader itself, on targets whose feature sets are known.
+    let set = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<BTreeSet<_>>();
+    assert_eq!(features_of("test-unit"), Some(set(&[])));
+    assert_eq!(features_of("test-fast"), Some(set(&["integration-fast"])));
+    assert_eq!(features_of("test-confine"), Some(defaults.clone()));
+    let mut root = defaults.clone();
+    root.insert("privileged-tests".into());
+    assert_eq!(features_of("test-root"), Some(root));
+    assert_eq!(features_of("container-test"), Some(defaults.clone()));
+    assert_eq!(features_of("setup-fcvm"), None);
+
+    let ci = parse_workflow("ci.yml");
+    let jobs = ci["jobs"].as_mapping().expect("ci.yml has jobs");
+    let mut checked = 0;
+    for (id, job) in jobs {
+        let id = id.as_str().expect("job id");
+        if !matches!(runner_of(job), Ok(Runner::Ours)) {
+            continue;
+        }
+        let mut sets: BTreeMap<BTreeSet<String>, Vec<String>> = BTreeMap::new();
+        for step in job["steps"].as_sequence().into_iter().flatten() {
+            let Some(run) = step.get("run").and_then(Value::as_str) else {
+                continue;
+            };
+            for target in make_targets(run) {
+                if let Some(features) = features_of(&target) {
+                    sets.entry(features).or_default().push(target);
+                }
+            }
+        }
+        if sets.is_empty() {
+            continue;
+        }
+        checked += 1;
+        assert_eq!(
+            sets.len(),
+            1,
+            "{id} compiles its tests for {} feature sets ({sets:?}); each is a full rebuild",
+            sets.len()
+        );
+    }
+    assert!(
+        checked >= 3,
+        "found test steps in {checked} self-hosted jobs; expected host, host-root and container"
+    );
+}
+
+/// Why one build per job loses no test: the tests compiled without a feature are a subset
+/// of those compiled with it only while no code is gated on a feature being OFF. Only
+/// `privileged-tests` is (test_no_sudo.rs, and tests ignored outside a privileged build),
+/// and no unprivileged lane is folded into a privileged one.
+#[test]
+fn no_code_is_gated_on_an_integration_feature_being_off() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut offenders = Vec::new();
+    let mut scanned = 0;
+    let mut pending = vec![root.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+            let entry = entry.expect("dir entry");
+            let file_type = entry.file_type().expect("file type");
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if !name.starts_with('.') && name != "target" && name != "node_modules" {
+                    pending.push(path);
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            scanned += 1;
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            for feature in ["integration-fast", "integration-slow"] {
+                for negation in ["not(feature=", "not(any(feature=", "not(all(feature="] {
+                    if squeezed.contains(&format!("{negation}\"{feature}\"")) {
+                        offenders.push(format!("{}: {negation}\"{feature}\"", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        scanned > 100,
+        "scanned {scanned} .rs files; the walk found too few to mean anything"
+    );
+    assert!(
+        offenders.is_empty(),
+        "code gated on an integration feature being off: {offenders:?}"
+    );
+}
+
+/// The SnapshotEnabled lanes run bench-vm right after test-root. `cargo bench` builds in the
+/// bench profile, which cargo keeps apart from release, so it rebuilt the workspace crates
+/// test-root had just built (7.6 to 7.9 min, run 45935858819). bench-vm builds the benches
+/// as `cargo test` with test-root's profile and features, so only the two bench binaries
+/// compile.
+#[test]
+fn bench_vm_reuses_the_test_root_build() {
+    let makefile = read_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Makefile"));
+    let rules = makefile_rules(&makefile);
+    let root_recipe = rules["_test-root"].1.join(" ");
+    let root_features: Vec<&str> = root_recipe
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|w| w[0] == "--features")
+        .map(|w| w[1])
+        .collect();
+    assert_eq!(root_features, ["privileged-tests"], "_test-root's features");
+    let nextest = makefile
+        .lines()
+        .find(|l| l.starts_with("NEXTEST :="))
+        .expect("Makefile defines NEXTEST");
+    assert!(
+        root_recipe.contains("$(NEXTEST)") && nextest.contains("--release"),
+        "_test-root builds through $(NEXTEST) in the release profile: {nextest}"
+    );
+
+    let bench = rules["bench-vm"].1.join(" ");
+    let bench = bench.replace("$(BENCH_VM_CARGO)", "");
+    let cargo = makefile
+        .lines()
+        .skip_while(|l| !l.starts_with("BENCH_VM_CARGO ="))
+        .take_while(|l| !l.starts_with("bench-vm:"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        cargo.contains("$(CARGO) test --release --features privileged-tests"),
+        "BENCH_VM_CARGO must build with test-root's profile and features: {cargo}"
+    );
+    for name in ["exec", "clone"] {
+        assert!(
+            bench.contains(&format!("--bench {name} -- --test")),
+            "bench-vm must run the {name} benchmarks once each: {bench}"
+        );
+    }
+    assert!(
+        !bench.contains("$(CARGO) bench") && !cargo.contains("$(CARGO) bench"),
+        "bench-vm uses the bench profile again: {bench}"
+    );
+}
+
+/// Whether a test file is compiled into the fc-mock job's build (the default features plus
+/// privileged-tests), judged by its file-level `#![cfg(...)]` only.
+fn in_the_mock_vmm_build(text: &str) -> bool {
+    let Some(cfg) = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("#![cfg("))
+    else {
+        return true;
+    };
+    let cfg: String = cfg.chars().filter(|c| !c.is_whitespace()).collect();
+    if cfg.contains("not(feature=\"privileged-tests\")") {
+        return false;
+    }
+    let built = ["integration-fast", "integration-slow", "privileged-tests"];
+    let features = regex::Regex::new(r#"feature="([^"]+)""#).unwrap();
+    features.captures_iter(&cfg).all(|c| built.contains(&&c[1])) && !cfg.contains("target_arch")
+}
+
+/// The fc-mock job (GitHub-hosted) names on its command line the binaries that hold the
+/// tests its filter selects, so the build skips the rest. A test added under a matching
+/// name in another file would otherwise drop out of the job without a sign.
+#[test]
+fn the_mock_vmm_job_builds_the_binaries_its_filter_selects() {
+    let ci = parse_workflow("ci.yml");
+    let step = workflow_job(&ci, "fc-mock")["steps"]
+        .as_sequence()
+        .expect("fc-mock steps")
+        .iter()
+        .find(|s| s.get("name").and_then(Value::as_str) == Some("Test fc-mock"))
+        .expect("fc-mock has a Test fc-mock step");
+    let run = step["run"].as_str().expect("run");
+    let words: Vec<&str> = run.split_whitespace().collect();
+    let named: BTreeSet<&str> = words
+        .windows(2)
+        .filter(|w| w[0] == "--test")
+        .map(|w| w[1])
+        .collect();
+    let lib = words.contains(&"--lib");
+    let patterns: Vec<regex::Regex> = regex::Regex::new(r"test\(/([^/]+)/\)")
+        .unwrap()
+        .captures_iter(run)
+        .map(|c| regex::Regex::new(&c[1]).unwrap())
+        .collect();
+    let excluded: BTreeSet<String> = regex::Regex::new(r"not test\(=([^)]+)\)")
+        .unwrap()
+        .captures_iter(run)
+        .map(|c| c[1].to_string())
+        .collect();
+    assert!(
+        patterns.len() >= 3,
+        "read {} patterns from: {run}",
+        patterns.len()
+    );
+
+    // A test function: a `fn` whose attribute lines just above name a test attribute.
+    let test_fns = |text: &str| -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let fn_name = regex::Regex::new(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)").unwrap();
+        let mut found = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(c) = fn_name.captures(line) else {
+                continue;
+            };
+            let attrs = lines[i.saturating_sub(4)..i].join("\n");
+            if attrs.contains("#[test]") || attrs.contains("::test") {
+                found.push(c[1].to_string());
+            }
+        }
+        found
+    };
+    let selected =
+        |name: &str| !excluded.contains(name) && patterns.iter().any(|p| p.is_match(name));
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut wanted = BTreeSet::new();
+    for entry in std::fs::read_dir(root.join("tests")).expect("tests/") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = read_file(path.clone());
+        if !in_the_mock_vmm_build(&text) {
+            continue;
+        }
+        if test_fns(&text).iter().any(|n| selected(n)) {
+            wanted.insert(path.file_stem().unwrap().to_string_lossy().into_owned());
+        }
+    }
+    let mut lib_wanted = Vec::new();
+    let mut pending = vec![root.join("src")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("src dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let text = read_file(path.clone());
+                lib_wanted.extend(test_fns(&text).into_iter().filter(|n| selected(n)));
+            }
+        }
+    }
+    assert!(
+        !wanted.is_empty(),
+        "found no test file the filter selects: the scan read nothing"
+    );
+    let named_owned: BTreeSet<String> = named.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        named_owned, wanted,
+        "the fc-mock step's --test list must be exactly the files holding tests its filter selects"
+    );
+    assert_eq!(
+        lib,
+        !lib_wanted.is_empty(),
+        "--lib on the fc-mock step: library tests the filter selects: {lib_wanted:?}"
+    );
+}
+
+/// The Fleet Web job runs its browser suite in shards, one package.json script each. Every
+/// Playwright config must run in exactly one shard, and `pnpm test:e2e` (what README.md
+/// tells people to run) must be the shards in order, so CI and a local run cover the same.
+#[test]
+fn fleet_web_shards_run_every_playwright_config() {
+    let ci = parse_workflow("ci.yml");
+    let shards: Vec<String> = workflow_job(&ci, "fleet-web")["strategy"]["matrix"]["shard"]
+        .as_sequence()
+        .expect("fleet-web has a shard matrix")
+        .iter()
+        .map(|v| v.as_str().expect("shard name").to_string())
+        .collect();
+    let web = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fleet/web");
+    let package: serde_json::Value =
+        serde_json::from_str(&read_file(web.join("package.json"))).expect("package.json parses");
+    let scripts = &package["scripts"];
+    let script = |name: &str| -> String {
+        scripts[name]
+            .as_str()
+            .unwrap_or_else(|| panic!("package.json has no {name} script"))
+            .to_string()
+    };
+    let in_order = shards
+        .iter()
+        .map(|s| format!("pnpm test:e2e:{s}"))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    assert_eq!(
+        script("test:e2e"),
+        in_order,
+        "test:e2e must be the CI shards in order"
+    );
+
+    let mut ran: BTreeMap<String, usize> = BTreeMap::new();
+    for shard in &shards {
+        for command in script(&format!("test:e2e:{shard}")).split("&&") {
+            let words: Vec<&str> = command.split_whitespace().collect();
+            assert_eq!(
+                words.get(..2),
+                Some(&["playwright", "test"][..]),
+                "{shard}: {command}"
+            );
+            let config = match words.iter().position(|w| *w == "-c") {
+                Some(i) => words[i + 1].to_string(),
+                None => "playwright.config.ts".to_string(),
+            };
+            *ran.entry(config).or_default() += 1;
+        }
+    }
+    let configs: BTreeMap<String, usize> = std::fs::read_dir(&web)
+        .expect("fleet/web")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("playwright.") && n.ends_with(".config.ts"))
+        .map(|n| (n, 1))
+        .collect();
+    assert!(
+        configs.len() >= 7,
+        "found {} Playwright configs",
+        configs.len()
+    );
+    assert_eq!(
+        ran, configs,
+        "each Playwright config runs in exactly one shard"
+    );
+}
+
+/// CI compiles this workspace with codegen-units=16 and no LTO: the shipped profile
+/// (codegen-units=1, thin LTO) compiles the 220k-line fcvm crate on one core, 420 s for make
+/// build and 546 s for test-root's test build on a 96-vCPU arm64 box, against 128 and 132 s.
+/// The Makefile gives the profile as `--config` to this workspace's cargo commands only
+/// (FCVM_CI_PROFILE=light): through CARGO_PROFILE_RELEASE_* in the environment it also
+/// reached the Firecracker and Cloud Hypervisor builds `fcvm setup` runs, overriding their own
+/// profiles, in every lane. One self-hosted lane (Host-Root-arm64-SnapshotDisabled) and
+/// Packaging keep the shipped profile. fc-mock runs cargo directly and builds nothing else,
+/// so it sets the environment.
+#[test]
+fn ci_builds_use_the_light_profile_but_one_lane() {
+    let makefile = read_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Makefile"));
+    let line = |prefix: &str| -> String {
+        makefile
+            .lines()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("the Makefile has no `{prefix}` line"))
+            .to_string()
+    };
+    assert_eq!(
+        line("CARGO_CI_CONFIG ="),
+        "CARGO_CI_CONFIG = $(if $(filter light,$(FCVM_CI_PROFILE)),--config \
+         profile.release.codegen-units=16 --config 'profile.release.lto=\"off\"')"
+    );
+    assert!(line("override CARGO =").ends_with("$(CARGO_CI_CONFIG)"));
+    assert!(line("NEXTEST :=").contains("$(CARGO_CI_CONFIG)"));
+    assert!(
+        makefile.contains("CONTAINER_TEST_OPTIONS += -e FCVM_CI_PROFILE\n"),
+        "the container build must receive the CI profile"
+    );
+
+    let ci = parse_workflow("ci.yml");
+    let env_of = |job: &str, name: &str| -> Option<String> {
+        workflow_job(&ci, job)["env"][name]
+            .as_str()
+            .map(str::to_string)
+    };
+    for job in ["host", "container"] {
+        assert_eq!(
+            env_of(job, "FCVM_CI_PROFILE").as_deref(),
+            Some("light"),
+            "{job}"
+        );
+    }
+    assert_eq!(
+        env_of("host-root", "FCVM_CI_PROFILE").as_deref(),
+        Some(
+            "${{ (matrix.arch == 'arm64' && matrix.mode == 'SnapshotDisabled') && 'shipped' \
+             || 'light' }}"
+        )
+    );
+    assert_eq!(
+        env_of("fc-mock", "CARGO_PROFILE_RELEASE_CODEGEN_UNITS").as_deref(),
+        Some("16")
+    );
+    assert_eq!(
+        env_of("fc-mock", "CARGO_PROFILE_RELEASE_LTO").as_deref(),
+        Some("off")
+    );
+    // Nothing that runs `fcvm setup` (which builds Firecracker and Cloud Hypervisor) carries
+    // the environment overrides, and Packaging carries no profile at all.
+    for job in ["host", "host-root", "container", "packaging"] {
+        for name in [
+            "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+            "CARGO_PROFILE_RELEASE_LTO",
+        ] {
+            assert_eq!(env_of(job, name), None, "{job} sets {name}");
+        }
+    }
+    assert_eq!(env_of("packaging", "FCVM_CI_PROFILE"), None);
+    for name in [
+        "FCVM_CI_PROFILE",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+        "CARGO_PROFILE_RELEASE_LTO",
+    ] {
+        assert!(
+            ci["env"][name].is_null(),
+            "{name} must not be workflow-wide"
+        );
+    }
+}
+
+/// A recipe that runs under TARGET_LEASE_SHELL needs target/: the wrapper refuses to run
+/// without it. clean-test-data runs under it, so cargo-target-link is a prerequisite whatever
+/// CLEAN_PRUNE says; with only `build` (dropped under CLEAN_PRUNE=0) a fresh checkout's clean
+/// failed before its first command, hidden by CI's `|| true`.
+#[test]
+fn clean_test_data_links_target_without_a_build() {
+    let makefile = read_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Makefile"));
+    let rules = makefile_rules(&makefile);
+    let leased: Vec<&str> = makefile
+        .lines()
+        .filter_map(|l| l.strip_suffix(": private SHELL := $(TARGET_LEASE_SHELL)"))
+        .collect();
+    assert!(
+        leased.contains(&"clean-test-data"),
+        "clean-test-data runs under the lease"
+    );
+    let prerequisites = &rules["clean-test-data"].0;
+    assert!(
+        prerequisites.first().map(String::as_str) == Some("cargo-target-link"),
+        "clean-test-data's prerequisites must start with cargo-target-link, unconditionally: \
+         {prerequisites:?}"
     );
 }

@@ -8,7 +8,7 @@
 # the top of the stack, whose head holds every lower PR's commits. The top's run
 # classifies the whole stack's diff against the default branch, not only its own
 # files, so a docs-only top PR cannot skip the matrix for code changed lower down.
-# `ci-stack-coverage.sh` then marks the lower PRs' heads as covered.
+# `scripts/ci-pool/ci_pool.py mark` then puts a `ci/pool` status on the lower PRs' heads.
 #
 # Every lookup that fails runs the full matrix: a scope that cannot be computed
 # must not skip anything.
@@ -162,7 +162,7 @@ while IFS= read -r f; do
     # Docs that TESTS READ are code, whatever their extension.
     # tests/test_documented_make_targets.rs reads README.md and
     # PERFORMANCE.md and fails when they name make targets that do not
-    # exist; it runs ungated under `make test-unit` in the host job. A
+    # exist; it runs ungated in every test build of the host job. A
     # PR editing only those files was getting zero gating jobs while
     # the very lints that check them sat unrun -- the same hole this
     # file fixes for bench/, one directory up.

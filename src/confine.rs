@@ -200,7 +200,7 @@ const SECCOMP_POLICY: &str = include_str!("../resources/seccomp/firecracker-conf
 /// from (resources/seccomp/confined-changes.json); `[firecracker] commit` in
 /// rootfs-config.toml must be this commit. A VMM built from another commit is not confined:
 /// its syscalls were never checked against the policy.
-pub const CONFINED_FIRECRACKER_COMMIT: &str = "2a33289b55b7f611959891dd5295438a416f386e";
+pub const CONFINED_FIRECRACKER_COMMIT: &str = "df341d66cfef596c957d4ebd0865d6f39b787784";
 
 /// The environment a confined VMM starts with, on top of fcvm's own.
 ///
@@ -352,6 +352,8 @@ pub enum Mechanism {
     Seccomp,
     /// The command itself.
     Command,
+    /// A host device passed through to the VM.
+    Device,
 }
 
 impl std::fmt::Display for Mechanism {
@@ -364,6 +366,7 @@ impl std::fmt::Display for Mechanism {
             Mechanism::Process => "process",
             Mechanism::Seccomp => "seccomp",
             Mechanism::Command => "command",
+            Mechanism::Device => "device",
         })
     }
 }
@@ -417,6 +420,8 @@ pub struct Request<'a> {
     /// The kernel profile the VMM starts with (`None`: default); it names the Firecracker
     /// build the VMM runs.
     pub kernel_profile: Option<&'a str>,
+    /// The host PCI devices this start passes through to the VM (`--gpu`).
+    pub passthrough_devices: usize,
 }
 
 /// What the host offers, read once per start.
@@ -580,6 +585,20 @@ pub fn missing(request: &Request<'_>, host: &Host) -> Vec<Missing> {
                  derived from Firecracker {CONFINED_FIRECRACKER_COMMIT}, and another build's \
                  syscalls were never checked against it",
                 request.kernel_profile.unwrap_or("default")
+            ),
+        );
+    }
+    // The confined policy has none of what a passthrough device needs (confined-changes.json
+    // removes the VFIO requests and the reads and writes of a device's configuration space),
+    // so the VMM would be stopped in the middle of attaching one.
+    if request.passthrough_devices > 0 {
+        add(
+            Mechanism::Device,
+            format!(
+                "--gpu passes {} host PCI device(s) through to the VM; the confined syscall \
+                 policy allows no VFIO request, so confinement does not support device \
+                 passthrough",
+                request.passthrough_devices
             ),
         );
     }
@@ -1307,6 +1326,7 @@ mod tests {
             firecracker_args: None,
             unsupported: None,
             kernel_profile: None,
+            passthrough_devices: 0,
         }
     }
 
@@ -1432,6 +1452,15 @@ mod tests {
     /// Whether `removal` (an entry of the changes' `remove`) takes `rule` out: every rule of
     /// its syscall, or, when it names an `arg`, only the rules that compare that argument
     /// with that value.
+    /// Whether `removal` applies to `arch`: one without `arches` applies to both, one with it
+    /// to the architectures it lists (a syscall that exists on one only, or a request one
+    /// architecture's policy must keep).
+    fn removal_is_for(removal: &serde_json::Value, arch: &str) -> bool {
+        removal
+            .get("arches")
+            .is_none_or(|arches| arches.as_array().unwrap().iter().any(|a| a == arch))
+    }
+
     fn removes(removal: &serde_json::Value, rule: &serde_json::Value) -> bool {
         if removal["syscall"] != rule["syscall"] {
             return false;
@@ -1457,7 +1486,11 @@ mod tests {
         let mut policy = fork.clone();
         for (class, filter) in policy.as_object_mut().unwrap().iter_mut() {
             let rules = filter["filter"].as_array_mut().unwrap();
-            rules.retain(|rule| !removed.iter().any(|removal| removes(removal, rule)));
+            rules.retain(|rule| {
+                !removed
+                    .iter()
+                    .any(|removal| removal_is_for(removal, arch) && removes(removal, rule))
+            });
             for add in changes["add"].as_array().unwrap() {
                 let listed = |key: &str, value: &str| {
                     add[key].as_array().unwrap().iter().any(|v| v == value)
@@ -1484,14 +1517,168 @@ mod tests {
     const SECCOMP_ARCHES: [&str; 2] = ["x86_64", "aarch64"];
 
     /// The thread categories the confined policy was audited for: the ones the pinned
-    /// Firecracker installs a filter for, each on the threads of that kind.
-    const AUDITED_THREAD_CLASSES: [&str; 3] = ["api", "vcpu", "vmm"];
+    /// Firecracker installs a filter for, each on the threads of that kind. `blk_worker` is
+    /// listed without an audit, because no VM fcvm starts has such a thread: Firecracker runs
+    /// a drive on worker threads only when the drive sets a queue count
+    /// (`no_drive_asks_for_worker_threads`), and the policy takes from the VMM thread what it
+    /// would need to start one for a drive attached later (confined-changes.json,
+    /// `every_drive_is_attached_before_the_guest_boots`). A drive that asks for worker
+    /// threads needs the audit first.
+    const AUDITED_THREAD_CLASSES: [&str; 4] = ["api", "blk_worker", "vcpu", "vmm"];
 
     /// The thread categories of a filter file, sorted.
     fn thread_classes(filter: &serde_json::Value) -> Vec<String> {
         let mut classes: Vec<String> = filter.as_object().unwrap().keys().cloned().collect();
         classes.sort();
         classes
+    }
+
+    /// No drive fcvm configures sets a queue count (the field this test looks for, spelled so
+    /// that its own text does not hold it). Firecracker runs a drive that sets one on
+    /// worker threads (its `blk_worker` category) and every other drive on the VMM thread, so
+    /// no VM of fcvm's has a thread of that category, and the confined policy for it has
+    /// never run. A drive that starts to ask for worker threads fails here first.
+    #[test]
+    fn no_drive_asks_for_worker_threads() {
+        let field = concat!("num", "_queues");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut read = 0;
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    read += 1;
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    assert!(
+                        !text.contains(field),
+                        "{} names {field}: a drive with it runs on Firecracker worker threads, \
+                         whose seccomp category the confined policy was never audited for",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert!(read > 50, "only {read} source files were read");
+    }
+
+    /// No request fcvm sends asks Firecracker for a Nitro Enclave (its enclave resource) or
+    /// names a drive's image format, whose only other value than raw is VMDK. The confined
+    /// policy has none of what either needs (confined-changes.json), so one that appears in
+    /// fcvm fails here first. The names are spelled so this test's own text holds neither.
+    #[test]
+    fn no_request_asks_for_an_enclave_or_a_vmdk_image() {
+        let names = [concat!("/encl", "ave"), concat!("image", "_format")];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut read = 0;
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    read += 1;
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    for name in names {
+                        assert!(
+                            !text.contains(name),
+                            "{} names {name}, a Firecracker feature the confined policy has \
+                             no syscalls for",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+        assert!(read > 50, "only {read} source files were read");
+    }
+
+    /// fcvm attaches every drive and pmem device before the guest boots, and never to a running
+    /// VM. For a drive that runs on worker threads Firecracker starts them while it attaches
+    /// the drive: at boot and at a snapshot load that is before the VMM thread's filter is
+    /// installed, and for a drive attached later it is under that filter. The confined policy
+    /// takes thread creation out of the VMM thread's filter, so a drive attached to a running
+    /// VM must not appear without a decision about it: it fails here, and not as a confined VM
+    /// stopped at run time.
+    #[test]
+    fn every_drive_is_attached_before_the_guest_boots() {
+        // The attach calls, spelled so this test's own text holds none of them.
+        let attach = [
+            concat!(".add", "_drive("),
+            concat!(".add", "_pmem("),
+            concat!(".put", "_pmem("),
+        ];
+        // The files that attach, each with the call after which it may attach nothing: the
+        // boot. The two without one are what the others call into (the Hypervisor trait's
+        // Firecracker implementation, and the pre-boot configuration it applies).
+        let may_attach: [(&str, Option<&str>); 5] = [
+            ("commands/podman/vm_config.rs", Some("hv.boot().await")),
+            ("commands/vm.rs", Some("backend.boot().await")),
+            ("setup/rootfs.rs", Some("InstanceAction::InstanceStart")),
+            ("hypervisor/firecracker.rs", None),
+            ("firecracker/config.rs", None),
+        ];
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        assert!(
+            files.len() > 50,
+            "only {} source files were read",
+            files.len()
+        );
+        let mut attaching = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            if !attach.iter().any(|call| text.contains(call)) {
+                continue;
+            }
+            let name = file
+                .strip_prefix(&src)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let Some((_, boot)) = may_attach.iter().find(|(allowed, _)| *allowed == name) else {
+                panic!(
+                    "{name} attaches a drive or pmem device. If it does so before the guest \
+                     boots, list it here with its boot call; a device attached to a running VM \
+                     starts a Firecracker thread under the VMM thread's seccomp filter, which \
+                     the confined policy does not allow"
+                );
+            };
+            if let Some(boot) = boot {
+                let booted = text
+                    .find(boot)
+                    .unwrap_or_else(|| panic!("{name} no longer calls {boot}"));
+                for call in attach {
+                    assert!(
+                        !text[booted..].contains(call),
+                        "{name} calls {call} after {boot}"
+                    );
+                }
+            }
+            attaching.push(name);
+        }
+        attaching.sort();
+        let mut expected: Vec<&str> = may_attach.iter().map(|(name, _)| *name).collect();
+        expected.sort();
+        assert_eq!(
+            attaching, expected,
+            "a listed file no longer attaches anything"
+        );
     }
 
     /// The pinned Firecracker's own filter says which thread categories the binary has, and
@@ -1549,6 +1736,21 @@ mod tests {
             // Every removal and addition still means something against this fork filter.
             for removal in changes["remove"].as_array().unwrap() {
                 let syscall = removal["syscall"].as_str().unwrap();
+                // A removal names the architectures it is for, or none: a name that is no
+                // architecture would apply nowhere and be checked nowhere.
+                if let Some(arches) = removal.get("arches") {
+                    let arches = arches.as_array().unwrap();
+                    assert!(
+                        !arches.is_empty()
+                            && arches
+                                .iter()
+                                .all(|a| SECCOMP_ARCHES.contains(&a.as_str().unwrap())),
+                        "{removal} lists something that is not an architecture"
+                    );
+                }
+                if !removal_is_for(removal, arch) {
+                    continue;
+                }
                 assert!(
                     fork.as_object()
                         .unwrap()
@@ -1698,9 +1900,12 @@ mod tests {
             ("vmm", "open"),
             ("api", "open"),
             ("vcpu", "open"),
+            ("blk_worker", "open"),
             ("vmm", "stat"),
+            ("blk_worker", "stat"),
             ("vmm", "epoll_wait"),
             ("api", "epoll_wait"),
+            ("blk_worker", "epoll_wait"),
         ];
         // On aarch64 only: none. Its openat and newfstatat are in the x86_64 policy too.
         const AARCH64_ONLY: &[(&str, &str)] = &[];
@@ -1860,6 +2065,7 @@ mod tests {
             firecracker_args: Some("--enable-nv2 --no-seccomp"),
             unsupported: None,
             kernel_profile: None,
+            passthrough_devices: 2,
         };
         let host = Host {
             mode: Mode::Off,
@@ -1882,6 +2088,7 @@ mod tests {
             vec![
                 Mechanism::Landlock,
                 Mechanism::Backend,
+                Mechanism::Device,
                 Mechanism::Network,
                 Mechanism::Debugging,
                 Mechanism::Debugging,
@@ -1892,6 +2099,7 @@ mod tests {
         let error = decide(&request, &host).unwrap_err().to_string();
         for needle in [
             "backend: confinement supports the Firecracker backend only",
+            "device: --gpu passes 2 host PCI device(s) through to the VM",
             "network: --network bridged runs the VMM as root",
             "debugging: FCVM_STRACE_FC",
             "debugging: FCVM_NO_SECCOMP",
@@ -1927,6 +2135,49 @@ mod tests {
             ..host(Ok(11))
         };
         assert!(decide(&request(true), &default).unwrap().is_some());
+    }
+
+    /// A start with a passed-through device is refused whatever build its profile runs: the
+    /// confined policy has no VFIO request, and a VMM stopped while it attaches a device is a
+    /// dead VM, not an error. Both commands that take `--gpu` say how many they were given.
+    #[test]
+    fn a_passed_through_device_is_refused() {
+        let default = Host {
+            firecracker_commit: Some(CONFINED_FIRECRACKER_COMMIT.to_string()),
+            ..host(Ok(11))
+        };
+        let with_gpu = Request {
+            passthrough_devices: 1,
+            ..request(true)
+        };
+        let error = decide(&with_gpu, &default).unwrap_err().to_string();
+        assert!(
+            error.contains("device: --gpu passes 1 host PCI device(s) through to the VM"),
+            "{error}"
+        );
+        assert!(decide(&request(true), &default).unwrap().is_some());
+        let required = Host {
+            mode: Mode::Required,
+            ..default
+        };
+        let unflagged = Request {
+            flag: false,
+            ..with_gpu
+        };
+        assert!(decide(&unflagged, &required).is_err());
+        let count = concat!("passthrough_devices: args", ".gpu.len(),");
+        for (path, text) in [
+            (
+                "commands/podman/mod.rs",
+                include_str!("commands/podman/mod.rs"),
+            ),
+            ("commands/snapshot.rs", include_str!("commands/snapshot.rs")),
+        ] {
+            assert!(
+                text.contains(count),
+                "{path} does not tell confinement how many devices --gpu passes through"
+            );
+        }
     }
 
     #[test]
@@ -2143,7 +2394,7 @@ mod tests {
         let inner = body(snapshot, "async fn cmd_snapshot_run_inner(");
         let resolve = inner.find("crate::confine::resolve(").unwrap();
         for effect in [
-            "reclaim_abandoned()",
+            "reclaim_abandoned_if_due()",
             "Owner::begin(",
             "EarlyPrefill::start(",
         ] {
@@ -2154,7 +2405,7 @@ mod tests {
         }
         let raw = body(snapshot, "async fn cmd_snapshot_run_raw(");
         let resolve = raw.find("crate::confine::resolve(").unwrap();
-        for effect in ["reclaim_abandoned()", "Owner::begin("] {
+        for effect in ["reclaim_abandoned_if_due()", "Owner::begin("] {
             assert!(
                 resolve < raw.find(effect).unwrap(),
                 "raw restore: {effect} first"

@@ -222,7 +222,10 @@ fn find_descendants_with_comm_prefix(ancestor: u32, prefix: &str) -> Vec<Tracked
 
 /// Does any state file in the state dir belong to `vm_name`?
 fn state_file_for_name_exists(vm_name: &str) -> bool {
-    for p in fcvm::state::StateManager::new(fcvm::paths::state_dir()).state_files() {
+    for p in fcvm::state::StateManager::new(fcvm::paths::state_dir())
+        .state_files()
+        .expect("listing the state files")
+    {
         let Ok(content) = std::fs::read_to_string(&p) else {
             continue;
         };
@@ -324,7 +327,7 @@ fn artifacts_for_name(vm_name: &str) -> Result<Option<VmArtifacts>> {
     let mut found = None;
 
     // The states are in buckets under the state directory.
-    for path in fcvm::state::StateManager::new(state_dir.clone()).state_files() {
+    for path in fcvm::state::StateManager::new(state_dir.clone()).state_files()? {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -356,9 +359,10 @@ fn artifacts_for_name(vm_name: &str) -> Result<Option<VmArtifacts>> {
 
         let lock_path = path.with_extension("json.lock");
         let data_dir = fcvm::paths::vm_runtime_dir(&state.vm_id);
-        let vm_disks = fcvm::paths::data_dir().join("vm-disks");
+        let vm_disks = fcvm::paths::vm_disks_dir();
         anyhow::ensure!(
-            data_dir.parent() == Some(vm_disks.as_path()) && data_dir != vm_disks,
+            data_dir.parent().and_then(|bucket| bucket.parent()) == Some(vm_disks.as_path())
+                && data_dir != vm_disks,
             "refusing to treat {} as one VM's runtime directory",
             data_dir.display()
         );
@@ -509,13 +513,12 @@ fn confirmed_exit_ignores_only_pidfd_esrch() {
 /// assertion. This is test-fixture hygiene, never part of the passing oracle.
 fn cleanup_exact_artifacts(artifacts: &VmArtifacts) -> Result<()> {
     let state_dir = fcvm::paths::state_dir();
-    let vm_disks = fcvm::paths::data_dir().join("vm-disks");
     anyhow::ensure!(
         artifacts.state_path
             == fcvm::state::StateManager::new(state_dir.clone()).state_file(&artifacts.vm_id)
             && artifacts.lock_path
                 == fcvm::state::StateManager::new(state_dir.clone()).lock_file(&artifacts.vm_id)
-            && artifacts.data_dir == vm_disks.join(&artifacts.vm_id)
+            && artifacts.data_dir == fcvm::paths::vm_runtime_dir(&artifacts.vm_id)
             && !artifacts.vm_id.is_empty(),
         "refusing cleanup for paths that are not one exact VM's artifacts: {artifacts:?}"
     );
@@ -3260,15 +3263,10 @@ async fn test_lifecycle_interleave_bridged_subnet_lock_spans_data_dirs() -> Resu
     let (a_name, b_name, _, _) = common::unique_names("ilv-hostlock");
     let scratch = tempfile::tempdir().context("creating the go-file directory")?;
     let go = scratch.path().join("go");
-    let data_dir = |tag: &str| {
-        // Short: a VM's sockets sit under <data>/vm-disks/vm-<32 hex>/, and AF_UNIX paths
-        // stop at 108 bytes.
-        fcvm::paths::data_dir().join(format!(
-            "rt-{tag}{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..7]
-        ))
-    };
-    let (a_dir, b_dir) = (data_dir("a"), data_dir("b"));
+    let (a_dir, b_dir) = (
+        common::short_data_dir(&fcvm::paths::data_dir(), "ra"),
+        common::short_data_dir(&fcvm::paths::data_dir(), "rb"),
+    );
     let a_fp = format!("bridged.subnet_locked:block_until_file:{}", go.display());
     let b_fp = "bridged.subnet_locked:sleep:0".to_string();
     let mut children: Vec<tokio::process::Child> = Vec::new();

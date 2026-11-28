@@ -109,11 +109,7 @@ impl Target {
             return Ok(None);
         }
         let path = self.with_suffix(".claim");
-        let claim = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
+        let claim = crate::utils::open_shared_lock_file(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         // SAFETY: flock on a descriptor this function owns.
         if unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
