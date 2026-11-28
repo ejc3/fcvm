@@ -222,7 +222,8 @@
     "actions": [
       {
         "args": {
-          "text": "hello"
+          "text": "hello",
+          "text_style": "lockup"
         },
         "at": 2000,
         "id": "w1",
@@ -278,7 +279,8 @@
       },
       {
         "args": {
-          "text": "  two   words "
+          "text": "two words",
+          "text_style": "lockup"
         },
         "at": 9200,
         "id": "w7",

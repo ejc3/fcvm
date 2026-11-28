@@ -413,9 +413,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "action": "notepad"
-        },
+        "args": {},
         "at": 33000,
         "id": "a1",
         "name": "windows_action",
@@ -435,9 +433,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "slot": "win-2"
-        },
+        "args": {},
         "at": 39900,
         "id": "c3a",
         "name": "claim_windows",
@@ -455,9 +451,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "slot": "win-2"
-        },
+        "args": {},
         "at": 40100,
         "id": "c4",
         "name": "claim_windows",

@@ -285,9 +285,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "action": "open_browser"
-        },
+        "args": {},
         "at": 4000,
         "id": "c3",
         "name": "phone_action",

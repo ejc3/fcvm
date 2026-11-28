@@ -130,9 +130,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "tile": "fcvm:9"
-        },
+        "args": {},
         "at": 2200,
         "id": "i-2",
         "name": "relaunch",
@@ -144,9 +142,9 @@
         "args": {},
         "at": 2300,
         "id": "i-3",
-        "name": "bogus",
+        "name": "unknown",
         "outcome": "refused",
-        "summary": "unknown intent \"bogus\"",
+        "summary": "unknown intent",
         "viewer": "v1"
       }
     ],

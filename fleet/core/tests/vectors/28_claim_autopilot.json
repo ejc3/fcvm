@@ -223,9 +223,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "on": false
-        },
+        "args": {},
         "at": 30600,
         "id": "p3",
         "name": "claim_autopilot",
@@ -234,9 +232,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "on": "yes"
-        },
+        "args": {},
         "at": 30700,
         "id": "p4",
         "name": "claim_autopilot",

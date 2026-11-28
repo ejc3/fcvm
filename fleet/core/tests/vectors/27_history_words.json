@@ -119,7 +119,8 @@
     "actions": [
       {
         "args": {
-          "text": "hello"
+          "text": "hello",
+          "text_style": "lockup"
         },
         "at": 70000,
         "id": "w1",

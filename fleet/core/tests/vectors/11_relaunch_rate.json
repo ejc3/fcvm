@@ -176,9 +176,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "tile": "slot-2"
-        },
+        "args": {},
         "at": 2000,
         "id": "r2",
         "name": "relaunch",
@@ -198,9 +196,7 @@
         "viewer": "v3"
       },
       {
-        "args": {
-          "tile": "slot-1"
-        },
+        "args": {},
         "at": 2300,
         "id": "r4",
         "name": "relaunch",
@@ -220,9 +216,7 @@
         "viewer": "v4"
       },
       {
-        "args": {
-          "tile": "fcvm:9"
-        },
+        "args": {},
         "at": 3100,
         "id": "r6",
         "name": "relaunch",

@@ -155,14 +155,12 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "secs": 10
-        },
+        "args": {},
         "at": 50500,
         "id": "sa",
-        "name": "set_auto_relaunch",
+        "name": "unknown",
         "outcome": "refused",
-        "summary": "unknown intent \"set_auto_relaunch\"",
+        "summary": "unknown intent",
         "viewer": "v2"
       }
     ],
