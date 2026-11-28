@@ -1246,9 +1246,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "slot": "mc-3"
-        },
+        "args": {},
         "at": 3500,
         "id": "r2",
         "name": "minecraft_reset",
@@ -1266,9 +1264,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "slot": "mc-9"
-        },
+        "args": {},
         "at": 3700,
         "id": "r4",
         "name": "minecraft_reset",
@@ -1277,10 +1273,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "all": true,
-          "slot": "mc-3"
-        },
+        "args": {},
         "at": 3800,
         "id": "r4b",
         "name": "minecraft_reset",
@@ -1289,12 +1282,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "keys": [
-            "forward"
-          ],
-          "slot": "mc-3"
-        },
+        "args": {},
         "at": 3850,
         "id": "r4c",
         "name": "minecraft_reset",
@@ -1303,9 +1291,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "all": "yes"
-        },
+        "args": {},
         "at": 3900,
         "id": "r4d",
         "name": "minecraft_reset",
@@ -1314,9 +1300,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "slot": 2
-        },
+        "args": {},
         "at": 3950,
         "id": "r4e",
         "name": "minecraft_reset",
@@ -1325,10 +1309,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "into": "mc-3",
-          "slot": "mc-1"
-        },
+        "args": {},
         "at": 6500,
         "id": "f0",
         "name": "minecraft_fork",
@@ -1357,9 +1338,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "slot": "mc-3"
-        },
+        "args": {},
         "at": 8000,
         "id": "f2",
         "name": "minecraft_fork",
@@ -1368,9 +1347,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "slot": "mc-2"
-        },
+        "args": {},
         "at": 8000,
         "id": "f3",
         "name": "minecraft_fork",
@@ -1379,9 +1356,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "slot": "mc-9"
-        },
+        "args": {},
         "at": 8100,
         "id": "f4",
         "name": "minecraft_fork",
@@ -1390,9 +1365,7 @@
         "viewer": "v3"
       },
       {
-        "args": {
-          "slot": "mc-4"
-        },
+        "args": {},
         "at": 10500,
         "id": "f5",
         "name": "minecraft_fork",
@@ -1434,10 +1407,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "slot": "mc-3",
-          "viewer": "v3"
-        },
+        "args": {},
         "at": 13050,
         "id": "c1b",
         "name": "claim_minecraft",
@@ -1455,9 +1425,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "slot": "mc-2"
-        },
+        "args": {},
         "at": 13200,
         "id": "r6",
         "name": "minecraft_reset",
@@ -1477,9 +1445,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "slot": "mc-3"
-        },
+        "args": {},
         "at": 17100,
         "id": "c3",
         "name": "claim_minecraft",
@@ -1488,9 +1454,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "slot": "mc-2"
-        },
+        "args": {},
         "at": 17200,
         "id": "c3b",
         "name": "claim_minecraft",
@@ -1528,9 +1492,7 @@
         "viewer": "v3"
       },
       {
-        "args": {
-          "all": true
-        },
+        "args": {},
         "at": 20000,
         "id": "r8",
         "name": "minecraft_reset",
@@ -1539,9 +1501,7 @@
         "viewer": "v3"
       },
       {
-        "args": {
-          "claim": "minecraft-claim-1"
-        },
+        "args": {},
         "at": 20100,
         "id": "x0",
         "name": "release_minecraft",
@@ -1550,10 +1510,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "claim": "minecraft-claim-2",
-          "now": true
-        },
+        "args": {},
         "at": 20200,
         "id": "x0b",
         "name": "release_minecraft",
@@ -1600,9 +1557,7 @@
         "viewer": "v3"
       },
       {
-        "args": {
-          "slot": "mc-4"
-        },
+        "args": {},
         "at": 47200,
         "id": "c8",
         "name": "claim_minecraft",
@@ -1611,9 +1566,7 @@
         "viewer": "v4"
       },
       {
-        "args": {
-          "slot": "mc-4"
-        },
+        "args": {},
         "at": 47300,
         "id": "r9",
         "name": "minecraft_reset",

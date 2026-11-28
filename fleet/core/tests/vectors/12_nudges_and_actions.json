@@ -156,9 +156,7 @@
         "viewer": "v3"
       },
       {
-        "args": {
-          "target": "nowhere"
-        },
+        "args": {},
         "at": 1300,
         "id": "n4",
         "name": "nudge",

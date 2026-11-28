@@ -161,28 +161,21 @@
   "final_view": {
     "actions": [
       {
-        "args": {
-          "drag": {
-            "pitch_deg": 0,
-            "yaw_deg": 5
-          }
-        },
+        "args": {},
         "at": 34010,
         "id": "c1",
-        "name": "camera",
+        "name": "unknown",
         "outcome": "refused",
-        "summary": "unknown intent \"camera\"",
+        "summary": "unknown intent",
         "viewer": "v1"
       },
       {
-        "args": {
-          "v": 0.5
-        },
+        "args": {},
         "at": 34020,
         "id": "t1",
-        "name": "time_of_day",
+        "name": "unknown",
         "outcome": "refused",
-        "summary": "unknown intent \"time_of_day\"",
+        "summary": "unknown intent",
         "viewer": "v1"
       }
     ],

@@ -244,6 +244,9 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             let pages_args = match &parsed {
                 Ok(Intent::RendersOverlay { text }) => Some(serde_json::json!({"text": text})),
                 Ok(Intent::RendersTransform { name }) => Some(serde_json::json!({"name": name})),
+                Ok(Intent::Word { text, text_style }) => {
+                    Some(serde_json::json!({"text": text, "text_style": text_style}))
+                }
                 _ => None,
             };
             let result =
@@ -256,29 +259,47 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     (Outcome::Refused, Some(reason.clone()), reason)
                 }
             };
-            // A refused word's text is never shown: its args are left out and the summary is
-            // the reason only. Args that are not an object (refused, `args must be an
-            // object`) are shown as `{}` too: an intent's args are an object on the wire, and
-            // a page keeps nothing else.
-            // A claim's and a resume's args are the claim's token, which only its viewer may
+            // An action shows what was parsed and committed, never what was sent: a refused
+            // intent shows `{}` (its text may be unchecked, and its summary is the reason
+            // only), a committed one only the keys its name reads (a word and a pages intent
+            // their parsed text), and a name that is not an intent shows as `unknown`. A
+            // claim's and a resume's args are the claim's token, which only its viewer may
             // hold.
-            // A pages intent (`renders_*`) shows what was parsed and committed and nothing
-            // else: a refused one shows `{}`, whatever it was refused for, and a committed
-            // one its text as kept or its transform's name. Its args as sent can hold text
-            // nobody checked (a transform's name that is none, a key beside `text`).
-            let shown_args = if name.starts_with("renders_") {
-                match outcome {
-                    Outcome::Committed => pages_args.unwrap_or_else(|| serde_json::json!({})),
-                    _ => serde_json::json!({}),
+            let known = Intent::arg_keys(name);
+            let shown_args = match (known, outcome, args.as_object()) {
+                _ if name == "resume_claim" || name == "claim_gpu" => serde_json::json!({}),
+                (Some(_), Outcome::Committed, _) if pages_args.is_some() => {
+                    pages_args.unwrap_or_default()
                 }
-            } else if (name == "word" && outcome == Outcome::Refused)
-                || name == "resume_claim"
-                || name == "claim_gpu"
-                || !args.is_object()
-            {
-                serde_json::json!({})
+                (Some(keys), Outcome::Committed, Some(o)) => {
+                    let mut shown = serde_json::Map::new();
+                    for k in keys {
+                        match o.get(*k) {
+                            // A drag is shown as its three numbers, nothing beside them.
+                            Some(d) if *k == "drag" && d.is_object() => {
+                                let mut drag = serde_json::Map::new();
+                                for n in ["yaw_deg", "pitch_deg", "dive"] {
+                                    if let Some(v) = d.get(n) {
+                                        drag.insert(n.into(), v.clone());
+                                    }
+                                }
+                                shown.insert((*k).into(), drag.into());
+                            }
+                            Some(v) => {
+                                shown.insert((*k).into(), v.clone());
+                            }
+                            None => {}
+                        }
+                    }
+                    shown.into()
+                }
+                _ => serde_json::json!({}),
+            };
+            // A name that is not an intent is shown as `unknown`, with a fixed summary.
+            let (shown_name, summary) = if known.is_some() {
+                (name.clone(), summary)
             } else {
-                args.clone()
+                ("unknown".to_string(), "unknown intent".to_string())
             };
             push_action(
                 &mut state.fleet,
@@ -286,7 +307,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     at,
                     viewer: viewer.clone(),
                     id: id.clone(),
-                    name: name.clone(),
+                    name: shown_name,
                     args: shown_args,
                     summary,
                     outcome,

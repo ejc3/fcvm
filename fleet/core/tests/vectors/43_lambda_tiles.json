@@ -323,9 +323,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "tile": "lambda:1"
-        },
+        "args": {},
         "at": 16000,
         "id": "rl",
         "name": "relaunch",

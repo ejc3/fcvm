@@ -366,6 +366,33 @@ pub fn normalise_word(text: &str) -> Result<String, String> {
 }
 
 impl Intent {
+    /// The keys an intent of this name reads from its args, or `None` for a name that is
+    /// not an intent. The recent-actions list shows only these, and only for a committed
+    /// intent.
+    pub fn arg_keys(name: &str) -> Option<&'static [&'static str]> {
+        Some(match name {
+            "restart_now" | "wake" | "claim_gpu" | "potato_faster" | "potato_restart"
+            | "renders_clear" => &[],
+            "relaunch" => &["tile"],
+            "nudge" => &["target"],
+            "word" => &["text", "text_style"],
+            "light" => &["pos", "color"],
+            "resume_claim" => &["token"],
+            "release_gpu" | "release_phone" | "release_windows" | "release_minecraft" => &["claim"],
+            "claim_camera" => &["drag"],
+            "claim_autopilot" => &["on"],
+            "claim_phone" => &["phone"],
+            "renders_overlay" => &["text"],
+            "renders_transform" => &["name"],
+            "phones_zoom" => &["out"],
+            "phone_action" => &["action", "claim", "x", "y"],
+            "windows_reset" | "minecraft_reset" => &["slot", "all"],
+            "claim_windows" | "claim_minecraft" | "minecraft_fork" => &["slot"],
+            "windows_action" => &["action", "claim"],
+            _ => return None,
+        })
+    }
+
     pub fn parse(name: &str, args: &serde_json::Value) -> Result<Intent, String> {
         match name {
             "relaunch" => {

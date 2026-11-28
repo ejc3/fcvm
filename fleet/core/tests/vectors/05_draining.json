@@ -171,9 +171,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "tile": "slot-1"
-        },
+        "args": {},
         "at": 4500,
         "id": "r1",
         "name": "relaunch",

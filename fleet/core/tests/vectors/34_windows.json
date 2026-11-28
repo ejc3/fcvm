@@ -865,9 +865,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "slot": "win-3"
-        },
+        "args": {},
         "at": 3500,
         "id": "r2",
         "name": "windows_reset",
@@ -885,9 +883,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "slot": "win-9"
-        },
+        "args": {},
         "at": 3700,
         "id": "r4",
         "name": "windows_reset",
@@ -896,10 +892,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "all": true,
-          "slot": "win-3"
-        },
+        "args": {},
         "at": 3800,
         "id": "r4b",
         "name": "windows_reset",
@@ -930,9 +923,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "action": "cmd.exe /c calc"
-        },
+        "args": {},
         "at": 9100,
         "id": "a2",
         "name": "windows_action",
@@ -941,11 +932,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "action": "notepad",
-          "text": "hello",
-          "x": 0.5
-        },
+        "args": {},
         "at": 9200,
         "id": "a2b",
         "name": "windows_action",
@@ -954,9 +941,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "action": "about"
-        },
+        "args": {},
         "at": 9500,
         "id": "a3",
         "name": "windows_action",
@@ -965,9 +950,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "action": "terminal"
-        },
+        "args": {},
         "at": 10500,
         "id": "a4",
         "name": "windows_action",
@@ -976,9 +959,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "action": "notepad"
-        },
+        "args": {},
         "at": 10600,
         "id": "a5",
         "name": "windows_action",
@@ -996,9 +977,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "slot": "win-2"
-        },
+        "args": {},
         "at": 10800,
         "id": "r5",
         "name": "windows_reset",
@@ -1018,9 +997,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "all": true
-        },
+        "args": {},
         "at": 15000,
         "id": "r7",
         "name": "windows_reset",
@@ -1050,9 +1027,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "slot": "win-2"
-        },
+        "args": {},
         "at": 42000,
         "id": "c4",
         "name": "claim_windows",

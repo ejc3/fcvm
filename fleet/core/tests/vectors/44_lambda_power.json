@@ -561,9 +561,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "tile": "lam-1"
-        },
+        "args": {},
         "at": 3721000,
         "id": "rl",
         "name": "relaunch",

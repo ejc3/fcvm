@@ -643,8 +643,10 @@ pub struct Action {
     pub viewer: String,
     /// The intent's client id.
     pub id: String,
+    /// The intent's name, or `unknown` for a name that is not an intent.
     pub name: String,
-    /// The intent's args, except a refused word's and any that are not an object (`{}`).
+    /// A committed intent's own args (its keys in `Intent::arg_keys`, a word's text as parsed);
+    /// `{}` for a refused intent, an unknown name and a claim's token.
     pub args: serde_json::Value,
     pub summary: String,
     pub outcome: Outcome,

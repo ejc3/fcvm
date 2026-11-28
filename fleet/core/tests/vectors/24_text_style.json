@@ -234,7 +234,8 @@
     "actions": [
       {
         "args": {
-          "text": "one"
+          "text": "one",
+          "text_style": "lockup"
         },
         "at": 2000,
         "id": "s1",

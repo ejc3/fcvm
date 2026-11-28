@@ -574,9 +574,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "action": "rm -rf /"
-        },
+        "args": {},
         "at": 6200,
         "id": "c3",
         "name": "phone_action",
@@ -585,9 +583,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "action": "dance"
-        },
+        "args": {},
         "at": 6500,
         "id": "c4",
         "name": "phone_action",
@@ -596,9 +592,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "action": "wave"
-        },
+        "args": {},
         "at": 7000,
         "id": "c5",
         "name": "phone_action",
@@ -657,9 +651,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "out": false
-        },
+        "args": {},
         "at": 54000,
         "id": "z2",
         "name": "phones_zoom",
@@ -690,9 +682,7 @@
         "viewer": "v3"
       },
       {
-        "args": {
-          "out": "yes"
-        },
+        "args": {},
         "at": 55000,
         "id": "z5",
         "name": "phones_zoom",
@@ -710,9 +700,7 @@
         "viewer": "v3"
       },
       {
-        "args": {
-          "claim": "phone-claim-9"
-        },
+        "args": {},
         "at": 57000,
         "id": "r2",
         "name": "release_phone",

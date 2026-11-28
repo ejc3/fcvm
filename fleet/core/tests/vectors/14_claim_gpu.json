@@ -357,12 +357,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "drag": {
-            "pitch_deg": 0,
-            "yaw_deg": 20
-          }
-        },
+        "args": {},
         "at": 10100,
         "id": "s2",
         "name": "claim_camera",
@@ -389,9 +384,7 @@
         "viewer": "v2"
       },
       {
-        "args": {
-          "claim": "claim-9"
-        },
+        "args": {},
         "at": 40500,
         "id": "rel",
         "name": "release_gpu",
