@@ -644,7 +644,7 @@ description = "Nested virtualization support for running VMs inside VMs"
 guest_kvm = true
 kernel_version = "7.3.6"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "ea5aac40a809"
+kernel_sha = "e0fef7e83c89"
 kernel_artifact_sha256 = "6a0a3e0cbe7623593fbc62c3c51ba82ab72761c91a873b180a86652627201a1f"
 
 # Build configuration - these files determine when kernel needs rebuilding
