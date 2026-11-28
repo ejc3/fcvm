@@ -172,14 +172,27 @@ tcp-reset` in both chains and both families (`TCP_NEW_FLOW_REJECT`).
    TCP that packet is a SYN without ACK, with one exception the rule passes:
    the ACK that completes a handshake the listener answered with a SYN cookie
    (#2123). The restore covers it, below.
-3. **The restored clone's UDP rule is the exception, and only on the restore
-   side** (`udp_ingress_rule_args`): UDP has no packet that begins a flow. Its
-   doc says what it promises and what it does not.
+3. **UDP has no packet that begins a flow, so the restored clone's UDP gate keeps
+   its own record instead of asking the tracker** (#2112). It is an nf_tables
+   table of its own (`fcvm_snapshot_udp`, both families, `crate::nftables`
+   `UDP_GATE_*`), added over nfnetlink on the restore side only and deleted with
+   the ingress half. A rule on the output hook adds `(peer address, peer port,
+   local port)` of each datagram the guest sends to a set (120 s, 8192 entries),
+   and the input hook drops a UDP datagram whose peer is not in it. Replies
+   pass, and loopback passes. The rule it replaced,
+   `-m conntrack --ctdir ORIGINAL`, attached the tracker for the whole restore
+   and left entries. The doc of `IptablesGate::install_udp_gate` says what the
+   gate promises and what it does not: a reply to a datagram the guest sent
+   before the snapshot is dropped, and a refused datagram is dropped without an
+   ICMP unreachable (the guest kernel has no nf_tables reject expression).
 
 **Enforcement:** `a_syn_is_refused_whatever_the_tracker_holds_for_its_tuple`,
-`a_segment_of_an_open_connection_passes_untracked` and
-`no_rule_the_snapshot_side_installs_uses_connection_tracking` run a packet model
+`a_segment_of_an_open_connection_passes_untracked` run a packet model
 over the chains `gate_chain_rules` builds.
+`no_rule_the_snapshot_side_or_the_restore_installs_uses_connection_tracking`
+covers the chains `close()` installs and the restore's UDP gate, and
+`the_udp_gate_refuses_a_peer_the_guest_has_not_sent_to_and_passes_replies` runs
+the UDP gate's rules over a peer set.
 `a_stale_tracked_tuple_does_not_pass_a_restored_clones_closed_gate` and
 `a_snapshot_leaves_the_sources_tracked_connections_as_it_found_them`
 (`tests/test_snapshot_gate_tcp.rs`) hold both in a routed VM.
@@ -491,7 +504,7 @@ already runs with the address in its environment, which a restore cannot change,
 (`two_host_identities_share_the_pre_start_snapshot_and_not_the_startup_one`).
 `the_host_identity_is_replaced_before_egress_opens_and_before_the_hook` pins the order.
 
-A restored clone's published UDP ports are closed by the host. The guest adds its UDP rule only
+A restored clone's published UDP ports are closed by the host. The guest adds its UDP gate only
 once it runs, while pasta `-u` and the bridged UDP DNAT rules are live before the resume, and a
 client sending from before the resume had 13 and 18 datagrams delivered before the restore hook
 ran. From before the clone's TAP can carry a frame until the guest acknowledges its restore
@@ -524,15 +537,15 @@ for its length, because a normal grace period behind the arm64 guest's 100 Hz
 tick was the largest step of a restore: `tcp_barrier_ms` median 30 to 41, 37 to
 46 and 57 to 66 ms at 2, 4 and 8 vCPUs on m8g.metal-24xl, and 0.1 to 0.2 ms
 expedited.
-A restored clone also verifies its gate and adds its UDP rule over that socket,
-not with iptables. At boot fc-agent learns what iptables-nft writes for the gate
-(`GateTemplate`): in a network namespace of its own it runs the same
-iptables-restore input `close()` uses, reads the rules back, and keeps them only
-if a UDP rule inserted over nfnetlink then reads back in `iptables -S` exactly as
-iptables writes it. With the template, verification (`tcp_verify_ms`) went from
-5.6 to 7.6 ms to 0.3 to 0.8 ms and the UDP rule from 1.8 to 4.0 ms to 0.2 to
-0.5 ms at 2, 4 and 8 vCPUs on m8g.metal-24xl; without one, both use iptables as
-before (`tcp_gate_netlink` in the ACK says which).
+A restored clone also verifies its gate over that socket, not with iptables. At
+boot fc-agent learns what iptables-nft writes for the gate (`GateTemplate`): in a
+network namespace of its own it runs the same iptables-restore input `close()`
+uses and reads the rules back. With the template, verification (`tcp_verify_ms`)
+went from 5.6 to 7.6 ms to 0.3 to 0.8 ms at 2, 4 and 8 vCPUs on m8g.metal-24xl;
+without one it uses iptables as before (`tcp_gate_netlink` in the ACK says
+which). The UDP gate (above) is added over the same socket with no template and
+no process: one commit for both families, in `udp_ipv4_ms` (the iptables UDP
+rule it replaced took 0.2 to 0.5 ms with the template and 1.8 to 4.0 ms without).
 `the_gate_socket_is_kept_and_never_released`,
 `frames_are_sent_through_the_socket_that_is_never_released`,
 `a_verified_restore_gates_udp_without_starting_a_process`,

@@ -97,7 +97,7 @@ host's (`Cfg.udpReach`), which the model assumes and does not hold. -/
 def clientDatagram (s : State) : Bool := s.udpIn
 
 /-- Not a property: a datagram on a flow the guest itself began reached a clone that had not
-published. The UDP rule passes it by design, as a reply (`udp_ingress_rule_args`). -/
+published. The UDP gate passes it by design, as a reply (`UdpGateRule::PassKnownPeer`). -/
 def replyDatagram (s : State) : Bool := s.udpLate
 
 /-- The property holds in the state a run ends in. A run that is not possible proves nothing. -/

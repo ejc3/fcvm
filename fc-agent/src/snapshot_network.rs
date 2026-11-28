@@ -1041,9 +1041,9 @@ trait FirewallGate {
     /// or only INPUT after `open_egress()`.
     async fn open(&self) -> Result<()>;
     /// Restore side only: also refuse client-direction UDP while ingress is
-    /// gated (`udp_ingress_rule_args`). The snapshot side never calls this: a
-    /// snapshot must not disturb the VM it is taken from, and this rule would
-    /// answer a live client's datagram with an ICMP unreachable.
+    /// gated (`crate::nftables::UDP_GATE_TABLE`, see `IptablesGate::install_udp_gate`). The
+    /// snapshot side never calls this: a snapshot must not disturb the VM it
+    /// is taken from, and this gate would drop a live client's datagram.
     async fn gate_udp_ingress(&self) -> Result<()>;
     /// Restore side only: stop the guest's listeners completing a handshake from a SYN
     /// cookie, until `open()` publishes the clone and puts the setting back.
@@ -1337,39 +1337,19 @@ struct IptablesGate<R, N: NetfilterOpener = SystemNetfilter> {
     /// What each gate operation of this transaction cost.
     timings: std::sync::Mutex<GateTimings>,
     /// What iptables writes for the gate, learned at boot (`GateTemplate`).
-    /// With it the restore verifies the gate and inserts the UDP rule over
-    /// nfnetlink; without it, with iptables.
+    /// With it the restore verifies the gate over nfnetlink; without it, with
+    /// iptables.
     template: Option<std::sync::Arc<GateTemplate>>,
     /// The kernel's SYN cookie setting, for `refuse_syn_cookies`. None leaves it alone.
     syn_cookies: Option<std::path::PathBuf>,
     /// What the setting held before `refuse_syn_cookies` wrote 0, for `open()` to put
     /// back. Guards the value only, never held across an await.
     syn_cookies_before: std::sync::Mutex<Option<String>>,
+    /// Whether `gate_udp_ingress` installed the UDP gate's table, which the
+    /// ingress half's removal then deletes in the same commit. A source's gate
+    /// has none and its removal touches no such table.
+    udp_gated: std::sync::atomic::AtomicBool,
 }
-
-/// Whether `dump`, `iptables -S` in the scratch namespace after the UDP rule
-/// was inserted over nfnetlink, shows the INPUT gate chain as the gate's rules
-/// with `udp_ingress_rule_args` third.
-fn scratch_rendering_matches(dump: &str, loopback_network: &str) -> bool {
-    let mut expected = gate_chain_rules("-s", loopback_network);
-    expected.insert(
-        2,
-        udp_ingress_rule_args(loopback_network)
-            .map(str::to_string)
-            .to_vec(),
-    );
-    parse_gate_state(dump).input_rules.is_some_and(|rules| {
-        rules.len() == expected.len()
-            && rules
-                .iter()
-                .zip(&expected)
-                .all(|(observed, wanted)| sorted_tokens(observed) == sorted_tokens(wanted))
-    })
-}
-
-/// The chain that holds the UDP rule while the template is learned. It exists
-/// only in the scratch namespace.
-const TEMPLATE_UDP_CHAIN: &str = "FCVM_SNAPSHOT_UDP";
 
 /// The template, once boot has learned it; `None` inside when learning failed.
 static GATE_TEMPLATE: std::sync::OnceLock<Option<std::sync::Arc<GateTemplate>>> =
@@ -1382,7 +1362,7 @@ fn gate_template() -> Option<std::sync::Arc<GateTemplate>> {
 
 /// Learn the gate template on a thread of its own, without holding up boot. A
 /// restore that runs before it is learned, or after learning failed, verifies
-/// the gate and adds the UDP rule with iptables, as before.
+/// the gate with iptables, as before.
 pub fn learn_gate_template_in_background() {
     let spawned = std::thread::Builder::new()
         .name("gate-template".into())
@@ -1412,13 +1392,11 @@ pub fn learn_gate_template_in_background() {
     }
 }
 
-/// Install the gate's chains, and the UDP rule in a chain of its own, with
-/// iptables-restore in a new network namespace, read back what nf_tables holds,
-/// and check that the UDP rule inserted over nfnetlink renders in `iptables -S`
-/// exactly as `udp_ingress_rule_args` writes it. Runs on the calling thread,
-/// whose network namespace it replaces: call it only from a thread of its own.
+/// Install the gate's chains with iptables-restore in a new network namespace
+/// and read back what nf_tables holds. Runs on the calling thread, whose
+/// network namespace it replaces: call it only from a thread of its own.
 fn learn_gate_template_in_scratch_namespace() -> Result<GateTemplate> {
-    use crate::nftables::{commit, generation, insertion_batch, read_rules, Commit, Insertion};
+    use crate::nftables::read_rules;
 
     // SAFETY: unshare(2) takes plain flags. It moves this thread alone into a
     // new network namespace, and the processes it starts inherit it.
@@ -1456,17 +1434,7 @@ fn learn_gate_template_in_scratch_namespace() -> Result<GateTemplate> {
         (Family::Ipv4, "iptables", IPV4_LOOPBACK),
         (Family::Ipv6, "ip6tables", IPV6_LOOPBACK),
     ] {
-        let mut input = gate_chains_restore_input(network);
-        let commit_line = input
-            .rfind("COMMIT\n")
-            .context("restore input has no COMMIT")?;
-        input.insert_str(
-            commit_line,
-            &format!(
-                ":{TEMPLATE_UDP_CHAIN} - [0:0]\n-A {TEMPLATE_UDP_CHAIN} {}\n",
-                udp_ingress_rule_args(network).join(" ")
-            ),
-        );
+        let input = gate_chains_restore_input(network);
         run(
             &format!("{program}-restore"),
             &["-w", "--noflush"],
@@ -1477,41 +1445,17 @@ fn learn_gate_template_in_scratch_namespace() -> Result<GateTemplate> {
         };
         let ingress = read_rules(&mut channel, family, GATE_INPUT_CHAIN)?;
         let egress = read_rules(&mut channel, family, GATE_OUTPUT_CHAIN)?;
-        let mut udp = read_rules(&mut channel, family, TEMPLATE_UDP_CHAIN)?;
         anyhow::ensure!(
             ingress.len() == gate_chain_rules("-s", network).len()
-                && egress.len() == gate_chain_rules("-d", network).len()
-                && udp.len() == 1,
-            "{} holds {} ingress, {} egress and {} UDP rules",
+                && egress.len() == gate_chain_rules("-d", network).len(),
+            "{} holds {} ingress and {} egress rules",
             family.name(),
             ingress.len(),
-            egress.len(),
-            udp.len()
-        );
-        let udp = udp.remove(0).body;
-        let generation = generation(&mut channel)?;
-        let (batch, _, end) = insertion_batch(
-            &[Insertion {
-                family,
-                chain: GATE_INPUT_CHAIN,
-                before: ingress[2].handle,
-                body: &udp,
-            }],
-            generation,
-        );
-        anyhow::ensure!(
-            commit(&mut channel, &batch, end)? == Commit::Committed,
-            "the scratch ruleset moved under the UDP rule"
-        );
-        let dump = run(program, &["-w", "-S"], None)?;
-        anyhow::ensure!(
-            scratch_rendering_matches(&dump, network),
-            "{program} renders the UDP rule inserted over nfnetlink differently:\n{dump}"
+            egress.len()
         );
         families.push(FamilyTemplate {
             input: bodies(ingress),
             output: bodies(egress),
-            udp,
         });
     }
     let ipv6 = families.pop().context("no ip6 template")?;
@@ -1522,8 +1466,7 @@ fn learn_gate_template_in_scratch_namespace() -> Result<GateTemplate> {
 }
 
 /// What iptables-nft writes in nf_tables for the gate, per family: the rules of
-/// each gate chain and the restored clone's UDP rule, as the kernel encoded
-/// them. Learned once at boot, in a network namespace of its own, by running
+/// each gate chain, as the kernel encoded them. Learned once at boot, in a network namespace of its own, by running
 /// the same iptables-restore input `close()` uses
 /// (`learn_gate_template_in_scratch_namespace`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1536,7 +1479,6 @@ pub(crate) struct GateTemplate {
 struct FamilyTemplate {
     input: Vec<crate::nftables::RuleBody>,
     output: Vec<crate::nftables::RuleBody>,
-    udp: crate::nftables::RuleBody,
 }
 
 /// Lends out the netlink socket nf_tables batches are sent on.
@@ -1588,14 +1530,14 @@ impl NetfilterOpener for SystemNetfilter {
 /// Milliseconds each gate operation of one restore took, carried into the
 /// restore ACK's phase record so a regression in any one of them is visible
 /// per restore. With the boot-time template (`netlink`), verification is a
-/// read of the gate's rules per family and the UDP rule one commit for both
-/// families; without it, both are process spawns per family. Each removal is
-/// a read of the rule handles and one commit for both families.
+/// read of the gate's rules per family; without it, a process spawn per
+/// family. The UDP gate is one commit for both families either way. Each
+/// removal is a read of the rule handles and one commit for both families.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct GateTimings {
-    /// Verification and the UDP rule went over nfnetlink with the boot-time
-    /// template, not through iptables. The UDP rule is then one commit for
-    /// both families, timed in `udp_ipv4_ms`.
+    /// Verification went over nfnetlink with the boot-time template, not
+    /// through iptables. The UDP gate is one commit for both families, timed
+    /// in `udp_ipv4_ms`.
     pub netlink: bool,
     pub verify_ipv4_ms: f64,
     pub verify_ipv6_ms: f64,
@@ -1623,6 +1565,7 @@ impl<R, N: NetfilterOpener> IptablesGate<R, N> {
             template: None,
             syn_cookies: None,
             syn_cookies_before: std::sync::Mutex::new(None),
+            udp_gated: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1754,9 +1697,10 @@ const IPV6_LOOPBACK: &str = "::1/128";
 ///
 /// These are the rules both the snapshot side and the restore side carry, and
 /// what verification expects. UDP ingress is not among them: a restored clone
-/// adds its own UDP rejection to INPUT with `gate_udp_ingress` (see there), which
-/// the snapshot side must not install, because it would answer a live client's
-/// datagram on the source VM with an ICMP unreachable during the cookie dump.
+/// adds its own UDP gate, in a table of its own, with `gate_udp_ingress` (see
+/// `IptablesGate::install_udp_gate`), which the snapshot side must not install,
+/// because it would drop a live client's datagram on the source VM during the
+/// cookie dump.
 ///
 /// OUTPUT also rejects the guest's own NTP requests (UDP to port 123). chronyd
 /// steps the clock at any update (`makestep 1 -1`), and a restored clone is
@@ -1842,8 +1786,8 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<Stri
 /// Matching the flags closes both, and nothing in these chains uses connection
 /// tracking any more, so closing the gate no longer attaches it: a snapshot
 /// leaves the source's tracking table as it found it. The restored clone's UDP
-/// rule (`udp_ingress_rule_args`) is the one that still does, on the restore
-/// side only.
+/// gate keeps its own record of peers and attaches none either
+/// (`IptablesGate::install_udp_gate`).
 ///
 /// The reject stays a TCP reset in both directions. On ingress a client must
 /// see a definitive refusal at once, not a SYN that times out; on egress it is
@@ -1903,53 +1847,6 @@ fn port_unreachable(loopback_network: &str) -> &'static str {
     } else {
         "icmp-port-unreachable"
     }
-}
-
-/// The restored clone's UDP rejection, inserted into the INPUT gate chain below
-/// the two loopback exemptions: a published UDP port reaches the workload
-/// through the port forwarders like a TCP one, and a client's datagram while
-/// ingress is gated would read or change state the restore hook is about to
-/// repair. The match is the flow's direction, not the conntrack state, because
-/// a client that exchanged traffic before the snapshot inherits an ESTABLISHED
-/// entry in the restored guest and a NEW-only rule would pass it. Replies to
-/// the guest's own outbound UDP are reply-direction and pass; OUTPUT gates no
-/// UDP but NTP (`gate_chain_rules`), so DNS works throughout. Removed with the
-/// chain when ingress opens.
-///
-/// What this does and does not promise. UDP has no segment that begins a flow,
-/// so unlike the TCP rule (`TCP_NEW_FLOW_REJECT`) this one cannot be read off
-/// the packet, and it is the one rule of the gate that needs connection
-/// tracking:
-///
-/// - Refused until publication: a datagram that begins a flow from outside,
-///   and a datagram on a flow a client began, however long ago, because a
-///   stale entry for that flow still has the client as its origin.
-/// - Passed: a datagram from an address and port the guest itself sent to from
-///   that local port within the tracker's timeout (30 s, or 120 s once both
-///   sides have sent), measured in guest run time, so an exchange shortly
-///   before the snapshot counts. That is what a reply is, and the rule cannot
-///   tell a late reply from a peer speaking again.
-/// - Not gated at all, on either side: ICMP and every protocol other than TCP
-///   and UDP. The boundary's claim is about TCP sockets (the cookie manifest
-///   holds nothing else), plus this rule and the NTP one for UDP.
-///
-/// Because it uses tracking, the tracker is attached in a restored clone from
-/// this rule's insertion until the ingress chain is removed, and connections
-/// open at that moment keep their entries. The snapshot side has no such rule.
-fn udp_ingress_rule_args(loopback_network: &str) -> [&'static str; 10] {
-    let unreachable = port_unreachable(loopback_network);
-    [
-        "-p",
-        "udp",
-        "-m",
-        "conntrack",
-        "--ctdir",
-        "ORIGINAL",
-        "-j",
-        "REJECT",
-        "--reject-with",
-        unreachable,
-    ]
 }
 
 /// The one rule that routes a built-in chain into a gate chain, as `-S`
@@ -2193,50 +2090,68 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
         Ok(closed)
     }
 
-    /// The UDP rule over nfnetlink: the template's rule, ahead of the third
-    /// rule of the INPUT gate chain in both families, in one commit pinned to
-    /// the generation the handles were read under.
-    fn gate_udp_over_netlink(&self, template: &GateTemplate) -> Result<()> {
-        use crate::nftables::{commit, generation, insertion_batch, read_rules, Commit, Insertion};
-        const ATTEMPTS: usize = 8;
+    /// The restored clone's UDP gate, in a table of its own
+    /// (`crate::nftables::UDP_GATE_TABLE`, both families, installed over nfnetlink
+    /// by `gate_udp_ingress` and deleted whole with the ingress half). A published
+    /// UDP port reaches the workload through the port forwarders like a TCP one,
+    /// and a client's datagram while ingress is gated would read or change state
+    /// the restore hook is about to repair.
+    ///
+    /// UDP has no packet that begins a flow, so the TCP rule's way
+    /// (`TCP_NEW_FLOW_REJECT`, read off the packet) is not open to it, and the
+    /// gate keeps its own record in place of connection tracking: a rule on the
+    /// output hook adds the peer of each datagram the guest sends to a set, and
+    /// the input hook drops a datagram from a peer that is not in it. The set holds
+    /// `(peer address, peer port, local port)` for 120 s after the guest's last
+    /// datagram to the peer, counted in guest run time, and at most 8192 peers.
+    /// Nothing in the gate attaches connection tracking to the guest, so a restore
+    /// leaves its tracking table as it found it.
+    ///
+    /// What this does and does not promise:
+    ///
+    /// - Dropped until publication: a datagram from a peer the guest has not sent
+    ///   to since the restore began, from a different port of that peer, or to a
+    ///   different local port than the guest sent from. Tracked state from before
+    ///   the snapshot is not carried over: a reply to a datagram the guest sent
+    ///   before the snapshot is dropped, and its sender retries. A client that
+    ///   exchanged traffic before the snapshot is no more admitted than a new one.
+    /// - Passed: a datagram from the address and port the guest sent to, to the
+    ///   port it sent from, within the set's timeout. That is what a reply is, and
+    ///   the gate cannot tell a late reply from a peer speaking again. Replies to
+    ///   the guest's own outbound UDP pass, and OUTPUT gates no UDP but NTP
+    ///   (`gate_chain_rules`), so DNS works throughout. Datagrams on `lo` or from a
+    ///   loopback address pass.
+    /// - Dropped, where the old rule answered with ICMP port unreachable: the gate
+    ///   is in nf_tables' own table and the guest kernel has no reject expression
+    ///   there, so a refused datagram is lost and its sender sees no error.
+    /// - Not gated at all, on either side: ICMP and every protocol other than TCP
+    ///   and UDP. The boundary's claim is about TCP sockets (the cookie manifest
+    ///   holds nothing else), plus this gate and the NTP rule for UDP.
+    ///
+    /// It was an iptables rule, `-m conntrack --ctdir ORIGINAL`, until #2112. That
+    /// rule attached connection tracking for the length of the restore, and a
+    /// connection open when the ingress chain went kept its entry for the 5 days an
+    /// established flow may idle, in every later snapshot of the guest.
+    ///
+    /// Over nfnetlink: its table in both families, in one commit. The batch reads
+    /// nothing, so it is pinned to no generation.
+    fn install_udp_gate(&self) -> Result<()> {
+        use crate::nftables::{commit, udp_gate_install_batch, Commit};
         let started = std::time::Instant::now();
         let mut channel = self.netfilter.take()?;
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let generation = generation(&mut channel)?;
-            let mut insertions = Vec::new();
-            for family in Family::BOTH {
-                let rules = read_rules(&mut channel, family, GATE_INPUT_CHAIN)?;
-                let before = rules.get(2).with_context(|| {
-                    format!(
-                        "the {} {GATE_INPUT_CHAIN} chain holds {} rules, too few for the UDP rule",
-                        family.name(),
-                        rules.len()
-                    )
-                })?;
-                insertions.push(Insertion {
-                    family,
-                    chain: GATE_INPUT_CHAIN,
-                    before: before.handle,
-                    body: &template.families[family_index(family)].udp,
-                });
-            }
-            let (batch, _, end) = insertion_batch(&insertions, generation);
-            match commit(&mut channel, &batch, end)
-                .context("adding the UDP rule to the snapshot network gate in both families")?
-            {
-                Commit::Committed => break,
-                Commit::GenerationMoved if attempt < ATTEMPTS => continue,
-                Commit::GenerationMoved => bail!(
-                    "adding the UDP rule to the snapshot network gate: the ruleset changed \
-                     under each of {ATTEMPTS} attempts"
-                ),
+        let (batch, _, end) = udp_gate_install_batch();
+        match commit(&mut channel, &batch, end)
+            .context("adding the UDP gate to the snapshot network gate in both families")?
+        {
+            Commit::Committed => {}
+            Commit::GenerationMoved => {
+                bail!("adding the UDP gate: nf_tables reported a moved generation for a batch pinned to none")
             }
         }
         self.netfilter.give_back(channel);
+        self.udp_gated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut timings = self.timings.lock().unwrap();
-        timings.netlink = true;
         // One commit covers both families.
         timings.udp_ipv4_ms = started.elapsed().as_secs_f64() * 1000.0;
         timings.udp_ipv6_ms = 0.0;
@@ -2386,7 +2301,10 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
             }
             let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
             let commit_started = std::time::Instant::now();
-            let Some((batch, _begin, end)) = crate::nftables::removal_batch(&removals, generation)
+            let udp_gate = directions.contains(&Direction::Input)
+                && self.udp_gated.load(std::sync::atomic::Ordering::SeqCst);
+            let Some((batch, _begin, end)) =
+                crate::nftables::removal_batch(&removals, udp_gate, generation)
             else {
                 break (read_ms, commit_started);
             };
@@ -2408,6 +2326,10 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
         self.netfilter.give_back(channel);
         for family in Family::BOTH {
             self.mark(family, directions, HalfKnown::Removed);
+        }
+        if directions.contains(&Direction::Input) {
+            self.udp_gated
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
         let mut timings = self.timings.lock().unwrap();
         if directions.contains(&Direction::Input) {
@@ -2489,35 +2411,7 @@ impl<R: CommandRunner + Sync, N: NetfilterOpener + Sync> FirewallGate for Iptabl
     }
 
     async fn gate_udp_ingress(&self) -> Result<()> {
-        if let Some(template) = &self.template {
-            match self.gate_udp_over_netlink(template) {
-                Ok(()) => return Ok(()),
-                // A refused batch changed nothing, so iptables can still add
-                // the rule.
-                Err(error) => eprintln!(
-                    "[fc-agent] WARNING: adding the UDP rule over nfnetlink failed, \
-                     using iptables: {error:#}"
-                ),
-            }
-        }
-        for (program, network) in [("iptables", IPV4_LOOPBACK), ("ip6tables", IPV6_LOOPBACK)] {
-            // Position 3: below the loopback exemptions (rules 1 and 2), above
-            // the TCP rejection. The chain is removed whole on open, so the
-            // rule needs no removal of its own.
-            let started = std::time::Instant::now();
-            let mut args = vec!["-w", "-I", GATE_INPUT_CHAIN, "3"];
-            args.extend(udp_ingress_rule_args(network));
-            self.required(program, &args)
-                .await
-                .with_context(|| format!("gating client-direction UDP in {program}"))?;
-            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-            let mut timings = self.timings.lock().unwrap();
-            match family_of(program) {
-                Family::Ipv4 => timings.udp_ipv4_ms = elapsed,
-                Family::Ipv6 => timings.udp_ipv6_ms = elapsed,
-            }
-        }
-        Ok(())
+        self.install_udp_gate()
     }
 
     async fn is_closed(&self) -> Result<bool> {
@@ -6042,33 +5936,117 @@ mod tests {
     }
 
     /// The restored clone also refuses client-direction UDP while its ingress is
-    /// gated: a published UDP port reaches the workload like a TCP one, and a client
-    /// whose flow predates the snapshot is ESTABLISHED in the restored guest, so the
-    /// match is the flow's direction, not its state. The rule is inserted after the
-    /// inherited gate is verified, below the loopback exemptions, and the ingress
-    /// open removes it with the chain. The snapshot side never installs it.
+    /// gated: a published UDP port reaches the workload like a TCP one. The gate
+    /// is a table of its own, added over nfnetlink in one commit for both families
+    /// after the inherited gate is verified, with no process started, and the
+    /// ingress open deletes it in the commit that removes the INPUT half. The
+    /// snapshot side never installs it, and its open touches no such table.
     ///
-    /// RED BEFORE THE FIX: the rule was part of every close(), the source VM's too.
+    /// RED BEFORE THE CHANGE: the rule was an iptables rule inserted with a
+    /// process per family.
     #[tokio::test]
-    async fn the_udp_rejection_is_installed_on_restore_only() {
+    async fn the_udp_gate_is_a_table_added_on_restore_and_deleted_with_the_ingress_half() {
+        use crate::nftables::model::Kernel;
+        let template = Arc::new(model_template());
+        let kernel = template_armed_model(&template);
         let runner = RecordingRunner::default();
         let calls = runner.0.clone();
-        IptablesGate::new(runner).gate_udp_ingress().await.unwrap();
-        let calls = calls.lock().unwrap().join("\n");
+        let gate = IptablesGate::with_netfilter(runner, ModelNetfilter::new(kernel.clone()))
+            .with_template(Some(template.clone()));
+
+        gate.gate_udp_ingress().await.unwrap();
+        assert_eq!(calls.lock().unwrap().clone(), Vec::<String>::new());
+        {
+            let k = kernel.lock().unwrap();
+            assert_eq!(k.commits.len(), 1, "{:?}", k.commits);
+            let ops = k.commits[0].join("; ");
+            assert!(
+                ops.contains("ip add table fcvm_snapshot_udp")
+                    && ops.contains("ip6 add table fcvm_snapshot_udp"),
+                "{ops}"
+            );
+            let udp = |kernel: &Kernel, family: Family| match family {
+                Family::Ipv4 => kernel.udp_ipv4.clone(),
+                Family::Ipv6 => kernel.udp_ipv6.clone(),
+            };
+            for family in Family::BOTH {
+                let table = udp(&k, family).expect("the UDP gate's table");
+                assert!(table.set, "{}", family.name());
+                assert_eq!(
+                    table.chains,
+                    vec![("out".to_string(), 3), ("in".to_string(), 1)],
+                    "{}",
+                    family.name()
+                );
+                let rules = |chain: &str| table.rules.iter().filter(|(c, _)| c == chain).count();
+                assert_eq!((rules("out"), rules("in")), (1, 4), "{}", family.name());
+                // The iptables gate is as it was: no UDP rule joins it.
+                assert_eq!(
+                    chain_bodies(&k, family, GATE_INPUT_CHAIN).len(),
+                    4,
+                    "{}",
+                    family.name()
+                );
+            }
+        }
+        gate.open_egress().await.unwrap();
+        {
+            let k = kernel.lock().unwrap();
+            assert!(
+                k.udp_ipv4.is_some() && k.udp_ipv6.is_some(),
+                "the egress half's removal took the UDP gate"
+            );
+        }
+        gate.open().await.unwrap();
+        let k = kernel.lock().unwrap();
         assert!(
-            calls.contains(
-                "iptables -w -I FCVM_SNAPSHOT_IN 3 -p udp -m conntrack --ctdir ORIGINAL -j REJECT \
-                 --reject-with icmp-port-unreachable"
-            ) && calls.contains(
-                "ip6tables -w -I FCVM_SNAPSHOT_IN 3 -p udp -m conntrack --ctdir ORIGINAL -j REJECT \
-                 --reject-with icmp6-port-unreachable"
-            ),
-            "client-direction UDP passes the restored clone's closed ingress gate:\n{calls}"
+            k.udp_ipv4.is_none() && k.udp_ipv6.is_none(),
+            "publication left the UDP gate in place"
         );
+        for table in [&k.ipv4, &k.ipv6] {
+            assert!(!holds_gate(table, GATE_INPUT_CHAIN), "{table:?}");
+        }
+    }
+
+    /// A source's gate has no UDP table, and opening it names none: the
+    /// resume must not touch the VM it reopens beyond the gate it closed.
+    #[tokio::test]
+    async fn a_sources_reopen_touches_no_udp_table() {
+        let template = Arc::new(model_template());
+        let kernel = template_armed_model(&template);
+        let gate = IptablesGate::with_netfilter(
+            RecordingRunner::default(),
+            ModelNetfilter::new(kernel.clone()),
+        )
+        .with_template(Some(template));
+        gate.open().await.unwrap();
+        let k = kernel.lock().unwrap();
+        let ops = k.commits.iter().flatten().cloned().collect::<Vec<_>>();
         assert!(
-            !calls.contains("--ctstate NEW") && !calls.contains("FCVM_SNAPSHOT_OUT"),
-            "the UDP rule must match direction, not state, and never gate egress:\n{calls}"
+            ops.iter().all(|op| !op.contains("fcvm_snapshot_udp")),
+            "{ops:?}"
         );
+        assert!(k.udp_ipv4.is_none() && k.udp_ipv6.is_none());
+    }
+
+    /// A commit that lands between the ingress removal's read and its commit
+    /// refuses the batch whole, and the removal reads and sends it again with the
+    /// UDP gate's table in it: it is deleted once, not left.
+    #[tokio::test]
+    async fn the_udp_gate_is_deleted_when_the_ingress_removal_is_sent_again() {
+        let template = Arc::new(model_template());
+        let kernel = template_armed_model(&template);
+        let gate = IptablesGate::with_netfilter(
+            RecordingRunner::default(),
+            ModelNetfilter::new(kernel.clone()),
+        )
+        .with_template(Some(template));
+        gate.gate_udp_ingress().await.unwrap();
+        kernel.lock().unwrap().before_batch = Some(Box::new(|k| k.genid += 1));
+        gate.open().await.unwrap();
+        let k = kernel.lock().unwrap();
+        assert_eq!(k.refused, 1);
+        assert!(k.udp_ipv4.is_none() && k.udp_ipv6.is_none());
     }
 
     /// What the tracker would say of a packet, for the rules that ask it.
@@ -6090,8 +6068,6 @@ mod tests {
         on_lo: bool,
         destination_port: u16,
         tracked: Tracked,
-        /// Whether the packet runs the way its flow began.
-        original_direction: bool,
     }
 
     const SYN: Packet = Packet {
@@ -6101,7 +6077,6 @@ mod tests {
         on_lo: false,
         destination_port: 7070,
         tracked: Tracked::New,
-        original_direction: true,
     };
 
     #[derive(PartialEq, Debug)]
@@ -6145,12 +6120,6 @@ mod tests {
                         matches &= match value() {
                             "NEW" => packet.tracked == Tracked::New,
                             other => panic!("the model does not know --ctstate {other}"),
-                        }
-                    }
-                    "--ctdir" => {
-                        matches &= match value() {
-                            "ORIGINAL" => packet.original_direction,
-                            other => panic!("the model does not know --ctdir {other}"),
                         }
                     }
                     "-j" => target = Some(value().to_string()),
@@ -6261,63 +6230,208 @@ mod tests {
         }
     }
 
-    /// Closing the gate must not attach connection tracking: no rule of the
-    /// chains a snapshot installs names it. The restored clone's UDP rule is
-    /// the one rule that does, and it is not among them.
+    /// Nothing the snapshot side or the restore installs may attach connection
+    /// tracking: no rule of the chains `close()` installs names it, and the
+    /// restored clone's UDP gate runs no iptables process and holds only
+    /// expressions that read the packet or the gate's own set. The tracker
+    /// attaches for as long as any rule needs it and leaves entries for flows
+    /// open when it detaches (#2112).
     ///
-    /// RED BEFORE THE FIX: the TCP rule of every chain was `-m conntrack`.
-    #[test]
-    fn no_rule_the_snapshot_side_installs_uses_connection_tracking() {
+    /// RED BEFORE THE CHANGE: the restore's UDP rule was
+    /// `-m conntrack --ctdir ORIGINAL`.
+    #[tokio::test]
+    async fn no_rule_the_snapshot_side_or_the_restore_installs_uses_connection_tracking() {
         for network in [IPV4_LOOPBACK, IPV6_LOOPBACK] {
             let input = gate_chains_restore_input(network);
             assert!(
                 !input.contains("conntrack") && !input.contains("--ct"),
                 "closing the gate attaches connection tracking:\n{input}"
             );
-            assert!(
-                udp_ingress_rule_args(network).contains(&"conntrack"),
-                "the model below assumes the UDP rule is the tracked one"
-            );
+        }
+        let kernel = Arc::new(Mutex::new(crate::nftables::model::Kernel::default()));
+        let runner = RecordingRunner::default();
+        let calls = runner.0.clone();
+        let gate = IptablesGate::with_netfilter(runner, ModelNetfilter::new(kernel.clone()));
+        gate.gate_udp_ingress().await.unwrap();
+        let calls = calls.lock().unwrap().join("\n");
+        assert!(
+            !calls.contains("conntrack") && !calls.contains("--ct"),
+            "the restore's UDP gate attaches connection tracking:\n{calls}"
+        );
+        let k = kernel.lock().unwrap();
+        for table in [&k.udp_ipv4, &k.udp_ipv6] {
+            let table = table.as_ref().expect("the UDP gate's table");
+            assert!(!table.rules.is_empty());
+            for (chain, expressions) in &table.rules {
+                for name in crate::nftables::expression_names(expressions).unwrap() {
+                    assert!(
+                        ["meta", "cmp", "payload", "dynset", "lookup", "immediate"]
+                            .contains(&name.as_str()),
+                        "the {chain} chain's rule holds the {name} expression"
+                    );
+                }
+            }
         }
     }
 
-    /// What the restored clone's UDP rule refuses and what it passes, with the
-    /// rule in its place in the INPUT chain. A datagram from outside is refused
-    /// whether its flow is new or one a client began before the snapshot; a
-    /// datagram on a flow the guest began passes, which is what a reply is.
+    /// What the restored clone's UDP gate refuses and what it passes, run over
+    /// the rules it installs (`UDP_GATE_OUTPUT`, `UDP_GATE_INPUT`) with the set
+    /// they keep. A datagram from outside is refused whether or not a client
+    /// had exchanged traffic with the guest before the snapshot; a datagram from
+    /// the address and port the guest sent to, to the port it sent from, passes,
+    /// which is what a reply is. Nothing else the guest sent opens the way.
     #[test]
-    fn the_udp_rule_refuses_by_direction_and_passes_replies() {
-        for network in [IPV4_LOOPBACK, IPV6_LOOPBACK] {
-            let mut rules = gate_chain_rules("-s", network);
-            rules.insert(
-                2,
-                udp_ingress_rule_args(network).map(str::to_string).to_vec(),
-            );
-            let datagram = Packet {
-                protocol: "udp",
-                flags: &[],
-                ..SYN
-            };
-            let unreachable = Verdict::Rejected(port_unreachable(network).to_string());
-            for tracked in [Tracked::New, Tracked::Established] {
-                let from_a_client = Packet {
-                    tracked,
-                    ..datagram
-                };
-                assert_eq!(through(&rules, "-s", from_a_client), unreachable);
-            }
-            let reply = Packet {
-                tracked: Tracked::Established,
-                original_direction: false,
-                ..datagram
-            };
-            assert_eq!(through(&rules, "-s", reply), Verdict::Passed);
-            let own = Packet {
-                on_lo: true,
-                ..datagram
-            };
-            assert_eq!(through(&rules, "-s", own), Verdict::Passed);
+    fn the_udp_gate_refuses_a_peer_the_guest_has_not_sent_to_and_passes_replies() {
+        use crate::nftables::{UdpGateRule, UDP_GATE_INPUT, UDP_GATE_OUTPUT};
+        use std::collections::HashSet;
+
+        #[derive(Clone, Copy)]
+        struct Datagram {
+            peer: u8,
+            peer_port: u16,
+            local_port: u16,
+            udp: bool,
+            on_lo: bool,
+            from_loopback: bool,
         }
+        let datagram = Datagram {
+            peer: 9,
+            peer_port: 6000,
+            local_port: 5000,
+            udp: true,
+            on_lo: false,
+            from_loopback: false,
+        };
+        #[derive(Default)]
+        struct Guest {
+            peers: HashSet<(u8, u16, u16)>,
+        }
+        impl Guest {
+            /// The guest sends `sent`, as seen from the guest.
+            fn sends(&mut self, sent: Datagram) {
+                for rule in UDP_GATE_OUTPUT {
+                    match rule {
+                        UdpGateRule::Record if sent.udp => {
+                            self.peers
+                                .insert((sent.peer, sent.peer_port, sent.local_port));
+                        }
+                        UdpGateRule::Record => {}
+                        other => panic!("{other:?} is not an output rule"),
+                    }
+                }
+            }
+            /// Whether `got` reaches the guest.
+            fn receives(&self, got: Datagram) -> bool {
+                for rule in UDP_GATE_INPUT {
+                    match rule {
+                        UdpGateRule::PassLoopbackInterface if got.on_lo => return true,
+                        UdpGateRule::PassLoopbackSource if got.from_loopback => return true,
+                        UdpGateRule::PassKnownPeer
+                            if got.udp
+                                && self.peers.contains(&(
+                                    got.peer,
+                                    got.peer_port,
+                                    got.local_port,
+                                )) =>
+                        {
+                            return true
+                        }
+                        UdpGateRule::DropUdp if got.udp => return false,
+                        UdpGateRule::PassLoopbackInterface
+                        | UdpGateRule::PassLoopbackSource
+                        | UdpGateRule::PassKnownPeer
+                        | UdpGateRule::DropUdp => {}
+                        UdpGateRule::Record => panic!("Record is not an input rule"),
+                    }
+                }
+                true
+            }
+        }
+
+        let mut guest = Guest::default();
+        assert!(!guest.receives(datagram), "a datagram from outside");
+        guest.sends(datagram);
+        assert!(guest.receives(datagram), "the reply to what the guest sent");
+        assert!(
+            !guest.receives(Datagram {
+                peer_port: 6001,
+                ..datagram
+            }),
+            "another port of the peer"
+        );
+        assert!(
+            !guest.receives(Datagram {
+                local_port: 5001,
+                ..datagram
+            }),
+            "another local port"
+        );
+        assert!(
+            !guest.receives(Datagram {
+                peer: 10,
+                ..datagram
+            }),
+            "another peer"
+        );
+        assert!(
+            guest.receives(Datagram {
+                udp: false,
+                ..datagram
+            }),
+            "only UDP is gated"
+        );
+        assert!(guest.receives(Datagram {
+            on_lo: true,
+            peer: 1,
+            ..datagram
+        }));
+        assert!(guest.receives(Datagram {
+            from_loopback: true,
+            peer: 1,
+            ..datagram
+        }));
+    }
+
+    /// The gate's expressions, by rule: which header fields each reads. The
+    /// pinned list is what the real kernel accepted and answered correctly
+    /// when the gate was written (`nft list ruleset` prints these rules as
+    /// `update @peers { ip daddr . udp dport . udp sport }` on the output hook
+    /// and `ip saddr . udp sport . udp dport @peers return` on the input hook).
+    #[test]
+    fn the_udp_gate_rules_name_the_expressions_the_kernel_was_checked_with() {
+        use crate::nftables::{expression_names, UdpGateRule, UDP_GATE_INPUT, UDP_GATE_OUTPUT};
+        let (batch, _, _) = crate::nftables::udp_gate_install_batch();
+        assert!(!batch.is_empty());
+        let names = |rule| {
+            [Family::Ipv4, Family::Ipv6].map(|family| {
+                expression_names(&crate::nftables::udp_rule_expressions(family, rule)).unwrap()
+            })
+        };
+        let expected = |list: &[&str]| {
+            let one = list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            [one.clone(), one]
+        };
+        assert_eq!(
+            names(UdpGateRule::Record),
+            expected(&["meta", "cmp", "payload", "payload", "payload", "dynset"])
+        );
+        assert_eq!(
+            names(UdpGateRule::PassKnownPeer),
+            expected(&[
+                "meta",
+                "cmp",
+                "payload",
+                "payload",
+                "payload",
+                "lookup",
+                "immediate"
+            ])
+        );
+        assert_eq!(
+            names(UdpGateRule::DropUdp),
+            expected(&["meta", "cmp", "immediate"])
+        );
+        assert_eq!(UDP_GATE_OUTPUT.len() + UDP_GATE_INPUT.len(), 5);
     }
 
     /// Runner that answers `-S` with a canned dump and records every call.
@@ -6937,7 +7051,7 @@ mod tests {
             .retain(|(chain, _, _)| *chain != "INPUT");
         let before = kernel.lock().unwrap().ipv4.clone();
         let generation = crate::nftables::generation(&mut channel).unwrap();
-        let (batch, _, end) = crate::nftables::removal_batch(&removals, generation).unwrap();
+        let (batch, _, end) = crate::nftables::removal_batch(&removals, false, generation).unwrap();
         let error = crate::nftables::commit(&mut channel, &batch, end).unwrap_err();
         assert!(format!("{error:#}").contains("No such file"), "{error:#}");
         let k = kernel.lock().unwrap();
@@ -10862,7 +10976,6 @@ mod tests {
         let family = |base: u8| FamilyTemplate {
             input: (0..4).map(|i| body(base + i, 0)).collect(),
             output: (0..4).map(|i| body(base + 10 + i, 0)).collect(),
-            udp: body(base + 20, 0),
         };
         GateTemplate {
             families: [family(10), family(110)],
@@ -10907,11 +11020,11 @@ mod tests {
             .collect()
     }
 
-    /// A restored clone verifies its inherited gate and adds the UDP rule over
+    /// A restored clone verifies its inherited gate and adds the UDP gate over
     /// the nfnetlink socket it keeps, and starts no process for either: the
     /// four iptables processes they took were 8 to 12 ms of a 17 to 24 ms
-    /// restore on m8g.metal-24xl. The UDP rule lands in both families in one
-    /// commit, below the two loopback exemptions, and the gate still opens.
+    /// restore on m8g.metal-24xl. The UDP gate lands in both families in one
+    /// commit, and the gate still opens.
     ///
     /// RED BEFORE THE CHANGE: verification ran `iptables -S` per family, so
     /// with a runner that answers nothing it read an empty table and reported
@@ -10933,28 +11046,12 @@ mod tests {
         assert_eq!(
             calls.lock().unwrap().clone(),
             Vec::<String>::new(),
-            "verification and the UDP rule started processes"
+            "verification and the UDP gate started processes"
         );
         {
             let k = kernel.lock().unwrap();
             assert_eq!(k.commits.len(), 1, "{:?}", k.commits);
-            let ops = k.commits[0].join("; ");
-            assert!(
-                ops.contains("ip insert rule FCVM_SNAPSHOT_IN")
-                    && ops.contains("ip6 insert rule FCVM_SNAPSHOT_IN"),
-                "{ops}"
-            );
-            for family in Family::BOTH {
-                let wanted = &template.families[family_index(family)];
-                let rules = chain_bodies(&k, family, GATE_INPUT_CHAIN);
-                assert_eq!(rules.len(), 5, "{} {rules:?}", family.name());
-                assert_eq!(
-                    rules[2],
-                    crate::nftables::model::Rule::Body(wanted.udp.clone()),
-                    "{}: the UDP rule is not third",
-                    family.name()
-                );
-            }
+            assert!(k.udp_ipv4.is_some() && k.udp_ipv6.is_some());
         }
         gate.open_egress().await.unwrap();
         gate.open().await.unwrap();
@@ -11021,61 +11118,5 @@ mod tests {
                 "{case}"
             );
         }
-    }
-
-    /// The UDP rule's batch is pinned to the generation its handles were read
-    /// under. A commit that lands in between refuses it whole, and it is read
-    /// and sent again: one UDP rule per family, never two.
-    #[tokio::test]
-    async fn the_udp_rule_is_read_and_sent_again_when_the_ruleset_moves() {
-        let template = Arc::new(model_template());
-        let kernel = template_armed_model(&template);
-        kernel.lock().unwrap().before_batch = Some(Box::new(|k| k.genid += 1));
-        let gate = IptablesGate::with_netfilter(
-            RecordingRunner::default(),
-            ModelNetfilter::new(kernel.clone()),
-        )
-        .with_template(Some(template.clone()));
-        gate.gate_udp_ingress().await.unwrap();
-        let k = kernel.lock().unwrap();
-        assert_eq!(k.refused, 1);
-        assert_eq!(k.commits.len(), 1, "{:?}", k.commits);
-        for family in Family::BOTH {
-            let udp = crate::nftables::model::Rule::Body(
-                template.families[family_index(family)].udp.clone(),
-            );
-            let rules = chain_bodies(&k, family, GATE_INPUT_CHAIN);
-            assert_eq!(rules.iter().filter(|r| **r == udp).count(), 1, "{rules:?}");
-        }
-    }
-
-    /// The template is used only when iptables renders a gate with the
-    /// inserted UDP rule exactly as `udp_ingress_rule_args` spells it, third in
-    /// the INPUT gate chain.
-    #[test]
-    fn the_template_is_used_only_when_iptables_renders_the_inserted_rule() {
-        let rendered = |udp: &str| {
-            let mut dump = String::from("-P INPUT ACCEPT\n-N FCVM_SNAPSHOT_IN\n");
-            for (index, rule) in gate_chain_rules("-s", IPV4_LOOPBACK).iter().enumerate() {
-                if index == 2 {
-                    dump.push_str(&format!("-A FCVM_SNAPSHOT_IN {udp}\n"));
-                }
-                dump.push_str(&format!("-A FCVM_SNAPSHOT_IN {}\n", rule.join(" ")));
-            }
-            dump
-        };
-        let written = udp_ingress_rule_args(IPV4_LOOPBACK).join(" ");
-        assert!(scratch_rendering_matches(
-            &rendered(&written),
-            IPV4_LOOPBACK
-        ));
-        assert!(!scratch_rendering_matches(
-            &rendered("-p udp -m conntrack --ctdir ORIGINAL -j DROP"),
-            IPV4_LOOPBACK
-        ));
-        assert!(!scratch_rendering_matches(
-            "-P INPUT ACCEPT\n-N FCVM_SNAPSHOT_IN\n",
-            IPV4_LOOPBACK
-        ));
     }
 }

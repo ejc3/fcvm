@@ -32,8 +32,12 @@ and its docstring says how):
   `snapshot create` left (`guard := false`; #1936, open).
 - The gate's chains (`gate_chain_rules`): in INPUT, TCP from a loopback source returns, anything
   that entered on `lo` returns, the TCP rule, return; in OUTPUT, TCP to a loopback destination
-  returns, NTP is rejected, the TCP rule, return. A clone inserts its UDP rule third in INPUT
-  (`udp_ingress_rule_args`, `-m conntrack --ctdir ORIGINAL`).
+  returns, NTP is rejected, the TCP rule, return. A clone adds a UDP gate of its own, in an
+  nf_tables table apart from these chains, that drops a datagram from a peer the guest has not
+  sent to (`UDP_GATE_INPUT`, fc-agent/src/nftables.rs; #2112). The model below still carries the
+  earlier rule, `-m conntrack --ctdir ORIGINAL`, which is a superset of what the new gate
+  passes and attaches the tracker where the new gate does not; it has not been re-run
+  against the new gate.
 - The egress proxy's redirect is in nat OUTPUT and nothing of the gate is (`natGate := false`;
   fc-agent/src/proxy.rs:763-822).
 - Both one-shots are exec'd through the long-running fc-agent (src/commands/common.rs:6021).

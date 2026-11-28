@@ -435,7 +435,7 @@ published clone is a source for the next generation.
 
 ### fc-agent's and the host's steps and their source
 
-Cited in `Today.lean`, per commit. In short: `gate_chain_rules`, `udp_ingress_rule_args`,
+Cited in `Today.lean`, per commit. In short: `gate_chain_rules`, `UDP_GATE_INPUT`,
 `prepare_with`, `restore_boundary_with`, `publish_with`, `resume_source_network`,
 `sockets_leaving_the_guest`, `manifest_sockets`, `unlisted_sockets`, `refuse_syn_cookies` and
 `restore_syn_cookies` in fc-agent/src/snapshot_network.rs; `handle_clone_restore` in restore.rs;
@@ -520,9 +520,11 @@ closed with the egress half). The second is the abstraction `Limits.lean` is abo
 - **The relay behind the egress proxy** (vsock), which the restore resets by other means.
 - **Time**: the payload freeze's deadline is a switch (`Cfg.slow`), a tracked entry never
   expires, a SYN cookie never expires, a step that is tried again is tried three times.
-- **The tracker's table as state the restore leaves behind** (#2112): each restore attaches the
-  tracker through the UDP rule and leaves entries, and a routed restore attaches IPv6 tracking
-  for good through the retired-address chain. The design does not change that.
+- **The tracker's table as state the restore leaves behind** (#2112): the model's UDP rule
+  attaches the tracker and leaves entries. fc-agent's UDP gate no longer does (it keeps its own
+  set of peers in nf_tables), and the model has not been re-run against it. A routed restore
+  attaches IPv6 tracking for good through the retired-address chain, which the design does not
+  change.
 - **What a returning fc-agent's boot path does** to the rules of a guest a boundary holds (the
   nat rules appended a second time, the containment rule).
 - **The steps of `handle_clone_restore` that touch no network state**: the clock, journald,
