@@ -899,11 +899,14 @@ enum Companion {
 
 impl Companion {
     /// The start of its `comm` under fcvm: pasta runs as `pasta-<sha>.bin`, and
-    /// the holder is `unshare ... -- sleep infinity`.
+    /// the holder is `fcvm __netns-agent`, which names itself
+    /// `fcvm::network::netns_agent::COMM`.
     fn comm(self) -> &'static str {
         match self {
             Companion::Pasta => "pasta",
-            Companion::NamespaceHolder => "sleep",
+            Companion::NamespaceHolder => fcvm::network::netns_agent::COMM
+                .to_str()
+                .expect("the holder's comm is UTF-8"),
         }
     }
 
