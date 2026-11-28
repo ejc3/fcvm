@@ -6728,40 +6728,65 @@ cp vmlinux arch/arm64/boot/Image
         assert_eq!(std::fs::read(&dest).unwrap(), kernel);
     }
 
-    /// The VMM pins of `plan` that have published builds for `arch` but none named as a host
-    /// with `libc` would name its build: such a host keeps building from source.
-    fn vmm_names_missing_from_publish(
-        plan: &crate::setup::rootfs::Plan,
-        arch: &str,
-        libc: &str,
-    ) -> Vec<String> {
-        let recorded = &plan.vmm_artifacts.files;
+    /// The builds of the publishing matrix (every architecture and libc `vmm.yml` publishes,
+    /// [`PUBLISHED_ARCHES`] × [`PUBLISHED_LIBCS`]) of each VMM pin of `plan` that has any build
+    /// recorded, which are missing from the records or recorded with other fields. A pin with no
+    /// build recorded yet is skipped: its pull request lands before `vmm.yml` publishes it.
+    ///
+    /// [`PUBLISHED_ARCHES`]: crate::setup::vmm_artifacts::PUBLISHED_ARCHES
+    /// [`PUBLISHED_LIBCS`]: crate::setup::vmm_artifacts::PUBLISHED_LIBCS
+    fn matrix_builds_missing_from_records(plan: &crate::setup::rootfs::Plan) -> Vec<String> {
+        use crate::setup::vmm_artifacts::{PUBLISHED_ARCHES, PUBLISHED_LIBCS};
+        let records = &plan.vmm_artifacts;
         let mut problems = Vec::new();
-        let mut check = |kind: &str, commit: &str, prefix: &str, ours: String| {
-            let published: Vec<&str> = recorded
-                .iter()
-                .filter(|f| f.commit == commit && f.arch == arch && f.name.starts_with(prefix))
-                .map(|f| f.name.as_str())
-                .collect();
-            if !published.is_empty() && !published.contains(&ours.as_str()) {
-                problems.push(format!(
-                    "{kind} at {commit}: a host on {arch} with {libc} builds {ours}, and the \
-                     published builds are {published:?}"
-                ));
+        let mut check = |kind: &str, commit: &str, arch: &str, libc: &str, name: String| {
+            if !records.files.iter().any(|f| f.commit == commit) {
+                return;
+            }
+            match records.find(&name) {
+                None => problems.push(format!(
+                    "{kind} at {commit}: {name} ({arch}, {libc}) is in vmm.yml's matrix but \
+                     not recorded"
+                )),
+                Some(f) if f.commit != commit || f.arch != arch || f.libc != libc => {
+                    problems.push(format!("{kind}: {name} is recorded as {f:?}"))
+                }
+                Some(_) => {}
             }
         };
-        for (name, profile) in vmm_profiles(plan) {
-            let commit = profile.firecracker_commit.as_deref().unwrap();
-            check(
-                &format!("Firecracker for profile {name}"),
-                commit,
-                &format!("firecracker-{name}-"),
-                firecracker_name_for(name, profile, libc, arch),
-            );
-        }
-        if let Some(ch) = plan.cloud_hypervisor.as_ref() {
-            let ours = cloud_hypervisor_file_name(&ch.repo, &ch.commit, arch, libc);
-            check("Cloud Hypervisor", &ch.commit, "cloud-hypervisor-", ours);
+        for arch in PUBLISHED_ARCHES {
+            let key = match *arch {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                other => panic!("no config architecture for {other}"),
+            };
+            for (_, libc) in PUBLISHED_LIBCS {
+                for (name, by_arch) in &plan.kernel_profiles {
+                    let Some(profile) = by_arch.get(key) else {
+                        continue;
+                    };
+                    let (Some(_), Some(commit)) = (
+                        profile.firecracker_repo.as_deref(),
+                        profile.firecracker_commit.as_deref(),
+                    ) else {
+                        continue;
+                    };
+                    if !profile.is_published() {
+                        continue;
+                    }
+                    check(
+                        &format!("Firecracker for profile {name}"),
+                        commit,
+                        arch,
+                        libc,
+                        firecracker_name_for(name, profile, libc, arch),
+                    );
+                }
+                if let Some(ch) = plan.cloud_hypervisor.as_ref() {
+                    let name = cloud_hypervisor_file_name(&ch.repo, &ch.commit, arch, libc);
+                    check("Cloud Hypervisor", &ch.commit, arch, libc, name);
+                }
+            }
         }
         problems
     }
@@ -6781,8 +6806,14 @@ cp vmlinux arch/arm64/boot/Image
             .collect()
     }
 
+    /// The store name a host on `arch` with `libc` gives `profile`'s Firecracker. The libseccomp
+    /// the build links is named for that architecture and libc too, not this host's.
     fn firecracker_name_for(name: &str, profile: &KernelProfile, libc: &str, arch: &str) -> String {
-        let libseccomp = profile_libseccomp_identity(profile);
+        let libseccomp = profile
+            .firecracker_libseccomp
+            .as_ref()
+            .map(|config| crate::setup::libseccomp::content_hash_for(config, arch, libc))
+            .unwrap_or_default();
         let build = FirecrackerBuildEnvironment {
             arch,
             libc_tag: libc,
@@ -6807,45 +6838,126 @@ cp vmlinux arch/arm64/boot/Image
         crate::setup::rootfs::load_config(Some(path)).unwrap().0
     }
 
-    /// A self-hosted lane computes its VMM names from this host's libc and architecture. Where
-    /// a pin has published builds for this architecture, one of them must be this host's name,
-    /// or the lane quietly keeps building from source (a libc tag that differs from the
-    /// publishing runner's is the usual cause). A pin with no builds recorded yet is skipped.
+    /// Every build of vmm.yml's matrix is recorded for each pin that has builds recorded, so the
+    /// self-hosted lanes, which run on the matrix's libcs, install instead of build. It does not
+    /// depend on this host's libc: a host outside the matrix builds locally (the next test).
     #[test]
-    fn this_hosts_vmm_names_are_published_wherever_its_pins_are() {
-        let problems = vmm_names_missing_from_publish(
-            &repo_plan(),
-            std::env::consts::ARCH,
-            &libc_version_tag(),
-        );
+    fn every_build_of_the_publishing_matrix_is_recorded_wherever_its_pins_are() {
+        let problems = matrix_builds_missing_from_records(&repo_plan());
         assert!(problems.is_empty(), "{problems:#?}");
     }
 
-    /// The check above on recorded builds written for it: a build published from another libc
-    /// is a finding for this host, and the build named as this host names it is not.
-    #[test]
-    fn a_vmm_build_published_from_another_libc_is_a_finding() {
-        let mut plan = repo_plan();
-        let (name, profile) = vmm_profiles(&plan)
-            .into_iter()
-            .map(|(n, p)| (n.clone(), p.clone()))
-            .next()
-            .expect("a published profile builds a pinned Firecracker");
+    /// A host whose libc vmm.yml does not publish for finds no recorded build named as it names
+    /// its own, so the install reports none and setup builds the VMM locally; nothing is
+    /// downloaded and nothing fails.
+    #[tokio::test]
+    async fn a_host_libc_outside_the_publishing_matrix_builds_locally() {
+        let plan = repo_plan();
+        let dir = tempfile::tempdir().unwrap();
         let arch = std::env::consts::ARCH;
-        let entry = |libc: &str| crate::setup::vmm_artifacts::VmmArtifact {
-            name: firecracker_name_for(&name, &profile, libc, arch),
-            commit: profile.firecracker_commit.clone().unwrap(),
-            arch: arch.to_string(),
-            libc: libc.to_string(),
-            sha256: "a".repeat(64),
-        };
-        plan.vmm_artifacts.files = vec![entry("libc-9.99")];
-        let found = vmm_names_missing_from_publish(&plan, arch, "libc-2.39");
-        assert_eq!(found.len(), 1, "{found:?}");
-        plan.vmm_artifacts.files.push(entry("libc-2.39"));
+        let mut names: Vec<String> = vmm_profiles(&plan)
+            .into_iter()
+            .map(|(name, profile)| firecracker_name_for(name, profile, "libc-9.99", arch))
+            .collect();
+        if let Some(ch) = plan.cloud_hypervisor.as_ref() {
+            names.push(cloud_hypervisor_file_name(
+                &ch.repo,
+                &ch.commit,
+                arch,
+                "libc-9.99",
+            ));
+        }
+        assert!(!names.is_empty());
+        for name in names {
+            let dest = dir.path().join(&name);
+            let installed = crate::setup::vmm_artifacts::install(
+                &plan.vmm_artifacts,
+                &dest,
+                std::time::Duration::ZERO,
+                |_| bail!("no build should reach the check"),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}: an unrecorded build is an error: {e:#}"));
+            assert!(!installed, "{name} was installed");
+            assert!(!dest.exists());
+        }
+    }
+
+    /// The check above on records written for it: the full matrix is clean, and one build of
+    /// it missing is a finding, whichever libc this host has.
+    #[test]
+    fn a_matrix_build_missing_from_the_records_is_a_finding() {
+        use crate::setup::vmm_artifacts::{VmmArtifact, PUBLISHED_ARCHES, PUBLISHED_LIBCS};
+        let mut plan = repo_plan();
+        let mut files = Vec::new();
+        for arch in PUBLISHED_ARCHES {
+            let key = if *arch == "x86_64" { "amd64" } else { "arm64" };
+            for (_, libc) in PUBLISHED_LIBCS {
+                for (name, by_arch) in &plan.kernel_profiles {
+                    let Some(profile) = by_arch.get(key) else {
+                        continue;
+                    };
+                    if !profile.is_published() || profile.firecracker_commit.is_none() {
+                        continue;
+                    }
+                    files.push(VmmArtifact {
+                        name: firecracker_name_for(name, profile, libc, arch),
+                        commit: profile.firecracker_commit.clone().unwrap(),
+                        arch: arch.to_string(),
+                        libc: libc.to_string(),
+                        sha256: "a".repeat(64),
+                    });
+                }
+            }
+        }
+        assert!(!files.is_empty());
+        plan.vmm_artifacts.files = files;
         assert_eq!(
-            vmm_names_missing_from_publish(&plan, arch, "libc-2.39"),
+            matrix_builds_missing_from_records(&plan),
             Vec::<String>::new()
+        );
+        let gone = plan.vmm_artifacts.files.remove(0);
+        let found = matrix_builds_missing_from_records(&plan);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains(&gone.name), "{found:?}");
+    }
+
+    /// PUBLISHED_LIBCS names what decides each libc tag; vmm.yml's legs are those: a host leg
+    /// on the Ubuntu 24.04 runners and a container leg in the bookworm test image, per
+    /// architecture.
+    #[test]
+    fn the_publishing_matrix_is_the_one_vmm_yml_builds() {
+        use crate::setup::vmm_artifacts::{PUBLISHED_ARCHES, PUBLISHED_LIBCS};
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workflow: serde_norway::Value = serde_norway::from_str(
+            &std::fs::read_to_string(root.join(".github/workflows/vmm.yml")).unwrap(),
+        )
+        .unwrap();
+        for arch in PUBLISHED_ARCHES {
+            let job = &workflow["jobs"][format!("build-{arch}").as_str()];
+            let runner = job["runs-on"]
+                .as_str()
+                .unwrap_or_else(|| panic!("build-{arch} has no runner"));
+            assert!(
+                runner.starts_with(PUBLISHED_LIBCS[0].0),
+                "build-{arch} runs on {runner}"
+            );
+            let legs: Vec<&str> = job["strategy"]["matrix"]["libc"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(legs, ["host", "container"], "build-{arch}");
+        }
+        let containerfile = std::fs::read_to_string(root.join("Containerfile")).unwrap();
+        let from = containerfile
+            .lines()
+            .find(|l| l.starts_with("FROM "))
+            .unwrap();
+        assert!(
+            from.contains(PUBLISHED_LIBCS[1].0),
+            "the test image is {from}"
         );
     }
 }

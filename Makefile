@@ -122,12 +122,14 @@ endif
 # Nested tests are the arm64 long pole and do NOT parallelize — they degrade ~3.7x under
 # mutual contention (measured before #770 dropped the dsb(sy) patch; see the
 # [test-groups.nested-tests] comment in .config/nextest.toml), so concurrency can't shrink
-# them. Instead CI runs four that cover the distinct nested risks and skips the rest
+# them. Instead CI runs five that cover the distinct nested risks and skips the rest
 # (which still run locally with a normal `make test-root`):
 #   - test_nested_run_fcvm_inside_vm  : nesting works at all + /dev/kvm usable in the guest
 #   - test_nested_l2_with_large_files : FUSE-over-FUSE data integrity at unbounded max_write
 #   - test_nested_l2_nfs              : the NFS-share data path under nesting
 #   - test_vsock_integrity_nested     : 2.5 GB of L2 vsock traffic checked byte for byte (arm64)
+#   - test_nested_l2_user_space_reads_the_kernels_counter : L1's and L2's EL0 counter against
+#                                       the kernel's, 17 to 110 s (arm64; #2249)
 # Skipped in CI (still run locally): test_nested_l2_fuse (FUSE path is covered by large_files),
 # test_nested_l2_network_fuse / _network_nfs (iperf throughput — the slowest AND flakiest under
 # any contention), test_utimensat_pjdfstest_nested_kernel, the three L3 tests (627 to 810 s
@@ -140,8 +142,8 @@ endif
 CI ?=
 ifndef FILTER
 ifeq ($(CI),true)
-# Base test-root CI filter: the nested subset (exclude all nested except the 3 kept).
-CI_ROOT_BASE := (not (package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))) | test(=test_nested_run_fcvm_inside_vm) | test(=test_nested_l2_with_large_files) | test(=test_nested_l2_nfs) | test(=test_vsock_integrity_nested))
+# Base test-root CI filter: the nested subset (exclude all nested except the five kept).
+CI_ROOT_BASE := (not (package(fcvm) & (test(/nested/) | test(/podman_load_over_fuse/))) | test(=test_nested_run_fcvm_inside_vm) | test(=test_nested_l2_with_large_files) | test(=test_nested_l2_nfs) | test(=test_vsock_integrity_nested) | test(=test_nested_l2_user_space_reads_the_kernels_counter))
 ifeq ($(FCVM_NO_SNAPSHOT),)
 # SnapshotEnabled mode (FCVM_NO_SNAPSHOT unset): ALSO drop test_nested_l2_with_large_files.
 # It guards FUSE-over-FUSE DATA INTEGRITY (the corruption the dropped #630 DSB patches once
