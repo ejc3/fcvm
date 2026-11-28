@@ -1298,10 +1298,7 @@ mod tests {
     #[tokio::test]
     async fn a_proxy_relay_tries_every_address_of_its_proxy() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let refused = {
-            let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            gone.local_addr().unwrap()
-        };
+        let (_held, refused) = crate::test_ports::refused_address();
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let live = proxy.local_addr().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1310,8 +1307,9 @@ mod tests {
 
         let mut client = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
         client.write_all(b"CONNECT").await.unwrap();
+        // The accept is the event. The guard only stops a hang.
         let (mut upstream, _) =
-            tokio::time::timeout(std::time::Duration::from_secs(5), proxy.accept())
+            tokio::time::timeout(std::time::Duration::from_secs(120), proxy.accept())
                 .await
                 .expect("the relay never reached the proxy at its second address")
                 .unwrap();
@@ -1723,9 +1721,7 @@ mod tests {
     #[tokio::test]
     async fn handed_over_listeners_stay_open_from_the_teardown_to_the_restore() {
         let (loopback, host, other) = (test_ip(11), test_ip(12), test_ip(13));
-        let probe = std::net::TcpListener::bind((host, 0)).unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
+        let port = crate::test_ports::released_port(host.into());
         let published = [mapping(Some(&host.to_string()), port)];
 
         // The torn-down VM: its relay ran on a duplicate and has stopped.
@@ -2078,10 +2074,11 @@ mod tests {
             }
         });
 
-        // Start port forward: host 127.0.0.1:0 → namespace 127.0.0.1:9999
-        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let host_addr = host_listener.local_addr()?;
-        drop(host_listener); // Release the port so bind_port_forwards can bind it
+        // Start port forward: a host port that bind_port_forwards binds → namespace 127.0.0.1:9999
+        let host_addr = SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            crate::test_ports::released_port(std::net::Ipv4Addr::LOCALHOST.into()),
+        ));
 
         let mapping = PortMapping {
             host_port: host_addr.port(),

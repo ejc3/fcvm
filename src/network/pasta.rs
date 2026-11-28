@@ -4950,14 +4950,10 @@ mod tests {
             assert!(answered.is_empty(), "{}", answered.join("\n\n"));
         }
 
-        /// A loopback address and a port on it that nothing listens on, for one test.
+        /// A loopback address and a port on it for pasta to bind, for one test.
         fn free_loopback_port() -> (String, u16) {
             let address = format!("127.88.{}.7", std::process::id() % 250 + 1);
-            let port = std::net::TcpListener::bind((address.as_str(), 0))
-                .expect("binding a loopback port")
-                .local_addr()
-                .unwrap()
-                .port();
+            let port = crate::test_ports::released_port(address.parse().unwrap());
             (address, port)
         }
 

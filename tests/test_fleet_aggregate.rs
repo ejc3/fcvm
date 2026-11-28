@@ -2,6 +2,11 @@
 //! no ffmpeg is needed): fake renderers stream tiles with crop margins, the aggregator
 //! joins them at one `t`, and a viewer checks every pixel of the region.
 
+// The library's `cfg(test)` module, by path: an address that refuses while the test holds
+// it, and a port for a program that binds it itself.
+#[path = "../src/test_ports.rs"]
+mod test_ports;
+
 use axum::extract::ws::{Message as AxMessage, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -838,10 +843,7 @@ async fn the_public_listener_serves_frames_with_tls_and_no_control_routes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_supervised_aggregator_that_needs_a_layout_stops_without_one() {
     use fcvm::fleet::aggregate::child::{supervise_with, Supervision};
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = test_ports::released_port(std::net::Ipv4Addr::LOCALHOST.into());
     let listen = format!("127.0.0.1:{port}");
     let (tx, rx) = tokio::sync::watch::channel(None::<Layout>);
     let argv = vec![
@@ -971,10 +973,7 @@ async fn the_push_child_dies_with_its_aggregator() {
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = test_ports::released_port(std::net::Ipv4Addr::LOCALHOST.into());
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_fcvm"));
     cmd.args([
         "fleet",

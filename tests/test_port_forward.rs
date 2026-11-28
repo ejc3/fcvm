@@ -202,10 +202,7 @@ fn test_port_forward_rootless() -> Result<()> {
     // A mapping on the host's ::1 as well. pasta splices a connection from a loopback
     // client into the VM's namespace and connects to the guest's IPv6 address from
     // there, so the namespace needs an IPv6 address on the guest's link.
-    let ipv6_port = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
-        .and_then(|l| l.local_addr())
-        .context("finding a free port on ::1")?
-        .port();
+    let ipv6_port = common::test_ports::released_port(std::net::Ipv6Addr::LOCALHOST.into());
     let publish_ipv6 = format!("[::1]:{ipv6_port}:80");
 
     // Start VM with rootless networking and port forwarding

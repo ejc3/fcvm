@@ -4,6 +4,11 @@
 
 mod fleet_support;
 
+// The library's `cfg(test)` module, by path: an address that refuses while the test holds
+// it, and a port for a program that binds it itself.
+#[path = "../src/test_ports.rs"]
+mod test_ports;
+
 use fcvm::fleet::agent::slot::AgentCfg;
 use fcvm::fleet::agent::{serve, Agent, AggregateCfg, AggregatePublic};
 use fcvm::fleet::lines::{spawn_writer, LineReader};
@@ -1009,13 +1014,7 @@ async fn a_spot_notice_is_reported_as_draining() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_agent_runs_and_feeds_its_aggregator() {
     let f = fake(2, &[]);
-    let free_port = || {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    };
+    let free_port = || test_ports::released_port(std::net::Ipv4Addr::LOCALHOST.into());
     let (port, tls_port) = (free_port(), free_port());
     let tls_dir = tempfile::tempdir().unwrap();
     let ck = rcgen::generate_simple_self_signed(vec!["agg.fleet.test".to_string()]).unwrap();
