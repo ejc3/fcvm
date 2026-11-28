@@ -1245,7 +1245,10 @@ echo "Memory: $(grep MemAvailable /proc/meminfo | awk '{print $2/1024 " MB"}')"
 # One COUNTER_L<level> line: whether this level's user space reads the counter its
 # kernel keeps time with (tests/nested/counter_check.py). It never fails the level;
 # test_nested_l2_user_space_reads_the_kernels_counter asserts on the lines.
-python3 "$(dirname "$0")/counter_check.py" "$LEVEL" || true
+# Bounded: a guest with a broken clock can hang anything that waits on it, and a hang
+# here would be reported as a missing marker 19 minutes later instead of as this line.
+timeout 30 python3 "$(dirname "$0")/counter_check.py" "$LEVEL" ||
+    echo "COUNTER_L${LEVEL} FAIL the check did not finish in 30 s (exit $?)"
 echo "=== END L${LEVEL} ==="
 echo "MARKER_L${LEVEL}_OK"
 "#

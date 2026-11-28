@@ -17,7 +17,13 @@ The line also says what the kernel's boot log shows about FEAT_NV2p1 (`nv2p1=`,
 `nv_frac_forced_to=`): a guest told it has FEAT_NV2p1 on a CPU that has not is how
 the counters came apart (kernel/patches-arm64/mmfr4-override.vm.patch).
 
-Two checks, three samples each:
+It must not sleep. Python's time.sleep() waits for an absolute CLOCK_MONOTONIC
+deadline computed from a vDSO read, so in a guest whose vDSO clock is 2125 s ahead
+of its kernel's a half-second sleep returned 2125 s later: the first version of
+this check hung in L2 that way until the test's own 1140 s limit, twice. The level
+script also runs it under `timeout`, whose timer is relative.
+
+Two checks, three samples each, back to back:
   - CLOCK_MONOTONIC_RAW through the vDSO and through the syscall agree within 1 ms;
   - 0 <= CNTVCT_EL0 - cycle_last < 600 s of ticks, with cycle_last, mask, mult and
     shift read from the vDSO data page under its seqlock. Skipped, and said so, when
@@ -113,7 +119,6 @@ for sample in range(3):
                     f"CNTVCT_EL0 at EL0 is {delta / freq:+.3f} s from the kernel's cycle_last "
                     f"(cntvct={count} cycle_last={cycle_last} mult={mult} shift={shift})"
                 )
-    time.sleep(0.5)
 
 
 
