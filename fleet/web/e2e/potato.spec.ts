@@ -439,6 +439,30 @@ test("density: on a phone the slots sit under the ring, the cards fit, and nothi
   await ctx.close();
 });
 
+for (const [width, cpus] of [[360, 16], [320, 8]] as const) {
+  test(`density: under the ring on a ${width} px phone, ${cpus} CPU slots wrap inside their card`, async ({ browser }) => {
+    await startDense(32, { cpus, players: 32 });
+    const ctx = await browser.newContext({ viewport: { width, height: 800 }, isMobile: true, hasTouch: true, deviceScaleFactor: 1 });
+    const page = await ctx.newPage();
+    await openPotato(page);
+    await expect(page.getByTestId("potato-cpus")).toBeVisible();
+    await expect(page.locator(".potato-centre")).toHaveCount(0);
+    // the card and every chip and word in it, read in one task so no tick redraws the list between
+    const out = await page.evaluate(() => {
+      const card = document.querySelector(".potato-cpus-card")!.getBoundingClientRect();
+      const over: string[] = [];
+      for (const el of document.querySelectorAll(".potato-cpus-card [data-testid='potato-slot'], .potato-cpus-card .cpus-heading, .potato-cpus-card .slot-label")) {
+        const r = el.getBoundingClientRect();
+        if (r.left < card.left - 1 || r.right > card.right + 1) over.push(`${el.className || el.getAttribute("data-testid")} ${Math.round(r.left)}..${Math.round(r.right)} outside ${Math.round(card.left)}..${Math.round(card.right)}`);
+      }
+      return { over, slots: document.querySelectorAll(".potato-cpus-card [data-testid='potato-slot']").length };
+    });
+    expect(out.slots).toBe(cpus);
+    expect(out.over, "every chip and label stays inside the card").toEqual([]);
+    await ctx.close();
+  });
+}
+
 test("density: with no allotment (an old agent) the page shows the ring, the machine count and the ladder, and no CPU figure", async ({ page }) => {
   await admin("/mock/potato", { cpus: 0, players: 8, size: 8, next_in_ms: 500 });
   await expect.poll(async () => (await mockPotato()).round?.size ?? null, { timeout: 10_000 }).toBe(8);

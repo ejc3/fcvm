@@ -140,6 +140,13 @@
 .potato-centre { position: absolute; transform: translate(-50%, -50%); }
 .potato-cpus { display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; }
 .potato-cpus-card .potato-cpus { align-items: flex-start; text-align: left; }
+/* Under the ring (slotsLayout chose "below", or there is no ring): the card is as wide as the screen, so the groups and the chips in them wrap rather than run past it. */
+.potato-cpus-card { min-width: 0; }
+.potato-cpus-card .potato-cpus { max-width: 100%; }
+.potato-cpus-card .cpus-heading { white-space: normal; }
+.potato-cpus-card .slot-groups { flex-wrap: wrap; justify-content: flex-start; max-width: 100%; }
+.potato-cpus-card .slot-group { max-width: 100%; }
+.potato-cpus-card .slot-row { flex-wrap: wrap; }
 .cpus-heading { margin: 0; font: 600 20px var(--sans); white-space: nowrap; }
 .cpus-asleep { margin: 0; font: 400 14px var(--mono); color: var(--muted); }
 .slot-groups { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: nowrap; justify-content: center; gap: 10px 6px; }
