@@ -449,7 +449,7 @@ cmd_validate() {
     local version patches_dir
     version=$(get_kernel_version "$profile") || error "Could not resolve kernel version for profile '$profile'"
     patches_dir=$(get_patches_dir "$profile") || error "Could not resolve patches_dir for profile '$profile'"
-    local workdir="/tmp/kernel-validate-$$"
+    local workdir="${KERNEL_PATCH_WORKDIR:-/tmp/kernel-validate-$$}"
 
     # An empty patches_dir means the profile deliberately applies no patches.
     if [[ -z "$patches_dir" ]]; then
