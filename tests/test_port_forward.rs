@@ -197,7 +197,7 @@ fn test_port_forward_rootless() -> Result<()> {
     let vm_name = format!("port-rootless-{}", std::process::id());
 
     // Use dynamic port to avoid conflicts with system services
-    let host_port = common::find_available_high_port().context("finding available port")?;
+    let (_host_port_held, host_port) = common::test_ports::reserved_port_number();
     let publish_arg = format!("{}:80", host_port);
     // A mapping on the host's ::1 as well. pasta splices a connection from a loopback
     // client into the VM's namespace and connects to the guest's IPv6 address from
@@ -360,16 +360,11 @@ fn test_port_forward_routed() -> Result<()> {
     let vm_name = format!("port-routed-{}", std::process::id());
 
     // Use dynamic port to avoid conflicts with system services
-    let host_port = common::find_available_high_port().context("finding available port")?;
+    let (_host_port_held, host_port) = common::test_ports::reserved_port_number();
     let publish_arg = format!("{}:80", host_port);
     // A different port for the mapping that names its host address, so a listener on
     // the loopback IP at that port could only be this mapping's.
-    let addressed_port = loop {
-        let port = common::find_available_high_port().context("finding available port")?;
-        if port != host_port {
-            break port;
-        }
-    };
+    let (_addressed_port_held, addressed_port) = common::test_ports::reserved_port_number();
     let addressed_ip = common::private_loopback_ip();
     let addressed_publish_arg = format!("{}:{}:80", addressed_ip, addressed_port);
 

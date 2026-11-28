@@ -1530,9 +1530,9 @@ async fn a_sigkilled_bridged_vm_leaves_its_network_to_the_next_launch() -> Resul
     let (name, clone_name, snapshot, _) = common::unique_names("reclaim-bridged");
     // Two host ports on one guest port: their MASQUERADE and FORWARD rules are the
     // same rule twice.
-    let port = common::find_available_high_port()?;
+    let (_port_held, port) = common::test_ports::reserved_port_number();
     let publish = format!("{port}:80");
-    let second_port = common::find_available_port(port + 1, 1000)?;
+    let (_second_port_held, second_port) = common::test_ports::reserved_port_number();
     let second_publish = format!("{second_port}:80");
     let (mut baseline, baseline_pid) = common::spawn_fcvm(&[
         "podman",

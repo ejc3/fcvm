@@ -683,7 +683,7 @@ async fn a_syn_cookie_handshake_does_not_reach_a_restored_clone() -> Result<()> 
 #[tokio::test]
 async fn a_loopback_ports_client_connection_does_not_outlive_a_restore() -> Result<()> {
     let (golden_name, clone_name, snapshot_name, _) = common::unique_names("loopclient");
-    let host_port = common::find_available_high_port()?;
+    let (_host_port_held, host_port) = common::test_ports::reserved_port_number();
     let (mut golden_child, golden_pid, _golden_log) = common::spawn_fcvm_with_env_and_log_path(
         &[
             "podman",

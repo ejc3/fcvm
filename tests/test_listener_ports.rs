@@ -6,7 +6,10 @@
 //! refuse can answer, and a program the test starts on that port can fail to bind it.
 //! `src/test_ports.rs` has an address for each of the two that stays the test's.
 //!
-//! The pin below is a lint over the three ways this tree wrote that, found when the
+//! A port probed free by binding it and letting it go is the same thing: nothing holds
+//! it between the probe and the program's bind.
+//!
+//! The pin below is a lint over the four ways this tree wrote that, found when the
 //! sites were converted. It is not a Rust parser: a new way to write the same thing is
 //! not caught, and gets its shape added here when one is found.
 
@@ -90,6 +93,18 @@ fn listeners_bound_for_their_address(source: &str) -> Vec<(&'static str, String)
                     "bound and read in one statement",
                     excerpt(&statement[bind..]),
                 ));
+            }
+        }
+    }
+
+    // A port is probed: bound to see whether it is free, and let go for a program to bind.
+    // A bind of port 0 asks about the address, not about a port, and is left alone.
+    //     if TcpListener::bind(addr).is_ok() { return Ok(port); }
+    let probe = Regex::new(r"::bind\((.*)\)\.is_ok\(\)").unwrap();
+    for statement in flat.split([';', '{', '}']) {
+        if let Some(hit) = probe.captures(statement) {
+            if !hit[1].trim_end_matches(')').ends_with(", 0") {
+                found.push(("probed and let go", excerpt(&hit[0])));
             }
         }
     }
@@ -192,7 +207,7 @@ fn the_pin_sees_each_shape_and_leaves_a_kept_listener_alone() {
             .map(|(shape, _)| shape)
             .collect()
     };
-    // The three shapes, as the tree had them.
+    // The four shapes, as the tree had them.
     assert_eq!(
         shapes(
             r#"let nobody = TcpListener::bind("127.0.0.1:0")
@@ -228,6 +243,20 @@ fn the_pin_sees_each_shape_and_leaves_a_kept_listener_alone() {
             drop(host_listener); // Release the port so bind_port_forwards can bind it"#
         ),
         ["bound, read and dropped"]
+    );
+    assert_eq!(
+        shapes(
+            r#"let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+            if TcpListener::bind(addr).is_ok() {
+                return Ok(port);
+            }"#
+        ),
+        ["probed and let go"]
+    );
+    // Asking whether an address can be bound at all takes no port from the answer.
+    assert_eq!(
+        shapes(r#"let v6_available = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_ok();"#),
+        [] as [&str; 0]
     );
     // A listener that goes on to accept is none of them, dropped later or not.
     assert_eq!(

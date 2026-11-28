@@ -2374,52 +2374,13 @@ pub fn startup_snapshot_key(base_key: &str) -> String {
     )
 }
 
-/// Find an available TCP port starting from a given port.
-///
-/// Scans ports from start_port to start_port+range_size-1 and returns
-/// the first port that can be bound. This avoids conflicts with system
-/// services and wildcard binds.
-pub fn find_available_port(start_port: u16, range_size: u16) -> anyhow::Result<u16> {
-    use std::net::{SocketAddr, TcpListener};
-
-    for i in 0..range_size {
-        let port = start_port + i;
-        // Check 0.0.0.0 to detect wildcard binds that block all interfaces
-        let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
-
-        // Try to bind - if successful, no wildcard bind exists on this port
-        if TcpListener::bind(addr).is_ok() {
-            return Ok(port);
-        }
-    }
-
-    anyhow::bail!(
-        "No available port found in range {}..{}",
-        start_port,
-        start_port + range_size
-    )
-}
-
-/// Find an available port in the default high port range (10000-60000).
-///
-/// Uses a random starting point to avoid race conditions when multiple
-/// callers try to find ports in quick succession.
-pub fn find_available_high_port() -> anyhow::Result<u16> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Use time-based pseudo-random offset to reduce collision likelihood
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u16)
-        .unwrap_or(0);
-    let offset = seed % 40000; // Stay within 10000-50000 range
-    find_available_port(10000 + offset, 50000 - offset)
-}
-
 /// A loopback address for one test process to publish on by name.
 ///
-/// 127.0.0.1 is shared with every other test, so a port probed free there can be taken
-/// before fcvm binds it. All of 127/8 is local on Linux, VM loopback IPs are allocated
-/// upward from 127.0.0.2, and the process id keeps concurrent test processes apart.
+/// 127.0.0.1 is shared with every other test, so a port there can be taken before fcvm
+/// binds it. All of 127/8 is local on Linux, VM loopback IPs are allocated upward from
+/// 127.0.0.2, and the process id keeps concurrent test processes apart. The port to
+/// publish there comes from `test_ports::reserved_port_number`, which keeps every
+/// wildcard socket off it.
 pub fn private_loopback_ip() -> String {
     let pid = std::process::id();
     format!(

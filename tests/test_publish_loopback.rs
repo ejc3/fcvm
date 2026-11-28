@@ -114,13 +114,8 @@ fn run_publish_loopback_case(network: &str) -> Result<()> {
     println!("\npublish loopback case: {network}");
     let fcvm_path = common::find_fcvm_binary()?;
     let vm_name = format!("publoop-{network}-{}", std::process::id());
-    let host_port = common::find_available_high_port().context("finding a host port")?;
-    let mut proxy_host_port =
-        common::find_available_high_port().context("finding a proxy host port")?;
-    while proxy_host_port == host_port {
-        proxy_host_port =
-            common::find_available_high_port().context("finding a distinct proxy host port")?;
-    }
+    let (_host_port_held, host_port) = common::test_ports::reserved_port_number();
+    let (_proxy_host_port_held, proxy_host_port) = common::test_ports::reserved_port_number();
 
     // nginx, whose `listen` directive gives exact control over the bind address —
     // unlike busybox `nc`, which has no bind-address option in this image.
@@ -265,11 +260,8 @@ fn run_loopback_client_case(network: &str) -> Result<()> {
     const PLAIN: u16 = 9233;
     let fcvm_path = common::find_fcvm_binary()?;
     let vm_name = format!("publoopclient-{network}-{}", std::process::id());
-    let loopback_host_port = common::find_available_high_port()?;
-    let mut plain_host_port = common::find_available_high_port()?;
-    while plain_host_port == loopback_host_port {
-        plain_host_port = common::find_available_high_port()?;
-    }
+    let (_loopback_host_port_held, loopback_host_port) = common::test_ports::reserved_port_number();
+    let (_plain_host_port_held, plain_host_port) = common::test_ports::reserved_port_number();
     let guest_cmd = format!(
         "set -e\n\
          printf 'server {{ listen 127.0.0.1:{AS_LOOPBACK}; location / {{ return 200 \"client=$remote_addr\"; }} }}\\n\
