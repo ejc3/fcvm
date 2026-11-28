@@ -155,7 +155,7 @@ impl SpanCollector {
                 }
             })
             .collect();
-        by_operation.sort_by(|a, b| b.count.cmp(&a.count));
+        by_operation.sort_by_key(|b| std::cmp::Reverse(b.count));
 
         Some(SpanSummary {
             count: total_latencies.len(),

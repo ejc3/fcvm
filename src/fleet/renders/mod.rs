@@ -271,7 +271,7 @@ fn prune_clone_logs(
             (age >= settled).then(|| (modified, e.path()))
         })
         .collect();
-    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    logs.sort_by_key(|b| std::cmp::Reverse(b.0));
     logs.iter()
         .skip(keep)
         .filter(|(_, path)| std::fs::remove_file(path).is_ok())
