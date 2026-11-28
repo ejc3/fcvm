@@ -1053,6 +1053,40 @@ pub fn set_progress_sink(sink: Arc<dyn ProgressSink>) {
     }
 }
 
+/// Hand one line of the agent's own to the host on the output connection, stamped now.
+/// False when no connection takes it (none registered, not established, its queue full):
+/// the caller still has the line. For output whose bulk must stay off the serial console
+/// outside a restore log window too (`vitals::PileupOut`).
+pub fn send_to_host(line: &str) -> bool {
+    let Some(state) = CONSOLE.get() else {
+        return false;
+    };
+    let sink = state.ctl().sink.clone();
+    let Some(sink) = sink else {
+        return false;
+    };
+    sink.connected()
+        && sink
+            .send(&[ProgressLine {
+                logged: Instant::now(),
+                bytes: line.as_bytes().to_vec(),
+            }])
+            .is_ok()
+}
+
+/// Bytes of this guest's console output that have not left for the UART: what the writer
+/// thread still holds plus what the tty has queued. None when there is no console of this
+/// module's, or the tty will not say what it has queued.
+pub fn unsent() -> Option<u64> {
+    let state = CONSOLE.get()?;
+    let held = state
+        .enqueued
+        .load(Ordering::SeqCst)
+        .saturating_sub(state.disposed.load(Ordering::SeqCst));
+    let queued = u64::try_from(state.uart_backlog()).ok()?;
+    Some(held + queued)
+}
+
 /// A snapshot boundary is behind this guest and a restore of it may be under way: from
 /// now until [`RESTORE_LOG_WINDOW`] later, progress lines are kept off the console (see
 /// the module doc). Called BEFORE the quiesce guard that held the console across the
