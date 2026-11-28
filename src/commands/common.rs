@@ -5408,8 +5408,8 @@ async fn reflink_disks_to_snapshot(
     let disk_dir = crate::storage::snapshot::snapshot_disk_dir(temp_snapshot_dir);
     let runtime_disks = runtime_disks_of(disk_path, &snapshot_config.vm_id);
     // `commit_free` (--memory-dir): disks with few extents are reflinked into an ordinary
-    // directory, which commits no transaction, and a clone of the snapshot reflinks them
-    // again (REFLINK_MAX_EXTENTS) rather than snapshotting a subvolume.
+    // directory, which commits no transaction (REFLINK_MAX_EXTENTS), and a clone of the
+    // snapshot reflinks them again, since an ordinary directory cannot be snapshotted.
     let reflink_into_dir = commit_free && {
         let mut files = vec![disk_path.to_path_buf()];
         files.extend(

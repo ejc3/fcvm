@@ -1,5 +1,8 @@
 # start-pieces results
 
+A historical record: every section below was measured on the stock host kernel 7.0.0-1013-aws, which fcvm no
+longer uses.
+
 One c8g.metal-48xl (192 Graviton4 cores, 377 GiB), host kernel 7.0.0-1013-aws,
 `/mnt/fcvm-btrfs` a btrfs image in a file on tmpfs (`/mnt/ram/btrfs.img`) mounted through a loop
 device, whose request queue holds 128 (`../README.md`, "The store"), one boot, 2026-11-22. Snapshot: `bench-start-rate-prep`
@@ -247,6 +250,10 @@ C=128, 0 held, one copy 232 ops/s, 16 copies 366 ops/s, 0.014 and 0.016 CPU-s pe
 source file serializes part of it; the rest is not attributed yet.
 
 ### 4. disk: reflink while one of 8 slots is free, else a subvolume snapshot (#2014)
+
+Measured on the stock host kernel 7.0.0-1013-aws, which fcvm no longer uses. The rule this section describes is
+gone: every clone of a snapshot disk subvolume it can own now takes the subvolume snapshot, and falls back to a
+reflink only when the snapshot is refused (see `.claude/CLAUDE.md`).
 
 The rest is the source inode's lock: every clone of a snapshot reflinks the same file, and
 `btrfs_remap_file_range` holds that inode's lock (`lock_two_nondirectories`) for the whole

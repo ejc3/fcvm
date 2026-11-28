@@ -55,8 +55,9 @@ mod helper_spawn_tests {
     /// or `btrfs subvolume snapshot` spawned bare outlived a SIGKILLed create: stopped before
     /// it made the staging directory, it made it after the next sweep had
     /// removed the record of it, and nothing then removed the directory (#1918). The same
-    /// holds for the clone's subvolume snapshot and reflink, and for `truncate`, which
-    /// creates the disk it is asked to extend when the disk is gone.
+    /// holds for `truncate`, which creates the disk it is asked to extend when the disk is
+    /// gone. Subvolume snapshots and reflinks are ioctls fcvm makes itself, and spawn
+    /// nothing.
     #[test]
     fn storage_and_snapshot_helpers_die_with_fcvm() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage");
@@ -109,15 +110,22 @@ mod helper_spawn_tests {
             bare.join("\n")
         );
         let disk = without_test_modules(include_str!("disk.rs"));
+        assert!(
+            body_of(&disk, "pub async fn create_dir_or_subvolume(")
+                .contains("crate::utils::helper_command(\"btrfs\")"),
+            "create_dir_or_subvolume spawns no helper_command"
+        );
+        // A subvolume snapshot is an ioctl of fcvm's own, so nothing outlives a killed fcvm:
+        // the kernel finishes the ioctl before the process exits.
         for function in [
-            "pub async fn create_dir_or_subvolume(",
             "pub async fn stage_from_parent_subvolume(",
             "pub async fn snapshot_disk_subvolume(",
             "async fn snapshot_base_subvolume(",
         ] {
+            let body = body_of(&disk, function);
             assert!(
-                body_of(&disk, function).contains("crate::utils::helper_command(\"btrfs\")"),
-                "{function} spawns no helper_command"
+                body.contains("snapshot_subvolume(") && !body.contains("helper_command("),
+                "{function} does not snapshot by the in-process ioctl"
             );
         }
     }

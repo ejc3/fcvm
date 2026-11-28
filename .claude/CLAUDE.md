@@ -3398,7 +3398,8 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 - Base rootfs: `/mnt/fcvm-btrfs/rootfs/layer2-{sha}.raw` (~10GB raw disk with Ubuntu 24.04 + Podman)
 - VM disks: `/mnt/fcvm-btrfs/vm-disks/{bucket}/{vm_id}/disks/rootfs.raw` (sparse, expanded per `--rootfs-size`)
 - A snapshot keeps its disks (`disk.raw` and the extra disks) in `snapshots/{tag}/disk/`, a btrfs subvolume, and a
-  clone's `disks/` directory is one `btrfs subvolume snapshot` of it with the disk renamed to `rootfs.raw`. A reflink
+  clone's `disks/` directory is one subvolume snapshot of it with the disk renamed to `rootfs.raw`, made in fcvm's own
+  process with `BTRFS_IOC_SNAP_CREATE_V2` (`snapshot_subvolume`; a start forks and execs no `btrfs` tool). A reflink
   copy of the disk is O(extents): 9 to 11 s per clone on a 154 GB www root disk with 860,177 extents, 11 of a 25 s
   restore ACK (2026-10-15); the subvolume snapshot costs one transaction commit whatever the extent count: 20 to 60 ms
   on a quiet host, 0.2 to 1.0 s on a shared devserver at load 14 to 46. The disks sit in their own
@@ -3407,39 +3408,21 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   extent (2.57 s for a 128 GiB memory image of 2,969,599 extents). Where the store cannot make a subvolume (not
   btrfs, or btrfs behind a FUSE map in a nested guest) `disk/` is an ordinary directory and the clone reflinks the
   disk as before, and so does an unprivileged clone of a snapshot another user made (a snapshot keeps every inode's
-  owner, so it would get a disk it cannot write or remove). A disk of at most 4096 extents (`REFLINK_MAX_EXTENTS`,
-  counted with FIEMAP) is reflinked while one of the snapshot's 8 reflink slots (`REFLINK_SLOTS`: `flock`ed
-  `reflink-slot-N.lock` files beside `disk/`, taken without waiting and freed by the kernel when the clone's process
-  exits) is free, and takes the subvolume snapshot when all 8 are held. Both costs are measured: the subvolume
-  snapshot's commit, and the parent directory lock it holds through the commit, took 193 ms p50 and 1.8 s p99 with
-  four restores and four snapshots at once on a fleet host, against 17 ms and 192 ms for a reflink of a 684-extent
-  disk; but every clone of a snapshot reflinks the same source file and btrfs holds that inode's lock for the whole
-  reflink, so reflinks of one snapshot run one at a time, 4.6 ms each for an 871-extent disk, about 240 per second
-  at any concurrency. With 8 queued the last waits about 8 x 4.6 = 37 ms, under the subvolume median, and the fleet
-  relaunches 8 tiles of one snapshot at once, which stay on reflinks; deeper queues take subvolume snapshots, which
-  share no lock. A slot that frees in the middle of a burst is not taken: a
-  clone that takes the subvolume snapshot holds a read lock (`F_OFD_SETLK`) on one byte, drawn at random among 64, of
-  `subvolume-snapshot.lock` beside the slots, for its snapshot and 100 ms after it (`SUBVOLUME_SNAPSHOT_LINGER`: the
-  snapshots that share a commit end together, and the clones that arrive next must still find the burst), and a clone
-  with a free slot takes the subvolume snapshot too while at least 4 of the 64 bytes are held (`SNAPSHOT_BURST`).
-  `subvolume_snapshot_burst` counts the held bytes with `F_OFD_GETLK`, which takes no lock. The kernel answers with
-  the first lock in the way in the order the locks were taken, not the lowest byte, so the count asks both sides of
-  every byte it finds. Clones that drew the same byte count as one: 4 clones hold 4 different bytes in 91 draws of
-  100, and 5 hold at least 4 in 99. A reflink joins a transaction for every
-  extent and waits out each commit that starts meanwhile, and the commits carry what the reflinks dirtied, so the two
-  paths running together slow each other. Fewer held bytes than 4 are a clone or two that found every slot held; the
-  clones after them reflink, as before the mark, which matters where a subvolume snapshot is the slower path (a host
-  writing snapshots at the same time). A burst lasts while about 4 clones arrive per snapshot duration plus 100 ms.
-  On the disk piece (bench/start-rate/pieces RESULTS.md, c8g.metal-48xl, stock kernel 7.0.0-1013-aws,
-  none held), clones per second at C=1, 8, 128 and 512 were 286, 237, 1263 to 1689 and 1641 to 1977 with the slots,
-  against 286, 236, 235 and 256 for reflinks only and 128 to 140, 561 to 640, 1287 to 1316 and 1779 to 1943 for
-  subvolume snapshots only. The C=8 reflink p50 there was 47 ms, not the 37 ms the arithmetic gives. `rm -rf` removes
+  owner, so it would get a disk it cannot write or remove). Every other clone takes the subvolume snapshot, a small
+  disk included, and falls back to a reflink only when the snapshot is refused. On fcvm's host kernel (7.3.3-fcvm, one local NVMe device, a standalone microbenchmark of 2000
+  operations, 2026-11-28) reflinks of an 871-extent file ran one after another at 230 to 250 per second at every
+  concurrency from 1 to 512, from one file, 16 reflinked copies or 16 byte copies alike: they serialize on the root of
+  the one subvolume tree the clones land in (`btrfs_lock_root_node < btrfs_insert_replace_extent < btrfs_clone`), and
+  unlinking reflinked files queues on the same tree (150 to 300 per second). Subvolume snapshots ran at 1,500 per
+  second alone (against 250 for reflinks), 7,000 at 16 at once and 13,800 at 128, because the snapshots that wait
+  together share one commit. Through fcvm at C=512 the 8 clones of 2000 that took a reflink slot, when there were slots, took 4.8 to
+  7.8 s each, the slowest 0.4% of the starts (p99 was 1.6 s). `rm -rf` removes
   subvolumes, so teardown is unchanged, but btrfs reclaims a removed subvolume's space on its cleaner thread after the rmdir returns, where an unlinked reflink
   freed its space at once; `df` right after many clone teardowns can read high for a while.
 - Each snapshot directory is a btrfs subvolume too, and a diff snapshot is staged as a subvolume snapshot of its
   parent's directory, keeping only the parent's `memory.bin`, which the diff is then written into
-  (`stage_from_parent_subvolume`). A memory file written by in-place diffs fragments: one written by eight of them
-  held 11,824,233 extents, a reflink of it took 133 s and removing that copy 52 s, while the subvolume snapshot and
+  (`stage_from_parent_subvolume`, by the same ioctl). A memory file written by in-place diffs fragments: one
+  written by eight of them held 11,824,233 extents, a reflink of it took 133 s and removing that copy 52 s, while the subvolume snapshot and
   its delete each finished within a second (2026-10-27). The parent's directory was synced when its own snapshot
   finished, so the flush a subvolume snapshot does first finds little. Snapshot directories are deleted with
   `btrfs subvolume delete` (`remove_snapshot_dir`), which detaches them at once, where `rm -rf` would drop the memory
@@ -3935,34 +3918,12 @@ separately.
   `filled_holes_mapped` counts the pages replay mapped at holes earlier clones filled.
 - **Replay trades memory for latency.** A replaying clone materialises the recorded set at
   restore instead of faulting it in as it runs. The set is a union over the recording
-  windows of a generation's first few clones (above). With three waves of 1000 rootless
-  nginx clones per snapshot at C=128, each held 330 s, past the 300 s window (256 MiB
-  guests; m8gd.metal-24xl, Ubuntu's 7.0.0-1018-aws, btrfs on NVMe RAID0; one snapshot per
-  arm, #2056), the set held 68 MiB with every clone's window unioned and 66 MiB with the
-  bound, and wave 3's private memory was 68.5 and 69.9 MiB per clone. With the guest's
-  120 s boot burst gone (#2052) these clones' windows record the same pages, so on this
-  workload the bound changes nothing; it bounds growth where windows differ. Where they
-  differ it holds the set. Seven clones in turn, one run per arm, each reading a different
-  128 MiB of an 896 MiB tmpfs file that the snapshot of a 2 GiB alpine guest holds, inside a
-  60 s window, the seventh repeating the first's 128 MiB (c8gd.metal-24xl, Ubuntu's
-  7.0.0-1018-aws, btrfs on NVMe RAID0; private memory is the clone's Firecracker
-  `Anonymous` after its read):
-
-  | clone | set after it, MiB (all windows / bound) | clone private memory, MiB (all windows / bound) |
-  |---|---|---|
-  | 1 | 316 / 321 | 182 / 174 |
-  | 2 | 455 / 456 | 393 / 381 |
-  | 3 | 586 / 587 | 530 / 512 |
-  | 4 | 721 / 718 | 662 / 643 |
-  | 5 | 851 / 718 | 792 / 774 |
-  | 6 | 982 / 718 | 923 / 776 |
-  | 7, as 1 | 982 / 718 | 923 / 645 |
-
-  The repeat clone was no slower with the bound (all windows first, then the bound): 877
-  and 1,216 demand faults, replay 59 and 43 ms, restore acknowledged in 52 and 44 ms. In copy
-  mode every replayed page is a private copy, so a clone also holds pages it would never have
-  touched, including a clone that is created and destroyed at once (#955, #956). Turn replay
-  off for workloads that spawn many clones which never run, or
+  windows of a generation's first few clones (above). With the guest's 120 s boot burst gone
+  (#2052), clones of one workload record the same pages, so there the bound changes nothing;
+  it bounds the set's growth where the clones' windows differ, and there it holds the set.
+  In copy mode every replayed page is a private copy, so a clone also holds pages it would
+  never have touched, including a clone that is created and destroyed at once (#955, #956).
+  Turn replay off for workloads that spawn many clones which never run, or
   bound what each clone replays with `--uffd-prefetch-max-mib` (`FCVM_UFFD_PREFETCH_MAX_MIB`
   for the implicit server): replay stops planning once it has passed that much of the set,
   and the rest faults on demand (#955). Unbounded by default.

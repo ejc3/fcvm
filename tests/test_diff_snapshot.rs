@@ -285,26 +285,17 @@ async fn test_diff_snapshot_cache_hit_fast() -> Result<()> {
 ///
 /// When a user creates a snapshot from a VM that was cloned from another snapshot,
 /// the new snapshot should use the source snapshot as its parent (creating a Diff).
-/// A test VM's disk has few extents, so the clone got it as a reflink and the
-/// snapshot reflinks it again.
+/// On a btrfs store the clone's disk directory is a subvolume snapshot of the first
+/// snapshot's, whatever the disk's extent count, and the second snapshot takes it whole
+/// as a subvolume snapshot.
 #[tokio::test]
 async fn test_user_snapshot_from_clone_uses_parent() -> Result<()> {
-    user_snapshot_from_clone_uses_parent("user-parent", false).await
+    user_snapshot_from_clone_uses_parent("user-parent").await
 }
 
-/// The same with `FCVM_REFLINK_MAX_EXTENTS=0`: the clone's disk directory is a subvolume
-/// snapshot of the first snapshot's, and the second snapshot takes it whole as a
-/// subvolume snapshot.
-#[tokio::test]
-async fn test_user_snapshot_from_a_clone_with_subvolume_disks_uses_parent() -> Result<()> {
-    // nextest runs each test in a process of its own; the fcvm processes it starts inherit this
-    std::env::set_var(fcvm::storage::disk::REFLINK_MAX_EXTENTS_ENV, "0");
-    user_snapshot_from_clone_uses_parent("user-parent-sv", true).await
-}
-
-/// A snapshot of a clone diffs against the clone's snapshot. `subvolume_disks`: the clone's
-/// disks are a subvolume snapshot (else reflinks), which the second snapshot takes whole.
-async fn user_snapshot_from_clone_uses_parent(prefix: &str, subvolume_disks: bool) -> Result<()> {
+/// A snapshot of a clone diffs against the clone's snapshot, and takes the clone's disk
+/// subvolume whole.
+async fn user_snapshot_from_clone_uses_parent(prefix: &str) -> Result<()> {
     println!("\nDiff Snapshot: User Snapshot from Clone");
     println!("========================================");
 
@@ -439,18 +430,11 @@ async fn user_snapshot_from_clone_uses_parent(prefix: &str, subvolume_disks: boo
             stderr.contains("staged as a subvolume snapshot of the parent"),
             "the diff was not staged from the parent's subvolume:\n{stderr}"
         );
-        // A clone whose disk directory is a subvolume snapshot of the first snapshot's disk/
-        // has it taken whole by the second snapshot; a clone of a small disk got reflinks,
-        // and the second snapshot reflinks them.
-        assert_eq!(
+        // The clone's disk directory is a subvolume snapshot of the first snapshot's disk/,
+        // a test VM's small disk included, and the second snapshot takes it whole.
+        assert!(
             stderr.contains("snapshotted the VM's disk subvolume"),
-            subvolume_disks,
-            "the clone's disks were {} as a subvolume snapshot:\n{stderr}",
-            if subvolume_disks {
-                "not taken"
-            } else {
-                "taken"
-            }
+            "the clone's disks were not taken as a subvolume snapshot:\n{stderr}"
         );
         let snapshot2_dir = snapshot_dir().join(&snapshot2_name);
         assert!(
