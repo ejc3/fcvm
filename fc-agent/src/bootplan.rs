@@ -70,10 +70,70 @@ async fn read_vsock_doc() -> Result<serde_json::Value> {
         .with_context(|| format!("parsing boot-plan JSON ({} bytes)", buf.len()))
 }
 
-/// Fetch the container plan via the selected transport.
-pub async fn fetch_plan(transport: Transport) -> Result<Plan> {
+/// How often the boot-plan retry loop prints its count line while the same error repeats.
+const RETRY_COUNT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the boot-plan retry loop prints about its failed attempts: an error in full the
+/// first time it is seen, and after that one count line every [`RETRY_COUNT_EVERY`].
+///
+/// The loop retries every 500 ms until the guest's network is up, and it used to print
+/// each failure whole: about a kilobyte per attempt. In a guest two levels down, where a
+/// console byte costs about 2 ms, those blocks were 7.6 KB of a 20 KB burst that held
+/// CPU 0 in the UART for 34 s (#2250).
+#[derive(Default)]
+pub struct RetryLog {
+    /// The errors printed in full so far, each on one line.
+    shown: Vec<String>,
+    /// Failures since the last line about them, and when that line was.
+    repeats: u32,
+    last_line: std::time::Duration,
+}
+
+/// How many different errors the retry loop prints in full. Past that, an error it has
+/// not shown is counted like one it has, with its one-line form in the count line.
+const RETRY_ERRORS_SHOWN: usize = 8;
+
+impl RetryLog {
+    /// Whether the next attempt may print its own progress and failure detail: only while
+    /// no failure has been printed yet.
+    pub fn verbose(&self) -> bool {
+        self.shown.is_empty()
+    }
+
+    /// The lines to print for one failed attempt at `now` (time since the loop began).
+    /// `summary` is the error on one line, `detail` its full form.
+    pub fn failed(&mut self, summary: &str, detail: &str, now: std::time::Duration) -> Vec<String> {
+        let known = self.shown.iter().any(|shown| shown == summary);
+        if !known && self.shown.len() < RETRY_ERRORS_SHOWN {
+            self.shown.push(summary.to_string());
+            self.repeats = 0;
+            self.last_line = now;
+            return vec![
+                format!("[fc-agent] boot plan not ready: {detail}"),
+                "[fc-agent] retrying every 500ms; this error is printed once, then counted"
+                    .to_string(),
+            ];
+        }
+        self.repeats += 1;
+        if now.saturating_sub(self.last_line) < RETRY_COUNT_EVERY {
+            return Vec::new();
+        }
+        let line = format!(
+            "[fc-agent] boot plan still not ready after {} more attempts ({} s): {summary}",
+            self.repeats,
+            now.as_secs()
+        );
+        self.repeats = 0;
+        self.last_line = now;
+        vec![line]
+    }
+}
+
+/// Fetch the container plan via the selected transport. `verbose` lets the MMDS fetch
+/// print its own request and failure detail, which the retry loop wants once.
+pub async fn fetch_plan(transport: Transport, verbose: bool) -> Result<Plan> {
     match transport {
-        Transport::Mmds => crate::mmds::fetch_plan().await,
+        Transport::Mmds => crate::mmds::fetch_plan(verbose).await,
         Transport::Vsock => {
             let doc = read_vsock_doc().await?;
             let plan = doc
@@ -402,5 +462,55 @@ mod clock_tests {
         assert!(parse_epoch_nanos("-1").is_err(), "before the epoch");
         assert!(parse_epoch_nanos("").is_err(), "empty");
         assert!(parse_epoch_nanos("1786000000.5").is_err(), "fractional");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The retry loop's error is printed once; its repeats are a count line every ten
+    /// seconds; another error is printed in full when it first appears.
+    #[test]
+    fn a_boot_plan_error_is_printed_once_then_counted() {
+        let mut log = RetryLog::default();
+        assert!(log.verbose());
+        let mut printed = Vec::new();
+        // One attempt every 500 ms for 25 s, all failing the same way.
+        for attempt in 0..50u64 {
+            let now = std::time::Duration::from_millis(attempt * 500);
+            printed.extend(log.failed("cannot reach the MMDS", "Error {\n  cannot reach\n}", now));
+            assert!(!log.verbose());
+        }
+        let full: Vec<&String> = printed
+            .iter()
+            .filter(|line| line.contains("Error {"))
+            .collect();
+        assert_eq!(full.len(), 1, "{printed:?}");
+        assert_eq!(printed.len(), 4, "{printed:?}");
+        assert!(
+            printed[2]
+                .contains("still not ready after 20 more attempts (10 s): cannot reach the MMDS"),
+            "{printed:?}"
+        );
+        assert!(
+            printed[3].contains("after 20 more attempts (20 s)"),
+            "{printed:?}"
+        );
+        // A different failure is new evidence: in full, at once.
+        let other = log.failed(
+            "HTTP 500",
+            "Error { HTTP 500 }",
+            std::time::Duration::from_secs(26),
+        );
+        assert_eq!(other.len(), 2, "{other:?}");
+        assert!(other[0].ends_with("Error { HTTP 500 }"), "{other:?}");
+        // The first error coming back is not new: it is counted, not printed again.
+        let back = log.failed(
+            "cannot reach the MMDS",
+            "Error {\n  cannot reach\n}",
+            std::time::Duration::from_secs(27),
+        );
+        assert!(back.is_empty(), "{back:?}");
     }
 }
