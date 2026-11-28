@@ -1231,6 +1231,7 @@ const ACTIONS_THAT_UPLOAD_NOTHING: &[&str] = &[
     "actions/cache",
     "actions/cache/restore",
     "actions/cache/save",
+    "actions/setup-node",
     "Swatinem/rust-cache",
     "./fcvm/.github/actions/checkout-deps",
 ];
