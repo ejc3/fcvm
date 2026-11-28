@@ -1297,6 +1297,7 @@ fn bare_hello(host: &str) -> AgentMsg {
         windows_actions: Vec::new(),
         minecraft: 0,
         minecraft_server: None,
+        renders: None,
     }
 }
 
@@ -1384,9 +1385,25 @@ async fn an_agent_on_a_host_that_is_not_this_fleets_is_refused() {
             host("i-0aaaaaaaaaaaaaaa2", "terminated"),
         ],
     );
+    // Pages mode's host is an instance of the other group, in another region.
+    let renders = renders_fake();
+    renders.hosts.lock().unwrap().insert(
+        "us-east-2".into(),
+        vec![host("i-0ccccccccccccccc1", "running")],
+    );
     let identity = agents::FleetHosts {
-        driver: fake.clone(),
-        regions: vec!["us-east-1".into()],
+        groups: vec![
+            agents::FleetGroup {
+                class: fcvm::fleet::coord::hosts::HostClass::Gpu,
+                driver: fake.clone(),
+                regions: vec!["us-east-1".into()],
+            },
+            agents::FleetGroup {
+                class: fcvm::fleet::coord::hosts::HostClass::Renders,
+                driver: renders.clone(),
+                regions: vec!["us-east-2".into()],
+            },
+        ],
         fleet: "prod".into(),
     };
     let c = coordinator_with(Opts {
@@ -1440,6 +1457,34 @@ async fn an_agent_on_a_host_that_is_not_this_fleets_is_refused() {
     }
     *fake.fail_lists.lock().unwrap() = [("us-east-1".to_string(), 1)].into_iter().collect();
     closes(dial("i-0aaaaaaaaaaaaaaa1").await).await;
+    // The instance's class decides what its hello may say: pages mode's host says it runs the
+    // mode and has no GPU, and a GPU host does not say it runs the mode. Each hello that does
+    // not fit is refused before it reaches the state.
+    let dial_msg = |msg: AgentMsg| {
+        let url = url.clone();
+        async move {
+            let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+            ws.send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
+                .await
+                .unwrap();
+            ws
+        }
+    };
+    let pages_hello = |host: &str, gpus: serde_json::Value| -> AgentMsg {
+        serde_json::from_value(json!({"type": "hello", "host": host, "arch": "aarch64",
+            "capacity": 1, "gpus": gpus, "renders": {"cpus": 40,
+            "pages": [{"id": "example", "url": "https://example.com/"}]}}))
+        .unwrap()
+    };
+    let t4 = json!([{"sbdf": "0000:01:00.0", "name": "Tesla T4"}]);
+    closes(dial_msg(bare_hello("i-0ccccccccccccccc1")).await).await;
+    closes(dial_msg(pages_hello("i-0ccccccccccccccc1", t4.clone())).await).await;
+    closes(dial_msg(pages_hello("i-0aaaaaaaaaaaaaaa1", json!([]))).await).await;
+    let mut before = Viewer::connect(&c.url).await;
+    let s = before.until(|s| !s["scene"].is_null()).await;
+    assert_eq!(s["fleet"]["agents"]["hosts"], json!([]), "{}", s["fleet"]);
+    assert_eq!(s["fleet"]["hosts"], json!([]), "{}", s["fleet"]);
+    assert!(s["renders"].is_null(), "{}", s["renders"]);
     // This fleet's running host registers, over IPv4 or from its IPv6 prefix.
     let mut req = url.as_str().into_client_request().unwrap();
     req.headers_mut()
@@ -1453,14 +1498,18 @@ async fn an_agent_on_a_host_that_is_not_this_fleets_is_refused() {
     .await
     .unwrap();
     let _ok = dial("i-0aaaaaaaaaaaaaaa1").await;
+    let _pages = dial_msg(pages_hello("i-0ccccccccccccccc1", json!([]))).await;
     let mut v = Viewer::connect(&c.url).await;
-    let s = v
-        .until(|s| {
+    let s = tokio::time::timeout(
+        Duration::from_secs(10),
+        v.until(|s| {
             s["fleet"]["agents"]["hosts"]
                 .as_array()
-                .is_some_and(|h| !h.is_empty())
-        })
-        .await;
+                .is_some_and(|h| h.len() == 2)
+        }),
+    )
+    .await
+    .expect("both groups' hosts register");
     let names: Vec<&str> = s["fleet"]["agents"]["hosts"]
         .as_array()
         .unwrap()
@@ -1469,7 +1518,7 @@ async fn an_agent_on_a_host_that_is_not_this_fleets_is_refused() {
         .collect();
     assert_eq!(
         names,
-        vec!["i-0aaaaaaaaaaaaaaa1"],
+        vec!["i-0aaaaaaaaaaaaaaa1", "i-0ccccccccccccccc1"],
         "{}",
         s["fleet"]["agents"]
     );
@@ -1515,6 +1564,7 @@ async fn the_agent_socket_answers_pings() {
         windows_actions: Vec::new(),
         minecraft: 0,
         minecraft_server: None,
+        renders: None,
     };
     ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
@@ -1568,6 +1618,7 @@ impl FakeAgent {
                 windows_actions: Vec::new(),
                 minecraft: 0,
                 minecraft_server: None,
+                renders: None,
             },
         )
     }
@@ -1784,6 +1835,7 @@ fn minecraft_hello(host: &str, n: u32) -> AgentMsg {
         windows_actions: Vec::new(),
         minecraft: n,
         minecraft_server: Some("Pumpkin 3ea7d281 (Java Edition 26.3)".into()),
+        renders: None,
     }
 }
 
@@ -1955,6 +2007,131 @@ async fn a_minecraft_hosts_servers_reach_the_snapshot_and_its_assignment() {
 
 /// With published names, a server's frame URL is its launch's view socket under the subzone,
 /// and players join that name.
+/// A host's status rows reach only the pages that asked for them (`visibility` with
+/// `minecraft`), each host's latest and under a key that is not the host's name, and they move
+/// no version: they are not part of the state.
+#[tokio::test]
+async fn minecraft_status_rows_reach_the_pages_that_asked_and_move_no_version() {
+    let (url, handle) = coordinator(allow_all()).await;
+    let mut agent = FakeAgent::connect_hello(&handle, minecraft_hello("mc-host", 2));
+    agent.assign().await;
+    let rows = |t: u64| {
+        AgentMsg::Health(fleet_core::protocol::HealthReport {
+            id: fleet_core::minecraft::STATUS_ID.into(),
+            fps: 0.0,
+            gpu: Value::Null,
+            budget_fit: None,
+            t: None,
+            render_ms_max: None,
+            budget_every_pixel: None,
+            boot_id: None,
+            minecraft: Some(fleet_core::minecraft::MinecraftStatus {
+                t,
+                rows: fleet_core::minecraft::base64(&[
+                    3, 200, 3, 0, 9, 0, 156, 1, 1, 255, 255, 0, 255, 255, 255, 255,
+                ]),
+                cpus: Some(192),
+                busy: Some(1.5),
+                mem_total_mib: Some(385_024),
+                mem_used_mib: Some(20_480),
+            }),
+            vm_stats: None,
+        })
+    };
+    let mut asked = Viewer::connect(&url).await;
+    let mut other = Viewer::connect(&url).await;
+    asked
+        .send(json!({"type": "visibility", "visible": true, "minecraft": true}))
+        .await;
+    other
+        .send(json!({"type": "visibility", "visible": true}))
+        .await;
+    // both pages' visibility is applied before the rows come: an intent after it has its receipt
+    for v in [&mut asked, &mut other] {
+        v.intent("after-visibility", "no_such_intent", json!({}))
+            .await;
+        v.receipt("after-visibility").await;
+    }
+    // A receipt comes before the snapshot that holds its intent is published: wait for the one
+    // with both pages' arrival and the refused intent, after which nothing sent so far is still
+    // to come. (Read at once, the version was still to move by three when the whole binary ran.)
+    let settled = |text: &str| {
+        let v: Value = serde_json::from_str(text).unwrap();
+        v["state"]["viewers"]["count"] == 2
+            && v["state"]["actions"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x["id"] == "after-visibility"))
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !settled(&handle.snapshot.borrow().text) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the snapshot with both pages' arrival and the intent within 10 s");
+    let before = handle.snapshot.borrow().version;
+    agent.to_coord.send(rows(1000)).unwrap();
+    let got = asked.message("minecraft_status").await;
+    assert_eq!(got["host"], fleet_core::minecraft::host_key("mc-host"));
+    assert!(!got.to_string().contains("mc-host"), "{got}");
+    assert_eq!(got["t"], 1000);
+    assert_eq!(got["rows"], "A8gDAAkAnAEB//8A/////w==");
+    // stamped with the coordinator's clock when it came, for the rows' age
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let at = got["received_at"].as_u64().unwrap();
+    assert!(at <= now && now - at < 10_000, "{at} {now}");
+    assert_eq!((&got["cpus"], &got["busy"]), (&json!(192), &json!(1.5)));
+    assert_eq!(
+        (&got["mem_total_mib"], &got["mem_used_mib"]),
+        (&json!(385_024), &json!(20_480))
+    );
+    // the page that did not ask was sent none, though its socket is live
+    other
+        .send(json!({"type": "ping", "client_unix_ms": 2.0}))
+        .await;
+    other
+        .message_where("clock", |m| m["client_unix_ms"] == 2.0)
+        .await;
+    assert!(
+        other.other.iter().all(|m| m["type"] != "minecraft_status"),
+        "{:?}",
+        other.other
+    );
+    // and nothing in the state moved
+    assert_eq!(handle.snapshot.borrow().version, before);
+    // A later report replaces it. It comes at once, inside the gap the coordinator keeps between
+    // a host's reports, so it is kept and reaches the page when the gap ends: the test waits
+    // for the message, not for a time.
+    agent.to_coord.send(rows(2000)).unwrap();
+    asked
+        .message_where("minecraft_status", |m| m["t"] == 2000)
+        .await;
+    // a page that asks later gets the host's latest at the next report, not every one before it
+    other
+        .send(json!({"type": "visibility", "visible": true, "minecraft": true}))
+        .await;
+    other
+        .send(json!({"type": "ping", "client_unix_ms": 3.0}))
+        .await;
+    other
+        .message_where("clock", |m| m["client_unix_ms"] == 3.0)
+        .await;
+    agent.to_coord.send(rows(3000)).unwrap();
+    let late = other.message("minecraft_status").await;
+    assert_eq!(late["t"], 3000);
+    assert_eq!(
+        other
+            .other
+            .iter()
+            .filter(|m| m["type"] == "minecraft_status")
+            .count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn a_minecraft_servers_published_name_is_its_view_socket_and_join_address() {
     let (names, zone) = subzone_names();
@@ -2693,12 +2870,26 @@ async fn a_retired_tile_task_leaves_its_replacement_running() {
 
 /// A handle whose actor only records the EC2 tiles' reports, in order.
 fn recording_handle() -> (Handle, Arc<std::sync::Mutex<Vec<SlotReport>>>) {
+    let (handle, reports, _) = recorder();
+    (handle, reports)
+}
+
+/// A handle whose actor only records: the EC2 tiles' reports, and every event, in order.
+#[allow(clippy::type_complexity)]
+fn recorder() -> (
+    Handle,
+    Arc<std::sync::Mutex<Vec<SlotReport>>>,
+    Arc<std::sync::Mutex<Vec<Event>>>,
+) {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<fcvm::fleet::coord::Cmd>(256);
     let reports = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     let r2 = reports.clone();
+    let e2 = events.clone();
     tokio::spawn(async move {
         while let Some(cmd) = rx.recv().await {
             if let fcvm::fleet::coord::Cmd::Apply { event, reply } = cmd {
+                e2.lock().unwrap().push(event.clone());
                 if let Event::Ec2 { report, .. } = event {
                     r2.lock().unwrap().push(report);
                 }
@@ -2721,8 +2912,10 @@ fn recording_handle() -> (Handle, Arc<std::sync::Mutex<Vec<SlotReport>>>) {
             lambda: tokio::sync::watch::channel(Vec::new()).1,
             ec2_layout,
             broadcast_layout: tokio::sync::watch::channel(None).1,
+            minecraft_status: Default::default(),
         },
         reports,
+        events,
     )
 }
 
@@ -3598,6 +3791,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
         lambda: tokio::sync::watch::channel(Vec::new()).1,
         ec2_layout: ec2_layout_rx,
         broadcast_layout: tokio::sync::watch::channel(None).1,
+        minecraft_status: Default::default(),
     };
     let before = handle.snapshot.borrow().version;
     handle
@@ -4082,6 +4276,7 @@ fn host_config(
     on_demand_max: u32,
 ) -> fcvm::fleet::coord::hosts::HostConfig {
     fcvm::fleet::coord::hosts::HostConfig {
+        class: fcvm::fleet::coord::hosts::HostClass::Gpu,
         driver: fake.clone(),
         regions: regions.iter().map(|r| r.to_string()).collect(),
         awake_hosts,
@@ -4092,6 +4287,38 @@ fn host_config(
         capacity_retry: Duration::from_millis(300),
         lost_launch_ttl: Duration::from_secs(60),
     }
+}
+
+/// Pages mode's host group over `fake` in `region`, polling every 50 ms: one host while the
+/// fleet is awake, at most one of it on demand (as `fleet coord` builds it).
+fn renders_config(
+    fake: &Arc<fcvm::fleet::coord::hosts::FakeHosts>,
+    region: &str,
+) -> fcvm::fleet::coord::hosts::HostConfig {
+    fcvm::fleet::coord::hosts::HostConfig {
+        class: fcvm::fleet::coord::hosts::HostClass::Renders,
+        ..host_config(fake, &[region], 1, 1)
+    }
+}
+
+/// Pages mode's hosts in memory, as a second group's driver lists them. Its instance ids
+/// (`i-0f...`) are none of the GPU hosts' fake's (`i-00...`), so a test sees whose instance a
+/// notice or an agent names.
+fn renders_fake() -> Arc<fcvm::fleet::coord::hosts::FakeHosts> {
+    Arc::new(fcvm::fleet::coord::hosts::FakeHosts::numbered_from(
+        0xf << 60,
+    ))
+}
+
+/// A coordinator with the GPU hosts' group over `gpu` and pages mode's host group over
+/// `renders`.
+fn start_two_groups(
+    state: State,
+    store: Option<store::StoreTx>,
+    gpu: fcvm::fleet::coord::hosts::HostConfig,
+    renders: fcvm::fleet::coord::hosts::HostConfig,
+) -> (Handle, tokio::task::JoinHandle<()>) {
+    fcvm::fleet::coord::start_with_groups(state, store, None, None, None, vec![gpu, renders], None)
 }
 
 /// Serves the page for `handle` and connects one viewer to it.
@@ -4211,6 +4438,8 @@ fn launches(fake: &fcvm::fleet::coord::hosts::FakeHosts) -> Vec<String> {
 /// The coordinator launches the GPU hosts itself, spot first: awake at start it launches
 /// the awake capacity, with no active viewer it terminates every host, and a viewer's
 /// visible page launches them again. While it wakes, the hosts show in the snapshot.
+/// Pages mode's host is a second group on the same power state: one while awake, launched
+/// with the GPU hosts, none asleep, and never in the wake's record of GPU hosts.
 #[tokio::test]
 async fn no_active_viewer_terminates_the_gpu_hosts_and_one_launches_them() {
     use fcvm::fleet::coord::hosts::FakeHosts;
@@ -4220,13 +4449,12 @@ async fn no_active_viewer_terminates_the_gpu_hosts_and_one_launches_them() {
         ..Config::default()
     };
     let fake = Arc::new(FakeHosts::default());
-    let (handle, _actor) = start(
+    let renders = renders_fake();
+    let (handle, _actor) = start_two_groups(
         State::new(config, now_ms()),
         None,
-        None,
-        None,
-        Some(host_config(&fake, &["us-east-1"], 2, 8)),
-        None,
+        host_config(&fake, &["us-east-1"], 2, 8),
+        renders_config(&renders, "us-east-2"),
     );
     let mut v = page_viewer(&handle).await;
     v.until(|s| s["viewers"]["active"] == 1).await;
@@ -4234,11 +4462,21 @@ async fn no_active_viewer_terminates_the_gpu_hosts_and_one_launches_them() {
         f.present("us-east-1").len() == 2
     })
     .await;
+    until_hosts(&renders, "the renders host awake at start", |f| {
+        f.present("us-east-2").len() == 1
+    })
+    .await;
     assert_eq!(launches(&fake), vec!["launch us-east-1 spot 2"]);
+    assert_eq!(launches(&renders), vec!["launch us-east-2 spot 1"]);
     v.send(json!({"type": "visibility", "visible": false}))
         .await;
     v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    // Sleep leaves nothing of either group running.
     until_hosts(&fake, "asleep", |f| f.present("us-east-1").is_empty()).await;
+    until_hosts(&renders, "the renders host asleep", |f| {
+        f.present("us-east-2").is_empty()
+    })
+    .await;
     v.send(json!({"type": "visibility", "visible": true})).await;
     let s = v
         .until(|s| {
@@ -4256,6 +4494,26 @@ async fn no_active_viewer_terminates_the_gpu_hosts_and_one_launches_them() {
         launches(&fake),
         vec!["launch us-east-1 spot 2", "launch us-east-1 spot 2"]
     );
+    until_hosts(&renders, "the renders host woken", |f| {
+        f.present("us-east-2").len() == 1
+    })
+    .await;
+    assert_eq!(
+        launches(&renders),
+        vec!["launch us-east-2 spot 1", "launch us-east-2 spot 1"]
+    );
+    // Its instance is not one of the wake's GPU hosts, while the wake runs or after.
+    let renders_id = renders.present("us-east-2")[0].id.clone();
+    let end = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::timeout_at(end, v.recv()).await.is_ok() {}
+    for (version, s) in &v.snapshots {
+        let hosts = s["fleet"]["power"]["hosts"].as_array();
+        assert!(
+            hosts.is_none_or(|h| h.iter().all(|h| h["host"] != renders_id.as_str())),
+            "snapshot {version} records the renders host in the wake: {}",
+            s["fleet"]["power"]
+        );
+    }
 }
 
 /// A spot request EC2 refuses for capacity is followed by the on-demand request in the
@@ -4890,6 +5148,359 @@ async fn a_restart_keeps_the_hosts_it_finds() {
     .await;
     assert!(launches(&fake).is_empty(), "{:?}", fake.calls());
     assert_eq!(fake.present("us-east-1").len(), 1);
+}
+
+/// Pages mode's host group spends under its own on-demand cap: with spot refused for
+/// capacity it falls back to on demand in the same pass while the GPU hosts' cap is 0 and
+/// their region waits for spot.
+#[tokio::test]
+async fn a_spot_refused_renders_host_launches_on_demand_under_its_own_cap() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
+    let gpu = Arc::new(FakeHosts::default());
+    let renders = renders_fake();
+    for f in [&gpu, &renders] {
+        f.capacity
+            .lock()
+            .unwrap()
+            .insert(("us-east-1".into(), Market::Spot), 0);
+    }
+    let (_handle, _actor) = start_two_groups(
+        State::new(Config::default(), now_ms()),
+        None,
+        host_config(&gpu, &["us-east-1"], 1, 0),
+        renders_config(&renders, "us-east-1"),
+    );
+    until_hosts(&renders, "the on-demand renders host", |f| {
+        f.present("us-east-1").len() == 1
+    })
+    .await;
+    assert_eq!(
+        launches(&renders)[..2],
+        ["launch us-east-1 spot 1", "launch us-east-1 on-demand 1"]
+    );
+    assert_eq!(renders.present("us-east-1")[0].market, Market::OnDemand);
+    // Past several capacity retries: still one, and the GPU group launched nothing on demand.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(renders.hosts.lock().unwrap()["us-east-1"].len(), 1);
+    assert!(
+        launches(&gpu).iter().all(|c| c.contains(" spot ")),
+        "{:?}",
+        gpu.calls()
+    );
+}
+
+/// A region short of pages mode's host for the account's quota marks the coordinator
+/// degraded under the class's own component, `scale-renders`, while the GPU hosts' `scale`
+/// stays healthy; the failure goes once the quota allows the launch.
+#[tokio::test]
+async fn a_quota_refused_renders_launch_marks_its_class_degraded() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Market};
+    let gpu = Arc::new(FakeHosts::default());
+    let renders = renders_fake();
+    for m in [Market::Spot, Market::OnDemand] {
+        renders
+            .capacity
+            .lock()
+            .unwrap()
+            .insert(("us-east-1".into(), m), 0);
+    }
+    renders.refusal.lock().unwrap().insert(
+        Market::OnDemand,
+        "VcpuLimitExceeded: your current vCPU limit of 96".into(),
+    );
+    let (handle, _actor) = start_two_groups(
+        State::new(Config::default(), now_ms()),
+        None,
+        host_config(&gpu, &["us-east-1"], 1, 8),
+        renders_config(&renders, "us-east-1"),
+    );
+    let failure = |s: &Value, component: &str| {
+        s["failures"].as_array().and_then(|f| {
+            f.iter()
+                .find(|f| f["kind"] == "coordinator_degraded" && f["component"] == component)
+                .cloned()
+        })
+    };
+    let mut v = page_viewer(&handle).await;
+    let s = tokio::time::timeout(
+        Duration::from_secs(10),
+        v.until(|s| failure(s, "scale-renders").is_some()),
+    )
+    .await
+    .expect("the renders quota failure is reported");
+    let reason = failure(&s, "scale-renders").unwrap()["reason"].clone();
+    assert!(
+        reason.as_str().unwrap().contains("VcpuLimitExceeded"),
+        "{reason}"
+    );
+    // The GPU hosts launched: their component is healthy, and stays so between the renders
+    // group's attempts.
+    until_hosts(&gpu, "the GPU host", |f| f.present("us-east-1").len() == 1).await;
+    let since = v.latest().0;
+    let end = tokio::time::Instant::now() + Duration::from_millis(800);
+    while tokio::time::timeout_at(end, v.recv()).await.is_ok() {}
+    for (version, s) in v.snapshots.range(since..) {
+        assert!(
+            failure(s, "scale-renders").is_some(),
+            "snapshot {version} dropped the renders quota failure: {}",
+            s["failures"]
+        );
+        assert!(
+            failure(s, "scale").is_none(),
+            "snapshot {version} reports the GPU hosts degraded: {}",
+            s["failures"]
+        );
+    }
+    renders.capacity.lock().unwrap().clear();
+    renders.refusal.lock().unwrap().clear();
+    until_hosts(&renders, "the launch the quota allows", |f| {
+        f.present("us-east-1").len() == 1
+    })
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        v.until(|s| failure(s, "scale-renders").is_none()),
+    )
+    .await
+    .expect("the renders quota failure clears");
+}
+
+/// Pages mode's host group reports none of what the wall counts GPU hosts by: no instances
+/// for the wake's record (`ScaleInstances`) and no expected hosts (`HostsExpected`, which
+/// would replace the GPU hosts' and leave the fcvm side waiting for a host with no GPU).
+#[tokio::test]
+async fn a_renders_group_reports_no_gpu_hosts() {
+    use fcvm::fleet::coord::hosts::run;
+    let renders = renders_fake();
+    *renders.launch_state.lock().unwrap() = Some("running".into());
+    let (handle, _reports, events) = recorder();
+    let (power_tx, power_rx) = tokio::sync::watch::channel("waking".to_string());
+    let (_drain_tx, drain_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(run(
+        renders_config(&renders, "us-east-1"),
+        power_rx,
+        drain_rx,
+        handle,
+    ));
+    until_hosts(&renders, "the renders host", |f| {
+        f.present("us-east-1").len() == 1
+    })
+    .await;
+    power_tx.send("awake".into()).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    power_tx.send("asleep".into()).unwrap();
+    until_hosts(&renders, "asleep", |f| f.present("us-east-1").is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = events.lock().unwrap().clone();
+    for e in &events {
+        assert!(
+            !matches!(
+                e,
+                Event::ScaleInstances { .. } | Event::HostsExpected { .. }
+            ),
+            "{e:?}"
+        );
+        if let Event::Degraded { component, .. } = e {
+            assert_eq!(component, "scale-renders", "{e:?}");
+        }
+    }
+}
+
+/// A spot interruption notice on pages mode's host launches nothing: with one host, the
+/// replacement waits for EC2 to take the instance, as a region's single GPU host does.
+#[tokio::test]
+async fn a_renders_host_notice_waits_for_ec2_to_take_it() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let gpu = Arc::new(FakeHosts::default());
+    let renders = renders_fake();
+    *renders.launch_state.lock().unwrap() = Some("running".into());
+    let (handle, _actor) = start_two_groups(
+        State::new(Config::default(), now_ms()),
+        None,
+        host_config(&gpu, &["us-east-1"], 1, 8),
+        renders_config(&renders, "us-east-1"),
+    );
+    until_hosts(&renders, "the renders host", |f| {
+        f.present("us-east-1").len() == 1
+    })
+    .await;
+    let id = renders.present("us-east-1")[0].id.clone();
+    let url = page_url(&handle).await;
+    let mut agent = dial_pages_agent_on(&url, &id).await;
+    let mut v = Viewer::connect(&url).await;
+    v.until(|s| !s["renders"].is_null()).await;
+    agent
+        .send(Message::Text(
+            json!({"type": "draining", "reason": "spot interruption notice"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    // The notice reached the state (and the launchers) before the window starts.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        v.until(|s| s["renders"]["draining"] == true),
+    )
+    .await
+    .expect("the notice is in the state");
+    // Many polls later: the host still runs and nothing was launched beside it.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(launches(&renders).len(), 1, "{:?}", renders.calls());
+    assert_eq!(renders.present("us-east-1").len(), 1);
+    // EC2 takes it: the replacement is launched.
+    renders.set_state("us-east-1", "running", "terminated");
+    until_hosts(&renders, "the replacement", |f| {
+        f.present("us-east-1").len() == 1
+    })
+    .await;
+    assert_eq!(launches(&renders).len(), 2, "{:?}", renders.calls());
+}
+
+/// Each launcher keeps only the notices of its own instances. With two awake GPU hosts a
+/// GPU host's notice launches its replacement at once; pages mode's host's notice launches
+/// nothing in either group, and the GPU host's notice launches nothing in pages mode's.
+#[tokio::test]
+async fn a_notice_reaches_only_the_launcher_of_its_instance() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let gpu = Arc::new(FakeHosts::default());
+    let renders = renders_fake();
+    for f in [&gpu, &renders] {
+        *f.launch_state.lock().unwrap() = Some("running".into());
+    }
+    let (handle, _actor) = start_two_groups(
+        State::new(Config::default(), now_ms()),
+        None,
+        host_config(&gpu, &["us-east-1"], 2, 8),
+        renders_config(&renders, "us-east-1"),
+    );
+    until_hosts(&gpu, "the GPU hosts", |f| f.present("us-east-1").len() == 2).await;
+    until_hosts(&renders, "the renders host", |f| {
+        f.present("us-east-1").len() == 1
+    })
+    .await;
+    let url = page_url(&handle).await;
+    let renders_id = renders.present("us-east-1")[0].id.clone();
+    let gpu_id = gpu.present("us-east-1")[0].id.clone();
+    let mut pages = dial_pages_agent_on(&url, &renders_id).await;
+    let (mut wall, _) = tokio_tungstenite::connect_async(url.replace("/live", "/agent").as_str())
+        .await
+        .unwrap();
+    let hello = json!({"type": "hello", "host": gpu_id, "arch": "x86_64", "capacity": 1,
+        "gpus": [{"sbdf": "0000:01:00.0", "name": "Tesla T4"}]});
+    wall.send(Message::Text(hello.to_string().into()))
+        .await
+        .unwrap();
+    let mut v = Viewer::connect(&url).await;
+    let s = tokio::time::timeout(
+        Duration::from_secs(10),
+        v.until(|s| {
+            !s["renders"].is_null() && s["fleet"]["hosts"].as_array().is_some_and(|h| h.len() == 1)
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("both agents in the state: {}", v.latest().1));
+    let _ = s;
+    let notice = || {
+        Message::Text(
+            json!({"type": "draining", "reason": "spot interruption notice"})
+                .to_string()
+                .into(),
+        )
+    };
+    pages.send(notice()).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        v.until(|s| s["renders"]["draining"] == true),
+    )
+    .await
+    .expect("the renders host's notice is in the state");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(launches(&gpu).len(), 1, "{:?}", gpu.calls());
+    assert_eq!(launches(&renders).len(), 1, "{:?}", renders.calls());
+    wall.send(notice()).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        v.until(|s| s["fleet"]["hosts"][0]["draining"] == true),
+    )
+    .await
+    .expect("the GPU host's notice is in the state");
+    until_hosts(&gpu, "the GPU host's replacement", |f| {
+        launches(f).len() == 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(launches(&renders).len(), 1, "{:?}", renders.calls());
+}
+
+/// Pages mode's host and its overlay survive the coordinator. The first coordinator
+/// launches the host, a viewer sets a transform, the host's agent is ordered it, and the
+/// coordinator's task is ended with no shutdown (as a SIGKILL ends the process: no sleep
+/// pass, no last write). A second one on the stored state adopts the running instance by
+/// its tags, launches nothing beside it, and orders the returning agent the same overlay.
+#[tokio::test]
+async fn a_restarted_coordinator_adopts_the_renders_host_and_orders_it_again() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fleet.json");
+    let config = Config {
+        light_interval_ms: 0,
+        ..Config::default()
+    };
+    let gpu = Arc::new(FakeHosts::default());
+    let renders = renders_fake();
+    *renders.launch_state.lock().unwrap() = Some("running".into());
+    let (handle, actor) = start_two_groups(
+        State::new(config.clone(), now_ms()),
+        Some(store::spawn_writer(path.clone())),
+        host_config(&gpu, &["us-east-1"], 1, 8),
+        renders_config(&renders, "us-east-1"),
+    );
+    until_hosts(&renders, "the renders host", |f| {
+        f.present("us-east-1").len() == 1
+    })
+    .await;
+    let id = renders.present("us-east-1")[0].id.clone();
+    let url = page_url(&handle).await;
+    let mut agent = dial_pages_agent_on(&url, &id).await;
+    let mut v = Viewer::connect(&url).await;
+    v.until(|s| !s["renders"].is_null()).await;
+    v.intent("o-0", "renders_transform", json!({"name": "mirror"}))
+        .await;
+    let r = v.receipt("o-0").await;
+    assert_eq!(r["outcome"], "committed", "{r}");
+    let ordered = pages_order(&mut agent, |o| !o["overlay"].is_null()).await;
+    actor.abort();
+    let _ = actor.await;
+    drop(handle);
+
+    let calls_before = renders.calls().len();
+    let stored = store::load(&path).unwrap().expect("a stored state");
+    let (handle, _actor) = start_two_groups(
+        stored.resumed(config, now_ms()),
+        Some(store::spawn_writer(path.clone())),
+        host_config(&gpu, &["us-east-1"], 1, 8),
+        renders_config(&renders, "us-east-1"),
+    );
+    let url = page_url(&handle).await;
+    let mut agent = dial_pages_agent_on(&url, &id).await;
+    let again = pages_order(&mut agent, |o| !o["overlay"].is_null()).await;
+    assert_eq!(again, ordered);
+    until_hosts(&renders, "listed by the second coordinator", |f| {
+        f.calls()[calls_before..]
+            .iter()
+            .filter(|c| c.starts_with("list"))
+            .count()
+            >= 5
+    })
+    .await;
+    assert_eq!(launches(&renders).len(), 1, "{:?}", renders.calls());
+    assert!(
+        !renders.calls().iter().any(|c| c.starts_with("terminate")),
+        "{:?}",
+        renders.calls()
+    );
+    assert_eq!(renders.present("us-east-1")[0].id, id);
 }
 
 /// A page shown again wakes a sleeping fleet only while `min_wake_remaining_secs` of the
@@ -6527,6 +7138,144 @@ async fn acknowledged_state_survives_a_sigterm() {
     acknowledged_state_survives(nix::sys::signal::Signal::SIGTERM).await;
 }
 
+/// An agent on the coordinator's `/agent` socket that runs pages mode and nothing else.
+async fn dial_pages_agent(live: &str) -> Ws {
+    dial_pages_agent_on(live, "pages-a").await
+}
+
+/// [`dial_pages_agent`] for the host named `host`.
+async fn dial_pages_agent_on(live: &str, host: &str) -> Ws {
+    let (mut ws, _) = tokio_tungstenite::connect_async(live.replace("/live", "/agent").as_str())
+        .await
+        .unwrap();
+    let hello = json!({"type": "hello", "host": host, "arch": "aarch64", "capacity": 0,
+        "gpus": [], "renders": {"cpus": 40,
+        "pages": [{"id": "example", "url": "https://example.com/"}]}});
+    ws.send(Message::Text(hello.to_string().into()))
+        .await
+        .unwrap();
+    ws
+}
+
+/// The next pages order the coordinator sends on `ws` that satisfies `f`.
+async fn pages_order(ws: &mut Ws, f: impl Fn(&Value) -> bool) -> Value {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let m = ws.next().await.expect("the agent socket is open").unwrap();
+            if let Message::Text(t) = m {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == "renders" && f(&v["order"]) {
+                    return v["order"].clone();
+                }
+            }
+        }
+    })
+    .await
+    .expect("a pages order within 10 s")
+}
+
+/// Pages mode's overlay is acknowledged state. A viewer sets a transform and is answered;
+/// the process is stopped with `signal` the moment the answer arrives. A new process on the
+/// same state file orders the returning host the same overlay with the same number, shows
+/// it to a new page with the same end time, and answers the intent sent again with its
+/// first receipt.
+async fn a_pages_overlay_survives(signal: nix::sys::signal::Signal) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("fleet.json");
+    let mut first = coord_process(&state).await;
+    let mut agent = dial_pages_agent(&first.url).await;
+    let mut v = Viewer::connect(&first.url).await;
+    v.until(|s| !s["renders"].is_null()).await;
+    v.intent("o-0", "renders_transform", json!({"name": "mirror"}))
+        .await;
+    let r = v.receipt("o-0").await;
+    assert_eq!(r["outcome"], "committed", "{r}");
+    let version = r["version"].as_u64().unwrap();
+    let shown = v.at_least(version).await["renders"]["overlay"].clone();
+    assert_eq!(shown["transform"], "mirror");
+    let ordered = pages_order(&mut agent, |o| !o["overlay"].is_null()).await;
+    assert_eq!(ordered["overlay"]["transform"], "mirror");
+    let pid = nix::unistd::Pid::from_raw(first.child.id().unwrap() as i32);
+    nix::sys::signal::kill(pid, signal).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), first.child.wait())
+        .await
+        .expect("the coordinator exits")
+        .unwrap();
+
+    let second = coord_process(&state).await;
+    let mut agent = dial_pages_agent(&second.url).await;
+    let again = pages_order(&mut agent, |o| !o["overlay"].is_null()).await;
+    assert_eq!(again["overlay"], ordered["overlay"]);
+    let mut w = Viewer::connect(&second.url).await;
+    let s = w.until(|s| !s["renders"]["overlay"].is_null()).await;
+    assert_eq!(s["renders"]["overlay"], shown);
+    w.intent("o-0", "renders_transform", json!({"name": "mirror"}))
+        .await;
+    let r = w.receipt("o-0").await;
+    assert_eq!(r["outcome"], "committed", "{r}");
+    assert_eq!(r["version"].as_u64(), Some(version));
+}
+
+#[tokio::test]
+async fn a_pages_overlay_survives_a_sigkill() {
+    a_pages_overlay_survives(nix::sys::signal::Signal::SIGKILL).await;
+}
+
+#[tokio::test]
+async fn a_pages_overlay_survives_a_sigterm() {
+    a_pages_overlay_survives(nix::sys::signal::Signal::SIGTERM).await;
+}
+
+/// Pages mode's text goes through the wall's text check, alone, before it is set: an
+/// allowed text is ordered to the host, a refused one changes nothing, and a host that does
+/// not run the mode gets no pages order at all.
+#[tokio::test]
+async fn a_pages_overlay_text_needs_an_allow_from_the_text_check() {
+    let checker: Arc<dyn TextChecker> = Arc::new(FakeCheck {
+        refuse: vec!["nasty".into()],
+        fail: false,
+        delay: Duration::from_millis(20),
+    });
+    let (url, _h) = coordinator(checker).await;
+    let mut gpu = dial_agent(&url).await;
+    let mut agent = dial_pages_agent(&url).await;
+    let mut a = Viewer::connect_from(&url, Some("198.51.100.1")).await;
+    let mut b = Viewer::connect_from(&url, Some("198.51.100.2")).await;
+    a.until(|s| !s["renders"].is_null()).await;
+    b.intent("o1", "renders_overlay", json!({"text": "so nasty"}))
+        .await;
+    let r = b.receipt("o1").await;
+    assert_eq!(r["outcome"], "refused", "{r}");
+    assert_eq!(r["check"]["verdict"], "refuse");
+    a.intent("o2", "renders_overlay", json!({"text": "  hello   there "}))
+        .await;
+    let r = a.receipt("o2").await;
+    assert_eq!(r["outcome"], "committed", "{r}");
+    assert_eq!(r["check"]["verdict"], "allow");
+    let order = pages_order(&mut agent, |o| !o["overlay"].is_null()).await;
+    assert_eq!(order["overlay"]["text"], "hello there");
+    // Limited before the check: no verdict.
+    a.intent("o3", "renders_overlay", json!({"text": "again"}))
+        .await;
+    let r = a.receipt("o3").await;
+    assert_eq!(r["reason"], "one change every 30 s");
+    assert!(r.get("check").is_none());
+    let s = a.at_least(r["version"].as_u64().unwrap()).await;
+    assert_eq!(s["renders"]["overlay"]["text"], "hello there");
+    assert!(!s.to_string().contains("nasty"));
+    // The GPU host said nothing of pages in its hello: nothing it was sent is a pages order.
+    // The coordinator goes on sending it scenes, so read for a bounded time.
+    let until = Instant::now() + Duration::from_secs(1);
+    while let Ok(Some(Ok(m))) =
+        tokio::time::timeout(until.saturating_duration_since(Instant::now()), gpu.next()).await
+    {
+        if let Message::Text(t) = m {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            assert_ne!(v["type"], "renders", "{v}");
+        }
+    }
+}
+
 /// A claim's token is the one the page sent with `claim_gpu`, so a page that reconnects
 /// before it heard about its claim can still take it back; the token is in no action, and a
 /// token the page could not have made well is refused without being recorded.
@@ -6921,6 +7670,96 @@ async fn the_aws_host_driver_launches_through_an_instant_fleet() {
     assert_eq!(list["Filter.2.Value.1"], "stage");
     // A template with no subnet in its region is refused at start.
     assert!(AwsHosts::new(&["us-east-1:t".parse().unwrap()], &[], "stage".into()).is_err());
+}
+
+/// Pages mode's host driver launches and lists its own class: its CreateFleet tags the
+/// instances `Purpose=fcvm-fleet-renders` (and names them so), and its DescribeInstances
+/// asks for that tag, so a GPU host is never one of its hosts and the reverse.
+#[tokio::test]
+async fn the_aws_host_driver_tags_and_lists_its_class() {
+    use fcvm::fleet::coord::hosts::{AwsHosts, HostClass, HostDriver, Market};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = FakeEc2Api::default();
+    let base = fake_ec2_api(api.clone()).await;
+    let mut d = AwsHosts::for_class(
+        &["us-east-1:fcvm-fleet-renders-arm64".parse().unwrap()],
+        &["us-east-1:subnet-0000000000000000a".parse().unwrap()],
+        "stage".into(),
+        HostClass::Renders,
+    )
+    .unwrap();
+    d.endpoints.insert("us-east-1".into(), base);
+    d.launch("us-east-1", Market::OnDemand, 1, "token-r", &[])
+        .await
+        .unwrap();
+    d.hosts("us-east-1").await.unwrap();
+    let calls = api.calls.lock().unwrap().clone();
+    let fleet = &calls
+        .iter()
+        .find(|(_, p)| p["Action"] == "CreateFleet")
+        .unwrap()
+        .1;
+    assert_eq!(
+        fleet["TagSpecification.1.Tag.1.Value"],
+        "fcvm-fleet-renders"
+    );
+    assert_eq!(fleet["TagSpecification.1.Tag.2.Key"], "Purpose");
+    assert_eq!(
+        fleet["TagSpecification.1.Tag.2.Value"],
+        "fcvm-fleet-renders"
+    );
+    assert_eq!(fleet["TagSpecification.1.Tag.3.Value"], "stage");
+    let list = &calls
+        .iter()
+        .find(|(_, p)| p["Action"] == "DescribeInstances")
+        .unwrap()
+        .1;
+    assert_eq!(list["Filter.1.Name"], "tag:Purpose");
+    assert_eq!(list["Filter.1.Value.1"], "fcvm-fleet-renders");
+    assert_eq!(list["Filter.2.Value.1"], "stage");
+    // Its flags name themselves in a refusal.
+    let e = AwsHosts::for_class(
+        &["us-east-1:t".parse().unwrap()],
+        &[],
+        "stage".into(),
+        HostClass::Renders,
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(e.contains("--renders-template"), "{e}");
+}
+
+/// The spend meter lists pages mode's host with the GPU hosts and the EC2 tiles: one
+/// DescribeInstances asks for every `Purpose` the fleet launches, so the renders host is
+/// charged under the same daily ceiling.
+#[tokio::test]
+async fn the_spend_meter_lists_the_renders_host_with_the_rest() {
+    use fcvm::fleet::coord::spend::{AwsMeter, MeterDriver};
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let api = FakeEc2Api::default();
+    let base = fake_ec2_api(api.clone()).await;
+    let mut m = AwsMeter::new("stage".into()).unwrap();
+    m.endpoints.insert("us-east-1".into(), base);
+    m.instances("us-east-1").await.unwrap();
+    let calls = api.calls.lock().unwrap().clone();
+    let list = &calls
+        .iter()
+        .find(|(_, p)| p["Action"] == "DescribeInstances")
+        .unwrap()
+        .1;
+    assert_eq!(list["Filter.2.Name"], "tag:Purpose");
+    let purposes: Vec<&str> = list
+        .iter()
+        .filter(|(k, _)| k.starts_with("Filter.2.Value."))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(
+        purposes,
+        ["fcvm-fleet-host", "fcvm-fleet-tile", "fcvm-fleet-renders"]
+    );
 }
 
 /// A CreateFleet whose answer is lost is asked again with the same ClientToken (#1329). If the
@@ -8111,6 +8950,7 @@ async fn the_slowest_tile_sets_one_budget_for_every_tile() {
                 render_ms_max: None,
                 budget_every_pixel: None,
                 boot_id: None,
+                minecraft: None,
                 vm_stats: None,
             }))
             .unwrap();
@@ -8175,6 +9015,7 @@ async fn a_tile_whose_fit_draws_every_pixel_is_granted_it() {
                 render_ms_max: None,
                 budget_every_pixel: Some(275_448.0),
                 boot_id: Some(format!("boot-{id}")),
+                minecraft: None,
                 vm_stats: None,
             }))
             .unwrap();

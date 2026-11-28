@@ -32,6 +32,7 @@ fn hello(at: u64, host: &str, gpus: usize) -> Event {
             windows_actions: Vec::new(),
             minecraft: 0,
             minecraft_server: None,
+            renders: None,
         },
     }
 }
@@ -351,6 +352,7 @@ fn a_host_that_comes_up_after_the_fleet_is_awake_still_records_its_wake() {
             windows_actions: Vec::new(),
             minecraft: 0,
             minecraft_server: None,
+            renders: None,
         },
     }];
     later.push(running(240000, "h1", "slot-1"));
@@ -724,6 +726,7 @@ fn phone_gpus_take_no_place_on_the_wall() {
                 windows_actions: Vec::new(),
                 minecraft: 0,
                 minecraft_server: None,
+                renders: None,
             },
         },
     );
@@ -1876,6 +1879,271 @@ fn a_server_nobody_holds_is_reset_on_a_schedule() {
     assert_eq!(gen(&s, "mc-1"), 3);
 }
 
+fn minecraft_fleet(n: u64) -> Vec<serde_json::Value> {
+    let mut events = vec![
+        serde_json::json!({"type": "agent", "at": 1000, "host": "h1", "msg": {"type": "hello",
+        "host": "h1", "arch": "aarch64", "gpus": [], "capacity": 0, "minecraft": n}}),
+    ];
+    for k in 1..=n {
+        events.push(
+            serde_json::json!({"type": "agent", "at": 2000, "host": "h1", "msg": {"type": "slot",
+            "id": format!("mc-{k}"), "phase": "running", "generation": 1,
+            "frame_url": format!("ws://[2001:db8::{k:x}]:8080/view"), "first_chunk_at": 1950}}),
+        );
+    }
+    events
+}
+
+/// The coordinator counts a reset of every server itself: each server the reset was sent to,
+/// once, when the launch the reset began reports its first chunk, and the time from the click
+/// to the last of them. A server the reset did not touch (lent at the click) and one of its own
+/// that a viewer reset again before it was back are not counted, whatever they do later.
+#[test]
+fn a_reset_of_every_server_counts_the_servers_it_brought_back() {
+    let cfg = config_with(serde_json::json!({}));
+    let running = |at: u64, id: &str, generation: u64, chunk: u64| {
+        serde_json::json!({"type": "agent", "at": at, "host": "h1", "msg": {"type": "slot",
+            "id": id, "phase": "running", "generation": generation, "timings": {},
+            "frame_url": "ws://[2001:db8::1]:8080/view", "first_chunk_at": chunk}})
+    };
+    let reset =
+        |s: &State| serde_json::to_value(view(s)).unwrap()["minecraft"]["last_reset_all"].clone();
+    let step = |s: State, more: serde_json::Value| events(more).iter().fold(s, apply);
+    let mut e = minecraft_fleet(4);
+    e.extend([
+        serde_json::json!({"type": "viewer_joined", "at": 2100, "viewer": "v1", "client": "198.51.100.20"}),
+        serde_json::json!({"type": "viewer_joined", "at": 2100, "viewer": "v2", "client": "198.51.100.21"}),
+        serde_json::json!({"type": "intent", "at": 2200, "viewer": "v2", "client": "198.51.100.21", "id": "c1",
+            "name": "claim_minecraft", "args": {"slot": "mc-4"}}),
+        serde_json::json!({"type": "intent", "at": 10_000, "viewer": "v1", "client": "198.51.100.20", "id": "r1",
+            "name": "minecraft_reset", "args": {"all": true}}),
+    ]);
+    let s = events(serde_json::json!(e))
+        .iter()
+        .fold(State::new(cfg.clone(), 0), apply);
+    assert_eq!(
+        reset(&s),
+        serde_json::json!({"clicked_at": 10_000, "by": "viewer:v1", "servers": 3, "back": 0}),
+        "mc-4 is lent: the reset is of three, none back yet"
+    );
+    // mc-1's new launch: first chunk 4 s after the click
+    let s = step(s, serde_json::json!([running(14_100, "mc-1", 2, 14_000)]));
+    assert_eq!(reset(&s)["back"], 1);
+    assert_eq!(reset(&s)["took_ms"], 4000);
+    // the same launch reported again is not another server back
+    let s = step(s, serde_json::json!([running(15_100, "mc-1", 2, 14_000)]));
+    assert_eq!(reset(&s)["back"], 1);
+    // a viewer resets mc-2 before it is back: its next launch is that viewer's, not the reset's
+    let s = step(
+        s,
+        serde_json::json!([
+            {"type": "intent", "at": 16_000, "viewer": "v2", "client": "198.51.100.21", "id": "r2",
+                "name": "minecraft_reset", "args": {"slot": "mc-2"}},
+            running(18_100, "mc-2", 3, 18_000),
+        ]),
+    );
+    assert_eq!(reset(&s)["back"], 1, "{}", reset(&s));
+    // mc-4, which the reset never touched, is given back and relaunched: not counted either
+    let s = step(
+        s,
+        serde_json::json!([
+            {"type": "intent", "at": 19_000, "viewer": "v2", "client": "198.51.100.21", "id": "g1",
+                "name": "release_minecraft", "args": {}},
+            running(20_100, "mc-4", 2, 20_000),
+        ]),
+    );
+    assert_eq!(reset(&s)["back"], 1, "{}", reset(&s));
+    // mc-3 is the reset's: the last of its servers that will come back, 11.5 s after the click
+    let s = step(s, serde_json::json!([running(21_600, "mc-3", 2, 21_500)]));
+    assert_eq!(
+        reset(&s),
+        serde_json::json!({"clicked_at": 10_000, "by": "viewer:v1", "servers": 3, "back": 2, "took_ms": 11_500})
+    );
+    // mc-1 reset by itself afterwards takes nothing from the count, and adds nothing when it is back
+    let s = step(
+        s,
+        serde_json::json!([
+            {"type": "intent", "at": 40_000, "viewer": "v1", "client": "198.51.100.20", "id": "r3",
+                "name": "minecraft_reset", "args": {"slot": "mc-1"}},
+            running(43_100, "mc-1", 3, 43_000),
+        ]),
+    );
+    assert_eq!(reset(&s)["back"], 2);
+    assert_eq!(reset(&s)["took_ms"], 11_500);
+    // a state file written before the count holds a reset with none: it is published without one
+    let mut old = serde_json::to_value(&s).unwrap();
+    let all = old["fleet"]["last_minecraft_reset_all"]
+        .as_object_mut()
+        .unwrap();
+    all.remove("back");
+    all.remove("took_ms");
+    let old: State = serde_json::from_value(old).unwrap();
+    assert_eq!(
+        reset(&old),
+        serde_json::json!({"clicked_at": 10_000, "by": "viewer:v1", "servers": 3})
+    );
+}
+
+/// A fleet of up to `TILES_LISTED` servers is listed whole, as before. A larger one lists the
+/// first that many and every lent server as tiles, in an image of their own, and names every
+/// server in `field`: by host, in the order of the host's status rows, with its view URL.
+#[test]
+fn a_large_minecraft_fleet_lists_some_servers_as_tiles_and_names_them_all_in_the_field() {
+    let listed = fleet_core::minecraft::TILES_LISTED as u64;
+    let cfg = config_with(serde_json::json!({}));
+    let state = |n: u64, more: serde_json::Value| {
+        let mut e = minecraft_fleet(n);
+        e.extend(more.as_array().unwrap().iter().cloned());
+        events(serde_json::json!(e))
+            .iter()
+            .fold(State::new(cfg.clone(), 0), apply)
+    };
+    let small = serde_json::to_value(view(&state(listed, serde_json::json!([])))).unwrap();
+    assert_eq!(
+        small["minecraft"]["tiles"].as_array().unwrap().len(),
+        listed as usize
+    );
+    assert!(
+        small["minecraft"].get("field").is_none(),
+        "{}",
+        small["minecraft"]
+    );
+
+    let n = listed + 4;
+    let v = serde_json::to_value(view(&state(n, serde_json::json!([])))).unwrap();
+    let m = &v["minecraft"];
+    let tiles = m["tiles"].as_array().unwrap();
+    assert_eq!(tiles.len(), listed as usize);
+    assert_eq!(tiles[0]["id"], "mc:1");
+    assert_eq!(tiles[15]["slot"], "mc-16");
+    // the listed tiles fill an image of their own: 16 are 4 by 4
+    let (rects, aspect) = fleet_core::minecraft::layout(listed as usize);
+    assert_eq!(m["image_aspect"], aspect);
+    assert_eq!(tiles[15]["rect"], serde_json::to_value(rects[15]).unwrap());
+    let field = &m["field"];
+    assert_eq!(field["servers"], n);
+    let host = &field["hosts"][0];
+    assert_eq!(field["hosts"].as_array().unwrap().len(), 1);
+    assert_eq!(host["key"], fleet_core::minecraft::host_key("h1"));
+    assert_ne!(host["key"], "h1");
+    assert_eq!(
+        host["servers"],
+        serde_json::json!((1..=n).collect::<Vec<u64>>())
+    );
+    assert!(host.get("frames_v4").is_none(), "{host}");
+    let url = |k: usize| {
+        format!(
+            "{}{}{}",
+            host["frames"]["prefix"].as_str().unwrap(),
+            host["frames"]["names"][k].as_str().unwrap(),
+            host["frames"]["suffix"].as_str().unwrap()
+        )
+    };
+    assert_eq!(url(0), "ws://[2001:db8::1]:8080/view");
+    assert_eq!(url(19), "ws://[2001:db8::14]:8080/view");
+    // the field carries no state of any server: a server that restarts moves nothing in it
+    let restarted = state(
+        n,
+        serde_json::json!([
+            {"type": "agent", "at": 3000, "host": "h1", "msg": {"type": "slot", "id": "mc-19",
+                "phase": "restoring", "generation": 1, "frame_url": "ws://[2001:db8::13]:8080/view"}}
+        ]),
+    );
+    assert_eq!(
+        serde_json::to_value(view(&restarted)).unwrap()["minecraft"]["field"],
+        *field
+    );
+
+    // a lent server beyond the first sixteen is a tile too: its holder's page needs its borrow
+    let lent = state(
+        n,
+        serde_json::json!([
+            {"type": "viewer_joined", "at": 2100, "viewer": "v1", "client": "198.51.100.20"},
+            {"type": "intent", "at": 2200, "viewer": "v1", "client": "198.51.100.20", "id": "c1",
+                "name": "claim_minecraft", "args": {"slot": "mc-19"}}
+        ]),
+    );
+    assert_eq!(lent.receipts["c1"].outcome, fleet_core::Outcome::Committed);
+    let v = serde_json::to_value(view(&lent)).unwrap();
+    let tiles = v["minecraft"]["tiles"].as_array().unwrap();
+    assert_eq!(tiles.len(), listed as usize + 1);
+    assert_eq!(tiles[16]["slot"], "mc-19");
+    assert_eq!(tiles[16]["id"], "mc:19");
+    assert_eq!(tiles[16]["borrowed"]["viewer"], "v1");
+}
+
+/// A host's status rows ride in a health report that names no slot. The coordinator passes
+/// them on and keeps none: applied as an event, the report changes nothing, so it moves no
+/// version and is never stored. A coordinator from before the field reads the same report as
+/// a health report for a slot it does not have.
+#[test]
+fn a_minecraft_status_report_is_not_part_of_the_state() {
+    let cfg = config_with(serde_json::json!({}));
+    let before = events(serde_json::json!(minecraft_fleet(3)))
+        .iter()
+        .fold(State::new(cfg, 0), apply);
+    let report = serde_json::json!({"type": "agent", "at": 5000, "host": "h1", "msg": {
+        "type": "health", "id": fleet_core::minecraft::STATUS_ID, "fps": 0.0,
+        "minecraft": {"t": 4990, "rows": "AwDIAw==", "cpus": 192, "busy": 4.9,
+            "mem_total_mib": 385024, "mem_used_mib": 20480}}});
+    let event: Event = serde_json::from_value(report.clone()).unwrap();
+    let after = apply(before.clone(), &event);
+    assert_eq!(after.version, before.version);
+    assert_eq!(
+        serde_json::to_value(view(&after)).unwrap(),
+        serde_json::to_value(view(&before)).unwrap()
+    );
+    // the report comes back out as it went in, and without the field it is an ordinary one
+    assert_eq!(
+        serde_json::to_value(&event).unwrap()["msg"]["minecraft"],
+        report["msg"]["minecraft"]
+    );
+    let plain: fleet_core::protocol::HealthReport =
+        serde_json::from_value(serde_json::json!({"id": "slot-1", "fps": 30.0})).unwrap();
+    assert_eq!(plain.minecraft, None);
+    assert!(serde_json::to_value(&plain)
+        .unwrap()
+        .get("minecraft")
+        .is_none());
+}
+
+#[test]
+fn the_status_message_and_the_pages_request_for_it_have_these_shapes() {
+    use fleet_core::protocol::{ClientMsg, ServerMsg};
+    let status: fleet_core::minecraft::MinecraftStatus =
+        serde_json::from_value(serde_json::json!({"t": 7, "rows": "AwDIAw=="})).unwrap();
+    assert_eq!(
+        serde_json::to_value(ServerMsg::MinecraftStatus {
+            host: "0123456789ab".into(),
+            received_at: 9000,
+            status
+        })
+        .unwrap(),
+        serde_json::json!({"type": "minecraft_status", "host": "0123456789ab", "received_at": 9000, "t": 7, "rows": "AwDIAw=="})
+    );
+    // a page from before the field sends no `minecraft`: it is not sent the rows
+    let old: ClientMsg =
+        serde_json::from_value(serde_json::json!({"type": "visibility", "visible": true})).unwrap();
+    assert!(matches!(
+        old,
+        ClientMsg::Visibility {
+            visible: true,
+            minecraft: false
+        }
+    ));
+    let new: ClientMsg = serde_json::from_value(
+        serde_json::json!({"type": "visibility", "visible": true, "minecraft": true}),
+    )
+    .unwrap();
+    assert!(matches!(
+        new,
+        ClientMsg::Visibility {
+            visible: true,
+            minecraft: true
+        }
+    ));
+}
+
 fn phone_host(at: u64) -> Event {
     let gpu = Gpu {
         sbdf: "0000:01:00.0".into(),
@@ -1900,6 +2168,7 @@ fn phone_host(at: u64) -> Event {
             windows_actions: Vec::new(),
             minecraft: 0,
             minecraft_server: None,
+            renders: None,
         },
     }
 }
@@ -2016,4 +2285,176 @@ fn a_phones_cpu_is_held_to_0_to_100_and_a_bad_one_is_dropped() {
         s = apply(s, &report(bad, 3000 + i as u64));
         assert!(phone_stats(&s).1.is_null(), "{bad}");
     }
+}
+
+/// A hello from pages mode's host: no GPU, the mode's pages, and its frame socket's
+/// addresses.
+fn renders_hello(at: u64, host: &str) -> Event {
+    serde_json::from_value(serde_json::json!({
+        "type": "agent", "at": at, "host": host,
+        "msg": {"type": "hello", "host": host, "arch": "aarch64", "capacity": 0, "gpus": [],
+            "renders": {"cpus": 40, "pages": [{"id": "example", "url": "https://example.com/"}],
+                "ipv6": "2001:db8:7:7::5", "ipv4": "198.51.100.5", "v4_port": 8443}}
+    }))
+    .unwrap()
+}
+
+/// Pages mode's host is never one of the wall's GPU hosts: it has no slot, no assignment,
+/// no place in the potato ring or the phones, sandboxes and servers, and no entry in the
+/// wake's record, so the wake closes once the GPU hosts render (a host recorded there that
+/// never renders would hold the record open until the fleet sleeps).
+#[test]
+fn a_renders_host_is_no_gpu_host_of_the_wall_or_the_wake() {
+    let config = config_with(serde_json::json!({
+        "power_managed": true, "idle_scale_down_secs": 60, "ec2_max": 0
+    }));
+    let mut s = State::new(config, 0);
+    for e in events(serde_json::json!([
+        {"type": "viewer_joined", "at": 1000, "viewer": "v1", "client": "192.0.2.70"},
+        {"type": "visibility", "at": 1100, "viewer": "v1", "visible": false},
+        {"type": "tick", "at": 62000},
+        {"type": "visibility", "at": 100000, "viewer": "v1", "visible": true},
+        {"type": "tick", "at": 100500},
+    ])) {
+        s = apply(s, &e);
+    }
+    assert_eq!(s.fleet.power.state, "waking");
+    s = apply(s, &renders_hello(110000, "r1"));
+    s = apply(s, &hello(111000, "h1", 1));
+    s = apply(s, &running(120000, "h1", "slot-1"));
+    s = apply(s, &Event::Tick { at: 121000 });
+    assert!(
+        !s.fleet.power.hosts.contains_key("r1"),
+        "{:?}",
+        s.fleet.power.hosts
+    );
+    assert_eq!(s.fleet.power.state, "awake");
+    assert!(
+        !fleet_core::apply::wake_open(&s.fleet.power),
+        "the wake's record stays open: {:?}",
+        s.fleet.power.hosts
+    );
+    assert!(s
+        .fleet
+        .slots
+        .values()
+        .all(|x| x.host.as_deref() != Some("r1")));
+    assert!(host_assignments(&s).get("r1").is_none_or(|a| a.is_empty()));
+    assert_eq!(s.fleet.potato.host, None);
+    assert!(s.fleet.phones.is_empty() && s.fleet.windows.is_empty());
+    assert!(s.fleet.minecraft.is_empty());
+    assert!(s.fleet.renders.hosts.contains_key("r1"));
+}
+
+/// Pages mode's host's frame socket is named like a host's aggregator: `renders-<host>`
+/// gets the coordinator's names for the addresses its hello gave, and a page is given those
+/// names; names minted for other addresses are not taken. Without the subzone the page gets
+/// the URLs of the host's report.
+#[test]
+fn a_renders_hosts_frame_socket_is_named_for_the_addresses_it_gave() {
+    assert_eq!(
+        fleet_core::state::renders_id("i-0123456789abcdef0").as_deref(),
+        Some("renders-i-0123456789abcdef0")
+    );
+    assert_eq!(fleet_core::state::renders_id("Not A Label"), None);
+    let names = |ipv6: &str, label: &str| {
+        serde_json::json!({
+            "type": "published", "at": 2000, "slot": "renders-r1",
+            "names": {"generation": 0, "label": label, "ipv6": ipv6, "ipv4": "198.51.100.5",
+                "v4_port": 8443,
+                "frame_url": format!("wss://{label}.fleet.example.test/frames"),
+                "frame_url_v4": format!("wss://{label}-v4.fleet.example.test:8443/frames")}
+        })
+    };
+    let report: Event = serde_json::from_value(serde_json::json!({
+        "type": "agent", "at": 1500, "host": "r1",
+        "msg": {"type": "renders", "at": 1490, "frame_url": "wss://r1.example.test/frames"}
+    }))
+    .unwrap();
+    let published = Config {
+        names_published: true,
+        ..Config::default()
+    };
+    let mut s = State::new(published, 0);
+    s = apply(s, &renders_hello(1000, "r1"));
+    s = apply(s, &report);
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert!(v["renders"]["frame_url"].is_null(), "{}", v["renders"]);
+    // Minted for an address the host did not give: not its names.
+    let other: Event =
+        serde_json::from_value(names("2001:db8:7:7::6", "renders-r1-aaaaaaaa")).unwrap();
+    s = apply(s, &other);
+    assert_eq!(s.fleet.renders.hosts["r1"].published, None);
+    let mine: Event =
+        serde_json::from_value(names("2001:db8:7:7::5", "renders-r1-bbbbbbbb")).unwrap();
+    s = apply(s, &mine);
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert_eq!(
+        v["renders"]["frame_url"],
+        "wss://renders-r1-bbbbbbbb.fleet.example.test/frames"
+    );
+    assert_eq!(
+        v["renders"]["frame_url_v4"],
+        "wss://renders-r1-bbbbbbbb-v4.fleet.example.test:8443/frames"
+    );
+    // No subzone: the report's URL.
+    let mut s = State::new(Config::default(), 0);
+    s = apply(s, &renders_hello(1000, "r1"));
+    s = apply(s, &report);
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert_eq!(v["renders"]["frame_url"], "wss://r1.example.test/frames");
+    assert!(v["renders"]["frame_url_v4"].is_null());
+}
+
+/// Pages mode's host is no host of the wall's views. Connected beside a GPU host, it is not
+/// in `fleet.hosts` (the count the phones, Windows and Minecraft pages read); its spot notice
+/// and its loss change pages mode's state only (`renders.draining`, then no `renders`),
+/// never `reclaimed` or the wall's failures. A host that said hello as a GPU host and then
+/// as pages mode's host on the same name leaves the wall too.
+#[test]
+fn a_renders_host_is_not_a_host_of_the_wall_views() {
+    let config = config_with(serde_json::json!({"ec2_max": 0}));
+    let mut s = State::new(config, 0);
+    s = apply(s, &renders_hello(1000, "r1"));
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert_eq!(v["fleet"]["hosts"], serde_json::json!([]), "{}", v["fleet"]);
+    s = apply(s, &hello(2000, "h1", 1));
+    s = apply(s, &running(3000, "h1", "slot-1"));
+    let wall_hosts = serde_json::to_value(view(&s)).unwrap()["fleet"]["hosts"].clone();
+    assert_eq!(wall_hosts.as_array().unwrap().len(), 1, "{wall_hosts}");
+    let draining: Event = serde_json::from_value(serde_json::json!({
+        "type": "agent", "at": 4000, "host": "r1",
+        "msg": {"type": "draining", "reason": "spot interruption notice"}
+    }))
+    .unwrap();
+    s = apply(s, &draining);
+    assert!(s.fleet.reclaimed.is_empty(), "{:?}", s.fleet.reclaimed);
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert_eq!(v["renders"]["draining"], true, "{}", v["renders"]);
+    assert_eq!(v["failures"], serde_json::json!([]), "{}", v["failures"]);
+    assert_eq!(v["fleet"]["hosts"], wall_hosts);
+    s = apply(
+        s,
+        &Event::AgentGone {
+            at: 5000,
+            host: "r1".into(),
+        },
+    );
+    assert!(s.fleet.reclaimed.is_empty(), "{:?}", s.fleet.reclaimed);
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert!(v["renders"].is_null(), "{}", v["renders"]);
+    assert_eq!(v["failures"], serde_json::json!([]), "{}", v["failures"]);
+    assert_eq!(v["fleet"]["hosts"], wall_hosts);
+    // The same name says hello as a GPU host, then as pages mode's host: its slot and its
+    // place among the wall's hosts go.
+    s = apply(s, &hello(6000, "h2", 1));
+    assert!(s.fleet.hosts.contains_key("h2"));
+    s = apply(s, &renders_hello(7000, "h2"));
+    assert!(!s.fleet.hosts.contains_key("h2"));
+    assert!(s
+        .fleet
+        .slots
+        .values()
+        .all(|x| x.host.as_deref() != Some("h2")));
+    assert!(s.fleet.renders.hosts.contains_key("h2"));
 }

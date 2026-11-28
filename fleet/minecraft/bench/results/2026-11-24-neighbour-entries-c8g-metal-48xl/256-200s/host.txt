@@ -1,0 +1,10 @@
+kernel 7.0.0-1018-aws
+cpus 192
+MemTotal:       395386980 kB
+net.ipv6.neigh.default.gc_thresh3 = 16384
+net.ipv4.neigh.default.gc_thresh3 = 16384
+store /dev/loop3 btrfs   96G
+/dev/loop3: [0052]:3 (/mnt/ram/store.img)
+NAME    MODEL                       SIZE
+nvme0n1 Amazon Elastic Block Store   30G
+nvme1n1 Amazon Elastic Block Store  100G

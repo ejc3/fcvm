@@ -502,6 +502,10 @@ pub struct View {
     /// host has run players.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub potato: Option<crate::potato::PotatoView>,
+    /// Pages mode (`?mode=pages`): the renders host's last report and the overlay. Absent
+    /// while no host runs the mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renders: Option<crate::renders::RendersView>,
 }
 
 impl PhonesView {
@@ -539,7 +543,33 @@ pub struct MinecraftView {
     pub last_reset_all: Option<crate::minecraft::ResetAll>,
     /// The last fork that reached `running`.
     pub last_fork: Option<crate::minecraft::LastFork>,
+    /// Every server, up to [`crate::minecraft::TILES_LISTED`] of them; with more, the first
+    /// that many and every lent one, laid out in an image of their own, and `field` names all.
     pub tiles: Vec<MinecraftTileView>,
+    /// With more servers than are listed as tiles: every server, by host, with its view URL.
+    /// Their state is not here: it comes in `minecraft_status` messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<MinecraftField>,
+}
+
+/// Every Minecraft server of a fleet too large to list as tiles.
+#[derive(Debug, Clone, Serialize)]
+pub struct MinecraftField {
+    pub servers: usize,
+    pub hosts: Vec<MinecraftFieldHost>,
+}
+
+/// One host's servers, in the order of its status rows.
+#[derive(Debug, Clone, Serialize)]
+pub struct MinecraftFieldHost {
+    /// `minecraft_status.host` (`minecraft::host_key`).
+    pub key: String,
+    /// The servers' numbers (`mc-<n>`), by their place on the host.
+    pub servers: Vec<u32>,
+    /// Each one's view URL (`frame_url`), and its IPv4 one when any has one.
+    pub frames: crate::minecraft::Squeezed,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frames_v4: Option<crate::minecraft::Squeezed>,
 }
 
 /// A server's tile: a wall tile's fields, the name players join it at, and the server its
@@ -876,6 +906,14 @@ pub fn view(state: &State) -> View {
         windows: windows_view(state),
         minecraft: minecraft_view(state),
         potato: state.fleet.potato.view(&state.config.potato),
+        renders: state
+            .fleet
+            .renders
+            .view(&state.config.renders)
+            .map(|mut v| {
+                (v.frame_url, v.frame_url_v4) = renders_urls(state, &v.host);
+                v
+            }),
     }
 }
 
@@ -1045,12 +1083,33 @@ fn minecraft_view(state: &State) -> Option<MinecraftView> {
     if f.minecraft.is_empty() {
         return None;
     }
-    let (places, image_aspect) = minecraft_places(state);
-    let tiles = places
+    let (places, mut image_aspect) = minecraft_places(state);
+    let listed = crate::minecraft::TILES_LISTED;
+    // A fleet of more servers than a page lists: the first `listed` and every lent one are
+    // tiles, in an image of their own; every server is named in `field`.
+    let many = f.minecraft.len() > listed;
+    let shown: Vec<(&u32, &(usize, Rect))> = places
         .iter()
-        .map(|(n, (i, rect))| {
-            let s = &f.minecraft[n];
-            let mut t = tile(state, format!("mc:{}", i + 1), Half::Fcvm, *rect, Some(s));
+        .filter(|(n, (i, _))| {
+            !many
+                || *i < listed
+                || f.minecraft[*n]
+                    .minecraft
+                    .as_ref()
+                    .is_some_and(|m| m.claim.is_some())
+        })
+        .collect();
+    let own = many.then(|| crate::minecraft::layout(shown.len()));
+    if let Some((_, aspect)) = &own {
+        image_aspect = *aspect;
+    }
+    let tiles = shown
+        .iter()
+        .enumerate()
+        .map(|(k, (n, (i, rect)))| {
+            let s = &f.minecraft[*n];
+            let rect = own.as_ref().map_or(*rect, |(rects, _)| rects[k]);
+            let mut t = tile(state, format!("mc:{}", i + 1), Half::Fcvm, rect, Some(s));
             let m = s.minecraft.as_ref();
             t.borrowed = m.and_then(|m| m.claim.as_ref()).map(|c| BorrowedView {
                 session: c.session.clone(),
@@ -1068,6 +1127,40 @@ fn minecraft_view(state: &State) -> Option<MinecraftView> {
             }
         })
         .collect();
+    let field = many.then(|| {
+        let mut by_host: BTreeMap<&str, Vec<(u32, u32)>> = BTreeMap::new();
+        for (n, s) in &f.minecraft {
+            if let (Some(host), Some(m)) = (s.host.as_deref(), s.minecraft.as_ref()) {
+                by_host.entry(host).or_default().push((m.index, *n));
+            }
+        }
+        let hosts = by_host
+            .into_iter()
+            .map(|(host, mut servers)| {
+                servers.sort_unstable();
+                let urls: Vec<(Option<String>, Option<String>)> = servers
+                    .iter()
+                    .map(|(_, n)| frame_urls(state, &f.minecraft[n]))
+                    .collect();
+                let v4: Vec<Option<String>> = urls.iter().map(|u| u.1.clone()).collect();
+                MinecraftFieldHost {
+                    key: crate::minecraft::host_key(host),
+                    servers: servers.iter().map(|(_, n)| *n).collect(),
+                    frames: crate::minecraft::squeeze(
+                        &urls.iter().map(|u| u.0.clone()).collect::<Vec<_>>(),
+                    ),
+                    frames_v4: v4
+                        .iter()
+                        .any(Option::is_some)
+                        .then(|| crate::minecraft::squeeze(&v4)),
+                }
+            })
+            .collect();
+        MinecraftField {
+            servers: f.minecraft.len(),
+            hosts,
+        }
+    });
     let lent: Vec<u64> = f
         .minecraft
         .values()
@@ -1095,6 +1188,7 @@ fn minecraft_view(state: &State) -> Option<MinecraftView> {
         last_reset_all: f.last_minecraft_reset_all.clone(),
         last_fork: f.last_minecraft_fork.clone(),
         tiles,
+        field,
     })
 }
 
@@ -1578,6 +1672,34 @@ pub fn host_aggregate_urls(state: &State, h: &Host) -> (Option<String>, Option<S
                 h.aggregate_ipv6.as_deref(),
                 h.aggregate_ipv4.as_deref(),
                 h.aggregate_v4_port,
+            ) =>
+        {
+            (p.frame_url.clone(), p.frame_url_v4.clone())
+        }
+        _ => (None, None),
+    }
+}
+
+/// Pages mode's host's frame URLs (IPv6, IPv4), as for a host aggregator: with published
+/// names, those of the addresses its hello gave, once published; otherwise the URLs of its
+/// last report.
+pub fn renders_urls(state: &State, host: &str) -> (Option<String>, Option<String>) {
+    let Some(h) = state.fleet.renders.hosts.get(host) else {
+        return (None, None);
+    };
+    if !state.config.names_published {
+        let r = h.report.as_ref();
+        return (
+            r.and_then(|r| r.frame_url.clone()),
+            r.and_then(|r| r.frame_url_v4.clone()),
+        );
+    }
+    match &h.published {
+        Some(p)
+            if p.names(
+                h.hello.ipv6.as_deref(),
+                h.hello.ipv4.as_deref(),
+                h.hello.v4_port,
             ) =>
         {
             (p.frame_url.clone(), p.frame_url_v4.clone())

@@ -1,7 +1,8 @@
 # start-pieces results
 
 One c8g.metal-48xl (192 Graviton4 cores, 377 GiB), host kernel 7.0.0-1013-aws,
-`/mnt/fcvm-btrfs` a btrfs image on tmpfs, one boot, 2026-11-22. Snapshot: `bench-start-rate-prep`
+`/mnt/fcvm-btrfs` a btrfs image in a file on tmpfs (`/mnt/ram/btrfs.img`) mounted through a loop
+device, whose request queue holds 128 (`../README.md`, "The store"), one boot, 2026-11-22. Snapshot: `bench-start-rate-prep`
 of nginx:alpine, 1 vCPU, 256 MiB, rootless; its `disk/disk.raw` is a 12.8 GB sparse file of 854
 extents, so clones reflink it (`REFLINK_MAX_EXTENTS` is 4096). Each cell is one
 `make bench-start-pieces` run (`matrix.sh`); raw `summary.json` files are not committed.

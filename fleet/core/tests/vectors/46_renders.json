@@ -1,0 +1,1285 @@
+{
+  "description": "Pages mode (fleet/PROTOCOL.md, \"Pages mode\"): a host that says it renders pages is shown with its last report; a viewer's checked text and a transform from the fixed lists are one overlay, limited per client and for everyone, ordered to the host with a number, ended at its time or by a clear; a text without an allowing check, a name outside the lists and a change with no host are refused.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "aarch64",
+        "capacity": 0,
+        "gpus": [],
+        "host": "h1",
+        "renders": {
+          "build": {
+            "instance": "example-instance",
+            "kernel": "example-kernel"
+          },
+          "confined": true,
+          "cpus": 40,
+          "pages": [
+            {
+              "id": "example",
+              "url": "https://example.com/"
+            },
+            {
+              "id": "hn",
+              "url": "https://news.ycombinator.com/"
+            }
+          ]
+        },
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "at": 1990,
+        "frame_url": "wss://renders-h1.example.test/frames",
+        "harness": {
+          "cpu_pressure": 0.0,
+          "replay_ms": {
+            "fcvm": 0.4,
+            "kitesurf": 0.5
+          }
+        },
+        "sides": {
+          "fcvm": {
+            "cpu_ms_per_render": 1400.0,
+            "cpus_busy": 32.5,
+            "done": 500,
+            "failed": 0,
+            "render_ms": 360.0,
+            "renders_per_s": 23.0,
+            "search": {
+              "backed_off": {
+                "at": 1900,
+                "cause": "render_time",
+                "from": 18,
+                "ratio": 1.3
+              },
+              "curve": [
+                {
+                  "in_flight": 1,
+                  "render_ms": 300.0,
+                  "renders_per_s": 1.9
+                },
+                {
+                  "in_flight": 16,
+                  "render_ms": 360.0,
+                  "renders_per_s": 23.0
+                }
+              ],
+              "in_flight": 16,
+              "limit": 16,
+              "phase": "holding"
+            },
+            "since": 1000
+          },
+          "kitesurf": {
+            "cpus_busy": 20.5,
+            "done": 300,
+            "engines": 48,
+            "failed": 0,
+            "recycles": 0,
+            "render_ms": 700.0,
+            "renders_per_s": 17.0,
+            "search": {
+              "in_flight": 20,
+              "phase": "adding"
+            },
+            "since": 1000
+          }
+        },
+        "tiles": [
+          {
+            "done": 40,
+            "failed": 0,
+            "last_at": 1980,
+            "last_ms": 180.0,
+            "page": "example",
+            "renders_per_s": 1.7,
+            "side": "fcvm",
+            "state": "rendering"
+          },
+          {
+            "done": 0,
+            "failed": 0,
+            "page": "example",
+            "renders_per_s": 0.0,
+            "side": "kitesurf",
+            "state": "waiting"
+          }
+        ],
+        "type": "renders"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {
+        "text": "  hello   there "
+      },
+      "at": 3000,
+      "check": {
+        "reason": "",
+        "verdict": "allow"
+      },
+      "id": "t1",
+      "name": "renders_overlay",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "name": "mirror"
+      },
+      "at": 4000,
+      "id": "t2",
+      "name": "renders_transform",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "name": "invert"
+      },
+      "at": 5000,
+      "id": "t3",
+      "name": "renders_transform",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "name": "invert"
+      },
+      "at": 14000,
+      "id": "t4",
+      "name": "renders_transform",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "text": "x"
+      },
+      "at": 50000,
+      "id": "t5",
+      "name": "renders_overlay",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "args": {
+        "text": "x"
+      },
+      "at": 50000,
+      "check": {
+        "reason": "not for this wall",
+        "verdict": "refuse"
+      },
+      "id": "t6",
+      "name": "renders_overlay",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "args": {
+        "name": "spin"
+      },
+      "at": 50000,
+      "id": "t7",
+      "name": "renders_transform",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "at": 133999,
+      "type": "tick"
+    },
+    {
+      "at": 134000,
+      "type": "tick"
+    },
+    {
+      "args": {},
+      "at": 140000,
+      "id": "t8",
+      "name": "renders_clear",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "args": {
+        "text": "<b>again</b>"
+      },
+      "at": 141000,
+      "check": {
+        "reason": "",
+        "verdict": "allow"
+      },
+      "id": "t9",
+      "name": "renders_overlay",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "args": {},
+      "at": 180000,
+      "id": "t10",
+      "name": "renders_clear",
+      "type": "intent",
+      "viewer": "v3"
+    },
+    {
+      "at": 190000,
+      "host": "h1",
+      "type": "agent_gone"
+    },
+    {
+      "args": {
+        "name": "flip"
+      },
+      "at": 200000,
+      "id": "t11",
+      "name": "renders_transform",
+      "type": "intent",
+      "viewer": "v1"
+    }
+  ],
+  "expect": [
+    {
+      "after": 0,
+      "checks": {
+        "/renders_order/overlay": null,
+        "/view/renders/cpus": 40,
+        "/view/renders/host": "h1",
+        "/view/renders/overlay": null,
+        "/view/renders/pages/1/id": "hn",
+        "/view/renders/report": null,
+        "/view/renders/transforms/chromium_only": [
+          "invert",
+          "tilt",
+          "blur"
+        ]
+      },
+      "note": "a host that runs the mode: its pages and CPUs a side, no report yet, nothing set"
+    },
+    {
+      "after": 1,
+      "checks": {
+        "/view/renders/report/sides/fcvm/search/backed_off/cause": "render_time",
+        "/view/renders/report/sides/fcvm/search/limit": 16,
+        "/view/renders/report/sides/kitesurf/search/limit": null,
+        "/view/renders/report/sides/kitesurf/search/phase": "adding",
+        "/view/renders/report/tiles/1/state": "waiting",
+        "/view/renders/report_at": 2000
+      },
+      "note": "the host's report is shown as it came, with when it arrived"
+    },
+    {
+      "after": 2,
+      "checks": {
+        "/receipts/t1/outcome": "committed",
+        "/renders_order/overlay/seq": 1,
+        "/renders_order/overlay/text": "hello there",
+        "/view/renders/overlay/chromium_only": false,
+        "/view/renders/overlay/text": "hello there",
+        "/view/renders/overlay/until": 123000
+      },
+      "note": "a checked text is set, whitespace collapsed, for two minutes, and ordered to the host"
+    },
+    {
+      "after": 3,
+      "checks": {
+        "/receipts/t2/outcome": "refused",
+        "/receipts/t2/reason": "one change every 30 s",
+        "/view/renders/overlay/seq": 1
+      },
+      "note": "one change per client in the interval"
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/receipts/t3/outcome": "refused",
+        "/receipts/t3/reason": "the pages changed less than 10 s ago; try again"
+      },
+      "note": "and one from anyone in the shorter interval"
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/receipts/t4/outcome": "committed",
+        "/renders_order/overlay/chromium_only": true,
+        "/renders_order/overlay/seq": 2,
+        "/view/renders/overlay/chromium_only": true,
+        "/view/renders/overlay/text": "hello there",
+        "/view/renders/overlay/transform": "invert",
+        "/view/renders/overlay/until": 134000
+      },
+      "note": "a transform joins the text; a Chromium-only one is marked for the page and the host"
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/receipts/t5/reason": "the text check did not run"
+      },
+      "note": "a text without the check's verdict is refused"
+    },
+    {
+      "after": 7,
+      "checks": {
+        "/receipts/t6/outcome": "refused",
+        "/receipts/t6/reason": "the text check refused it: not for this wall",
+        "/view/actions/5/args": {},
+        "/view/actions/5/summary": "the text check refused it: not for this wall",
+        "/view/renders/overlay/text": "hello there"
+      },
+      "note": "and so is one the check refused, whose text is in no snapshot"
+    },
+    {
+      "after": 8,
+      "checks": {
+        "/receipts/t7/outcome": "refused",
+        "/receipts/t7/reason": "args.name must be one of mirror, flip, rotate, scale, zoom, skew, invert, tilt, blur"
+      },
+      "note": "a transform is a name from the lists, never CSS"
+    },
+    {
+      "after": 9,
+      "checks": {
+        "/view/renders/overlay/seq": 2
+      },
+      "note": "the overlay stays until its time"
+    },
+    {
+      "after": 10,
+      "checks": {
+        "/renders_order/overlay": null,
+        "/view/renders/overlay": null
+      },
+      "note": "and ends at it, which the host is ordered too"
+    },
+    {
+      "after": 11,
+      "checks": {
+        "/receipts/t8/outcome": "refused",
+        "/receipts/t8/reason": "nothing is set"
+      },
+      "note": "nothing to clear"
+    },
+    {
+      "after": 12,
+      "checks": {
+        "/receipts/t9/outcome": "committed",
+        "/renders_order/overlay/seq": 4,
+        "/view/renders/overlay/text": "<b>again</b>"
+      },
+      "note": "markup is kept as the text it is; the host escapes it into the page"
+    },
+    {
+      "after": 13,
+      "checks": {
+        "/receipts/t10/outcome": "committed",
+        "/renders_order/overlay": null,
+        "/view/renders/overlay": null
+      },
+      "note": "a clear takes it away"
+    },
+    {
+      "after": 14,
+      "checks": {
+        "/view/renders": null
+      },
+      "note": "the host gone, the mode has no view"
+    },
+    {
+      "after": 15,
+      "checks": {
+        "/receipts/t11/outcome": "refused",
+        "/receipts/t11/reason": "no host runs the pages now"
+      },
+      "note": "and no change is taken"
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {
+          "text": "hello there"
+        },
+        "at": 3000,
+        "id": "t1",
+        "name": "renders_overlay",
+        "outcome": "committed",
+        "summary": "text",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 4000,
+        "id": "t2",
+        "name": "renders_transform",
+        "outcome": "refused",
+        "summary": "one change every 30 s",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 5000,
+        "id": "t3",
+        "name": "renders_transform",
+        "outcome": "refused",
+        "summary": "the pages changed less than 10 s ago; try again",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "name": "invert"
+        },
+        "at": 14000,
+        "id": "t4",
+        "name": "renders_transform",
+        "outcome": "committed",
+        "summary": "transform",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 50000,
+        "id": "t5",
+        "name": "renders_overlay",
+        "outcome": "refused",
+        "summary": "the text check did not run",
+        "viewer": "v3"
+      },
+      {
+        "args": {},
+        "at": 50000,
+        "id": "t6",
+        "name": "renders_overlay",
+        "outcome": "refused",
+        "summary": "the text check refused it: not for this wall",
+        "viewer": "v3"
+      },
+      {
+        "args": {},
+        "at": 50000,
+        "id": "t7",
+        "name": "renders_transform",
+        "outcome": "refused",
+        "summary": "args.name must be one of mirror, flip, rotate, scale, zoom, skew, invert, tilt, blur",
+        "viewer": "v3"
+      },
+      {
+        "args": {},
+        "at": 140000,
+        "id": "t8",
+        "name": "renders_clear",
+        "outcome": "refused",
+        "summary": "nothing is set",
+        "viewer": "v3"
+      },
+      {
+        "args": {
+          "text": "<b>again</b>"
+        },
+        "at": 141000,
+        "id": "t9",
+        "name": "renders_overlay",
+        "outcome": "committed",
+        "summary": "text",
+        "viewer": "v3"
+      },
+      {
+        "args": {},
+        "at": 180000,
+        "id": "t10",
+        "name": "renders_clear",
+        "outcome": "committed",
+        "summary": "clear",
+        "viewer": "v3"
+      },
+      {
+        "args": {},
+        "at": 200000,
+        "id": "t11",
+        "name": "renders_transform",
+        "outcome": "refused",
+        "summary": "no host runs the pages now",
+        "viewer": "v1"
+      }
+    ],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": null,
+    "counters": {
+      "restores": 0,
+      "restores_last_hour": 0,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "agents": {
+        "hosts": [
+          {
+            "first_at": 1000,
+            "last_at": 1000,
+            "name": "h1"
+          }
+        ],
+        "since": 0
+      },
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 0,
+      "gpus": 0,
+      "hosts": [],
+      "max_tiles": 100,
+      "n": 0,
+      "power": {
+        "asleep_since": null,
+        "hosts": [],
+        "idle_since": null,
+        "last_arrival_at": 0,
+        "last_wake": null,
+        "sleep_without_arrival_at": null,
+        "state": "awake",
+        "wakes": [],
+        "woke_at": null
+      },
+      "standby": [],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 0,
+      "from_t": 0.0,
+      "generation": 0
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": 156999,
+      "closes_at": 164999,
+      "holding": null,
+      "holding_label": null,
+      "leading": "peak-close",
+      "next": "ridges",
+      "next_hold_at": null,
+      "next_label": "Across the ridges",
+      "opened_at": 133999,
+      "targets": [
+        {
+          "arrive_at": 183999,
+          "id": "peak-close",
+          "label": "Circling the peak",
+          "votes": 0
+        },
+        {
+          "arrive_at": 190999,
+          "id": "peak-west",
+          "label": "The peak from the west",
+          "votes": 0
+        },
+        {
+          "arrive_at": 190999,
+          "id": "lake-skim",
+          "label": "Low over the western lakes",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -12.861588,
+            1.35,
+            -101.722203
+          ],
+          "pos": [
+            3.0,
+            0.55,
+            -90.0
+          ],
+          "t": 122.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.1036,
+            1.36,
+            -100.987452
+          ],
+          "pos": [
+            3.0,
+            0.56,
+            -89.6
+          ],
+          "t": 123.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.338549,
+            1.37,
+            -100.247706
+          ],
+          "pos": [
+            3.0,
+            0.57,
+            -89.2
+          ],
+          "t": 124.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.566332,
+            1.38,
+            -99.503114
+          ],
+          "pos": [
+            3.0,
+            0.58,
+            -88.8
+          ],
+          "t": 125.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -13.786847,
+            1.39,
+            -98.753828
+          ],
+          "pos": [
+            3.0,
+            0.59,
+            -88.4
+          ],
+          "t": 126.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.0,
+            1.4,
+            -98.0
+          ],
+          "pos": [
+            3.0,
+            0.6,
+            -88.0
+          ],
+          "t": 127.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.205696,
+            1.41,
+            -97.241786
+          ],
+          "pos": [
+            3.0,
+            0.61,
+            -87.6
+          ],
+          "t": 128.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.403845,
+            1.42,
+            -96.479342
+          ],
+          "pos": [
+            3.0,
+            0.62,
+            -87.2
+          ],
+          "t": 129.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.59436,
+            1.43,
+            -95.712828
+          ],
+          "pos": [
+            3.0,
+            0.63,
+            -86.8
+          ],
+          "t": 130.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.777157,
+            1.44,
+            -94.942405
+          ],
+          "pos": [
+            3.0,
+            0.64,
+            -86.4
+          ],
+          "t": 131.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -14.952157,
+            1.45,
+            -94.168235
+          ],
+          "pos": [
+            3.0,
+            0.65,
+            -86.0
+          ],
+          "t": 132.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -15.123232,
+            1.46,
+            -93.392246
+          ],
+          "pos": [
+            3.0,
+            0.66,
+            -85.6
+          ],
+          "t": 133.999
+        },
+        {
+          "fov_deg": 60.221383,
+          "look": [
+            -15.93824,
+            1.417335,
+            -91.939983
+          ],
+          "pos": [
+            2.826235,
+            0.674205,
+            -85.097802
+          ],
+          "t": 134.999
+        },
+        {
+          "fov_deg": 60.806858,
+          "look": [
+            -17.798539,
+            1.259131,
+            -89.206226
+          ],
+          "pos": [
+            2.319307,
+            0.69244,
+            -84.418791
+          ],
+          "t": 135.999
+        },
+        {
+          "fov_deg": 61.646649,
+          "look": [
+            -20.20021,
+            0.945295,
+            -85.672758
+          ],
+          "pos": [
+            1.501671,
+            0.704897,
+            -83.602009
+          ],
+          "t": 136.999
+        },
+        {
+          "fov_deg": 62.641957,
+          "look": [
+            -22.869039,
+            0.465493,
+            -81.738102
+          ],
+          "pos": [
+            0.396995,
+            0.699666,
+            -82.683384
+          ],
+          "t": 137.999
+        },
+        {
+          "fov_deg": 63.704961,
+          "look": [
+            -25.771821,
+            -0.05885,
+            -77.924782
+          ],
+          "pos": [
+            -0.969846,
+            0.67451,
+            -81.695735
+          ],
+          "t": 138.999
+        },
+        {
+          "fov_deg": 64.758817,
+          "look": [
+            -29.127654,
+            -0.374598,
+            -74.905372
+          ],
+          "pos": [
+            -2.572765,
+            0.643109,
+            -80.668767
+          ],
+          "t": 139.999
+        },
+        {
+          "fov_deg": 65.737658,
+          "look": [
+            -33.260817,
+            -0.394617,
+            -73.554619
+          ],
+          "pos": [
+            -4.384463,
+            0.632034,
+            -79.62907
+          ],
+          "t": 140.999
+        },
+        {
+          "fov_deg": 66.586597,
+          "look": [
+            -37.966228,
+            -0.302628,
+            -73.233281
+          ],
+          "pos": [
+            -6.376433,
+            0.637978,
+            -78.600128
+          ],
+          "t": 141.999
+        },
+        {
+          "fov_deg": 67.261724,
+          "look": [
+            -42.956263,
+            0.068052,
+            -73.075184
+          ],
+          "pos": [
+            -8.518958,
+            0.665892,
+            -77.602307
+          ],
+          "t": 142.999
+        },
+        {
+          "fov_deg": 67.730104,
+          "look": [
+            -48.143756,
+            0.970775,
+            -73.117425
+          ],
+          "pos": [
+            -10.781109,
+            0.759996,
+            -76.652865
+          ],
+          "t": 143.999
+        },
+        {
+          "fov_deg": 67.969783,
+          "look": [
+            -53.421758,
+            2.387295,
+            -73.381936
+          ],
+          "pos": [
+            -13.130747,
+            0.95548,
+            -75.765945
+          ],
+          "t": 144.999
+        },
+        {
+          "fov_deg": 67.969783,
+          "look": [
+            -58.70238,
+            3.966339,
+            -73.872482
+          ],
+          "pos": [
+            -15.534525,
+            1.271382,
+            -74.952579
+          ],
+          "t": 145.999
+        },
+        {
+          "fov_deg": 67.730104,
+          "look": [
+            -64.039659,
+            3.561424,
+            -74.579519
+          ],
+          "pos": [
+            -17.957882,
+            1.66662,
+            -74.220688
+          ],
+          "t": 146.999
+        },
+        {
+          "fov_deg": 67.261724,
+          "look": [
+            -69.241167,
+            1.838591,
+            -75.487168
+          ],
+          "pos": [
+            -20.36505,
+            1.830663,
+            -73.575078
+          ],
+          "t": 147.999
+        },
+        {
+          "fov_deg": 66.586597,
+          "look": [
+            -74.191879,
+            1.51746,
+            -76.55581
+          ],
+          "pos": [
+            -22.719048,
+            1.935999,
+            -73.017445
+          ],
+          "t": 148.999
+        },
+        {
+          "fov_deg": 65.737658,
+          "look": [
+            -78.856302,
+            1.534126,
+            -77.73277
+          ],
+          "pos": [
+            -24.981688,
+            2.039911,
+            -72.546373
+          ],
+          "t": 149.999
+        },
+        {
+          "fov_deg": 64.758817,
+          "look": [
+            -82.896008,
+            1.466684,
+            -80.85321
+          ],
+          "pos": [
+            -27.113568,
+            2.130506,
+            -72.157332
+          ],
+          "t": 150.999
+        },
+        {
+          "fov_deg": 63.704961,
+          "look": [
+            -85.36016,
+            0.760973,
+            -87.918299
+          ],
+          "pos": [
+            -29.074079,
+            2.204499,
+            -71.842682
+          ],
+          "t": 151.999
+        },
+        {
+          "fov_deg": 62.641957,
+          "look": [
+            -85.416255,
+            0.959022,
+            -97.319808
+          ],
+          "pos": [
+            -30.821399,
+            2.183617,
+            -71.591669
+          ],
+          "t": 152.999
+        },
+        {
+          "fov_deg": 61.646649,
+          "look": [
+            -82.854021,
+            2.196468,
+            -107.041988
+          ],
+          "pos": [
+            -32.312498,
+            2.237366,
+            -71.390428
+          ],
+          "t": 153.999
+        },
+        {
+          "fov_deg": 60.806858,
+          "look": [
+            -78.550373,
+            2.464257,
+            -115.214027
+          ],
+          "pos": [
+            -33.503134,
+            2.327439,
+            -71.221981
+          ],
+          "t": 154.999
+        },
+        {
+          "fov_deg": 60.221383,
+          "look": [
+            -74.295133,
+            2.380238,
+            -120.639428
+          ],
+          "pos": [
+            -34.347855,
+            2.381619,
+            -71.066239
+          ],
+          "t": 155.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.3,
+            2.4,
+            -122.65
+          ],
+          "pos": [
+            -34.8,
+            2.4,
+            -70.9
+          ],
+          "t": 156.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.54,
+            2.4,
+            -122.47
+          ],
+          "pos": [
+            -35.04,
+            2.4,
+            -70.72
+          ],
+          "t": 157.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -72.78,
+            2.4,
+            -122.29
+          ],
+          "pos": [
+            -35.28,
+            2.4,
+            -70.54
+          ],
+          "t": 158.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.02,
+            2.4,
+            -122.11
+          ],
+          "pos": [
+            -35.52,
+            2.4,
+            -70.36
+          ],
+          "t": 159.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.26,
+            2.4,
+            -121.93
+          ],
+          "pos": [
+            -35.76,
+            2.4,
+            -70.18
+          ],
+          "t": 160.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.5,
+            2.4,
+            -121.75
+          ],
+          "pos": [
+            -36.0,
+            2.4,
+            -70.0
+          ],
+          "t": 161.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.74,
+            2.4,
+            -121.57
+          ],
+          "pos": [
+            -36.24,
+            2.4,
+            -69.82
+          ],
+          "t": 162.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -73.98,
+            2.4,
+            -121.39
+          ],
+          "pos": [
+            -36.48,
+            2.4,
+            -69.64
+          ],
+          "t": 163.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.22,
+            2.4,
+            -121.21
+          ],
+          "pos": [
+            -36.72,
+            2.4,
+            -69.46
+          ],
+          "t": 164.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.46,
+            2.4,
+            -121.03
+          ],
+          "pos": [
+            -36.96,
+            2.4,
+            -69.28
+          ],
+          "t": 165.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.7,
+            2.4,
+            -120.85
+          ],
+          "pos": [
+            -37.2,
+            2.4,
+            -69.1
+          ],
+          "t": 166.999
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -74.94,
+            2.4,
+            -120.67
+          ],
+          "pos": [
+            -37.44,
+            2.4,
+            -68.92
+          ],
+          "t": 167.999
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.711,
+      "weather": [
+        {
+          "cover": 0.5,
+          "rays": 1.0,
+          "snow_line_km": 0.7,
+          "t": 132.999,
+          "towers": 0.0
+        },
+        {
+          "cover": 0.5,
+          "rays": 1.0,
+          "snow_line_km": 0.7122,
+          "t": 156.999,
+          "towers": 0.0
+        }
+      ],
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 0,
+      "count": 0
+    }
+  }
+}

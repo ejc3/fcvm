@@ -795,7 +795,7 @@ async fn check_health_once(
                     // started it (the status listener writes the container-ready file).
                     // Nothing is spawned for that, so checks cost nothing under load
                     // and the monitor learns of the start when it happens.
-                    match read_container_start(&paths::vm_runtime_dir(vm_id)) {
+                    match read_container_start(&state.vm_runtime_dir()) {
                         ContainerStart::NotYet => {
                             debug!(target: "health-monitor", "waiting for the container start notification");
                             HealthStatus::Unknown
@@ -1007,7 +1007,7 @@ async fn rdp_health(
     last_failure_log: &mut Option<Instant>,
 ) -> HealthStatus {
     let timeout = Duration::from_secs(state.config.health_check_timeout.max(1));
-    let data_dir = paths::vm_runtime_dir(&state.vm_id);
+    let data_dir = state.vm_runtime_dir();
     match raw_guest_health(&data_dir, timeout).await {
         Ok(()) => {
             debug!(target: "health-monitor", "clock acknowledged and RDP connection confirmed");

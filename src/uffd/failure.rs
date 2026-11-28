@@ -152,19 +152,16 @@ mod tests {
             Some("vm-clone")
         );
 
-        // A state the index does not name: written beside it, as a build without the index
-        // would have.
+        // A state the index does not name: written where states go, with no index entry.
         let parent = std::os::unix::process::parent_id();
         let parent_start = crate::utils::process_start_time(parent).unwrap();
         let mut unindexed =
             crate::state::VmState::new("vm-unindexed".into(), "alpine".into(), 1, 128);
         unindexed.pid = Some(parent);
         unindexed.pid_start_time = Some(parent_start);
-        std::fs::write(
-            dir.path().join("vm-unindexed.json"),
-            serde_json::to_string(&unindexed).unwrap(),
-        )
-        .unwrap();
+        let unindexed_path = manager.state_file("vm-unindexed");
+        std::fs::create_dir_all(unindexed_path.parent().unwrap()).unwrap();
+        std::fs::write(unindexed_path, serde_json::to_string(&unindexed).unwrap()).unwrap();
         let (states, listed) = states_of_parent(&manager, parent, parent_start)
             .await
             .unwrap();

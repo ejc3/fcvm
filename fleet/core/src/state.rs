@@ -15,6 +15,9 @@ pub struct Config {
     /// Potato mode's game (docs/fleet/ARCHITECTURE.md, "Potato mode").
     #[serde(default)]
     pub potato: crate::potato::PotatoConfig,
+    /// Pages mode's overlay limits.
+    #[serde(default)]
+    pub renders: crate::renders::RendersConfig,
     /// Width / height of the whole image (both halves).
     pub image_aspect: f64,
     /// Width / height the tiling aims for.
@@ -255,6 +258,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             potato: Default::default(),
+            renders: Default::default(),
             max_tiles: 100,
             image_aspect: 16.0 / 9.0,
             tile_aspect: 16.0 / 9.0,
@@ -858,6 +862,9 @@ pub struct Fleet {
     /// Potato mode's game.
     #[serde(default)]
     pub potato: crate::potato::Potato,
+    /// Pages mode: its hosts' reports and the overlay viewers set.
+    #[serde(default)]
+    pub renders: crate::renders::Renders,
     /// The GPU hosts the launcher keeps, by instance id (`Event::HostsExpected`); `None`
     /// when it cannot say, or the coordinator launches none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -995,6 +1002,7 @@ impl State {
                 last_minecraft_fork: None,
                 minecraft_to_reset: BTreeMap::new(),
                 potato: Default::default(),
+                renders: Default::default(),
                 expected_hosts: None,
                 registrations: Registrations {
                     since: now_ms,
@@ -1022,6 +1030,8 @@ impl State {
         let f = &mut self.fleet;
         // the ladder and the records stay; the round and the players went with the agent
         f.potato.resumed();
+        // the overlay stays and ends at its time; the hosts went with their connections
+        f.renders.resumed();
         // Registrations it had not stored are lost, and agents reconnect only once it is back.
         f.registrations = Registrations {
             since: now_ms,
@@ -1175,15 +1185,25 @@ pub fn lambda_name(n: u32) -> String {
 /// be part of a DNS label: lowercase letters, digits and inner hyphens, at most 40
 /// characters (an EC2 instance id is 19), and not `ec2`, kept for the EC2 half's aggregator.
 pub fn aggregate_id(host: &str) -> Option<String> {
-    let ok = !host.is_empty()
+    (host != "ec2" && host_label(host)).then(|| format!("agg-{host}"))
+}
+
+/// Whether a host's name can be part of a DNS label: lowercase letters, digits and inner
+/// hyphens, at most 40 characters (an EC2 instance id is 19).
+fn host_label(host: &str) -> bool {
+    !host.is_empty()
         && host.len() <= 40
-        && host != "ec2"
         && !host.starts_with('-')
         && !host.ends_with('-')
         && host
             .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    ok.then(|| format!("agg-{host}"))
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The id pages mode's host's frame socket is named under in DNS, `renders-<host>`, when the
+/// host's name can be part of a DNS label (as for [`aggregate_id`]).
+pub fn renders_id(host: &str) -> Option<String> {
+    host_label(host).then(|| format!("renders-{host}"))
 }
 
 /// The id the EC2 half's aggregator is named under in DNS.

@@ -184,7 +184,12 @@ impl Fake {
         let manifest = Manifest::read(&img).unwrap();
         WindowsCfg {
             count,
-            gold_key: fcvm::fleet::agent::windows::gold_key(&img, &manifest).unwrap(),
+            gold_key: fcvm::fleet::agent::windows::gold_key(
+                &img,
+                &manifest,
+                "cloud-hypervisor test",
+            )
+            .unwrap(),
             image_check: Duration::from_millis(300),
             bridge_stop: Duration::from_secs(1),
             manifest,
@@ -318,6 +323,7 @@ impl Coord {
             store_ready_file: None,
             boot: Default::default(),
             ipv4_front: None,
+            renders: None,
             potato: None,
             windows: Some(windows),
             minecraft: None,

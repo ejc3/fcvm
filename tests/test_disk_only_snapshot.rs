@@ -12,11 +12,12 @@ mod common;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
+/// Where the fcvm this test runs keeps its snapshots: asked of fcvm's own path helper,
+/// which reads the data directory the way the binary does (the config's, or
+/// `FCVM_DATA_DIR`). `make test-all` sets no `FCVM_DATA_DIR` and `make test-root` sets the
+/// root data directory, so a default written here is right under one of them only.
 fn snapshot_dir() -> PathBuf {
-    let data_dir = std::env::var("FCVM_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/mnt/fcvm-btrfs/root"));
-    data_dir.join("snapshots")
+    fcvm::paths::snapshot_dir()
 }
 
 #[tokio::test]

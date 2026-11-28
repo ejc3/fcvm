@@ -77,7 +77,7 @@ If you already have a host with nested KVM enabled:
 ./fcvm setup --kernel-profile nested --build-kernels
 ```
 
-The nested kernel (6.18) includes CONFIG_KVM=y, EL2 support, MMFR4 patch for NV2 capability, FUSE, and TUN/VETH/netfilter for nested networking.
+The nested kernel (7.3.3) includes CONFIG_KVM=y, EL2 support, the MMFR4 patch that lets `arm64.nv2` tell the guest it has NV2 (ID_AA64MMFR4_EL1.NV_frac = 1, NV2_ONLY; 2 would claim FEAT_NV2p1), FUSE, and TUN/VETH/netfilter for nested networking.
 
 ## Running Nested VMs
 

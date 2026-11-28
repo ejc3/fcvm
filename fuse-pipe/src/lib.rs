@@ -71,7 +71,7 @@ pub use transport::{Transport, TransportError, UnixListener, UnixTransport, HOST
 pub use transport::{VsockListener, VsockTransport};
 
 // Re-export server types
-pub use server::remap::RemapFs;
+pub use server::remap::{inode_table_paths, RemapFs};
 pub use server::{AsyncServer, CapturedInodes, FilesystemHandler, PassthroughFs, ServerConfig};
 
 // Re-export telemetry types
