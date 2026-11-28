@@ -4,9 +4,18 @@
 // pages; the words come from core/landing.ts.
 
 import { createPortal } from "react-dom";
-import { useEffect, useId, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { landingPanelText, type LandingView, type LegendEntry } from "../../core/index.ts";
 import "./landing.css";
+
+/**
+ * The control and its panel keep their keys to themselves: a taken-over server's handlers listen on
+ * the window, so Space on Close or a movement key would otherwise reach the game. Nothing is
+ * prevented, so a button still activates on Space and Enter. Escape is taken in the capture phase below.
+ */
+const keepKeys = (e: ReactKeyboardEvent) => {
+  if (e.key !== "Escape") e.stopPropagation();
+};
 
 /** A legend mark, drawn with the Potato tiles' own phase styles. */
 function Mark({ m, colour }: { m: LegendEntry["mark"]; colour: string }) {
@@ -83,7 +92,7 @@ export function Landing({ landing, colour, sheet = "bottom", children }: { landi
   const text = landingPanelText(landing);
   return (
     <div className="landing" data-testid="landing">
-      <p className="landing-line" data-testid="landing-line">
+      <p className="landing-line" data-testid="landing-line" onKeyDown={keepKeys} onKeyUp={keepKeys}>
         <span data-testid="landing-text">{landing.line}</span>{" "}
         <button ref={btnRef} type="button" className="landing-btn" aria-expanded={open} aria-controls={open ? panelId : undefined} data-testid="landing-button" onClick={() => {
           const r = btnRef.current?.getBoundingClientRect();
@@ -98,7 +107,7 @@ export function Landing({ landing, colour, sheet = "bottom", children }: { landi
         <>
         {/* A tap outside takes the whole pointer sequence (down, up, click) and only closes the panel: nothing under it sees it. */}
         <div className="landing-backdrop" data-testid="landing-backdrop" onPointerDown={(e) => e.stopPropagation()} onPointerUp={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); setOpen(false); }} />
-        <div ref={panelRef} id={panelId} className="landing-panel" data-sheet={sheet} role="dialog" aria-label="What this page shows" tabIndex={-1} data-testid="landing-panel" style={{ ["--lx" as string]: `${Math.min(anchor?.x ?? 0, Math.max(0, window.innerWidth - 436))}px`, ["--ly" as string]: `${anchor?.y ?? 0}px` }}>
+        <div ref={panelRef} id={panelId} className="landing-panel" data-sheet={sheet} role="dialog" aria-label="What this page shows" tabIndex={-1} data-testid="landing-panel" onKeyDown={keepKeys} onKeyUp={keepKeys} style={{ ["--lx" as string]: `${Math.min(anchor?.x ?? 0, Math.max(0, window.innerWidth - 436))}px`, ["--ly" as string]: `${anchor?.y ?? 0}px` }}>
           <button type="button" className="landing-close" aria-label="Close" data-testid="landing-close" onClick={() => { setOpen(false); btnRef.current?.focus(); }}>
             Close
           </button>

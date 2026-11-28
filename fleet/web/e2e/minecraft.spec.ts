@@ -525,6 +525,38 @@ test("minecraft: Escape closes the About panel and releases nothing under it", a
   expect(sent.slice(before).filter((t) => /release_|"close"/.test(t)), "no release or close intent was sent").toEqual([]);
 });
 
+test("minecraft: Space on the About panel's Close button closes it and sends no drive input", async ({ page }, info) => {
+  test.skip(info.project.name === "phone", "the control is hidden while something is held on a phone");
+  const views: Record<string, unknown>[] = [];
+  page.on("websocket", (ws) =>
+    ws.on("framesent", (e) => {
+      if (!ws.url().endsWith("/view") || typeof e.payload !== "string") return;
+      views.push(JSON.parse(e.payload) as Record<string, unknown>);
+    }),
+  );
+  await openMinecraft(page);
+  await page.getByTestId("mc-take-mc-2").click();
+  await expect(page.getByTestId("mc-panel")).toBeVisible();
+  await expect.poll(async () => drivenBot(page, "mc:2")).not.toBeNull();
+  await page.getByTestId("landing-button").focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("landing-panel")).toBeVisible();
+  await page.getByTestId("landing-close").focus();
+  const before = views.length;
+  await page.keyboard.press("Space");
+  await expect(page.getByTestId("landing-panel")).toHaveCount(0);
+  // a movement key on the panel goes nowhere either
+  await page.getByTestId("landing-button").focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("landing-panel")).toBeVisible();
+  await page.keyboard.press("KeyW");
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("landing-panel")).toHaveCount(0);
+  await expect(page.getByTestId("mc-panel"), "the held server stays held").toBeVisible();
+  const driven = views.slice(before).filter((m) => Array.isArray(m["keys"]) && (m["keys"] as string[]).length > 0);
+  expect(driven, "no key reached the game").toEqual([]);
+});
+
 test("minecraft: a tap on the held view with the About panel open only closes the panel", async ({ page }, info) => {
   // On a phone the bottom sheet covers the held view and the pad; the Wall test covers the backdrop there.
   test.skip(isPhone(info), "the sheet covers the held view on a phone");

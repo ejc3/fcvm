@@ -503,6 +503,80 @@ test("potato: a card does not come back after its tile left the ring and the rin
   await expect(readout, "nothing is focused, so no card").toHaveCount(0);
 });
 
+test("potato: a focused tile's card does not come back when the agent is gone and returns", async ({ page }) => {
+  await startAt(8);
+  await openPotato(page);
+  const readout = page.getByTestId("potato-readout");
+  await tiles(page).first().focus();
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowLeft");
+  await expect(tiles(page).first()).toBeFocused();
+  await expect(readout).toBeVisible();
+  // no players are running: the ring is gone, and with it the tile that was focused
+  await admin("/mock/potato", { cpus: 0, players: 0, next_in_ms: 300 });
+  await expect(tiles(page)).toHaveCount(0, { timeout: 10_000 });
+  await admin("/mock/potato", { cpus: 0, players: 8, size: 8, next_in_ms: 300 });
+  await expect(tiles(page)).toHaveCount(8, { timeout: 10_000 });
+  await page.waitForTimeout(500);
+  await expect(readout, "nothing is focused, so no card").toHaveCount(0);
+});
+
+test("density: one ball, two waking, one saving and four free on 8 CPUs take the two rows the compact slots reserve", async ({ page }) => {
+  await startDense(32, { cpus: 8, players: 32 });
+  await openPotato(page);
+  const cpus = page.getByTestId("potato-cpus");
+  // a window whose ring leaves room for two rows of small chips and no more: two rows of 8 CPUs is 4
+  // columns, and slotsLayout sets the list's width to columns x 23 px. The page measures its stage
+  // on a resize and draws on the frame after, so the form and the width are read in one task after two frames.
+  let found = false;
+  const tried: string[] = [];
+  for (const [vw, vh] of [[1280, 800], [1200, 760], [1120, 720], [1040, 700], [980, 680], [920, 660], [860, 640]] as const) {
+    await page.setViewportSize({ width: vw, height: vh });
+    const now = await cpus.evaluate(
+      (el) =>
+        new Promise<{ form: string | null; width: string }>((resolve) =>
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() => {
+              const live = document.querySelector('[data-testid="potato-cpus"]') ?? el;
+              resolve({ form: live.getAttribute("data-form"), width: (live.querySelector(".slot-groups") as HTMLElement | null)?.style.width ?? "" });
+            }),
+          ),
+        ),
+    );
+    tried.push(`${vw}x${vh}: ${now.form}/${now.width}`);
+    if (now.form === "compact" && now.width === "92px") {
+      found = true;
+      break;
+    }
+  }
+  expect(found, `a viewport with the compact two-row slots; tried ${tried.join(", ")}`).toBe(true);
+  // the page's own markup and stylesheet, given that distribution, read in one task so no tick redraws it between
+  const rows = await cpus.evaluate((el) => {
+    const groups = el.querySelector(".slot-groups")!;
+    const mk = (name: string, n: number, free: boolean) => {
+      const li = document.createElement("li");
+      li.className = "slot-group";
+      const row = document.createElement("span");
+      row.className = "slot-row";
+      for (let i = 0; i < n; i++) {
+        const c = document.createElement("span");
+        c.className = free ? "slot free" : "potato-swatch sm";
+        c.setAttribute("data-testid", "potato-slot");
+        row.append(c);
+      }
+      const label = document.createElement("span");
+      label.className = "sr-only";
+      label.textContent = name;
+      li.append(row, label);
+      return li;
+    };
+    groups.replaceChildren(mk("ball", 1, false), mk("waking", 2, false), mk("saving", 1, false), mk("free", 4, true));
+    const tops = new Set([...groups.querySelectorAll('[data-testid="potato-slot"]')].map((c) => Math.round(c.getBoundingClientRect().top)));
+    return tops.size;
+  });
+  expect(rows, "the chips stand in two rows").toBe(2);
+});
+
 test("potato: the legend's marks keep their colours in the panel, in the dark and the light scheme", async ({ page }) => {
   await startAt(8);
   for (const scheme of ["dark", "light"] as const) {

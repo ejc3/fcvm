@@ -158,7 +158,13 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
   const shown = present(pressed) ?? present(pointed) ?? present(focused);
   // A state that names a tile no longer in the ring is dropped, so the card does not come back when the ring does.
   useEffect(() => {
-    if (ring === null) return;
+    // No ring (the host's agent is gone) means no players: nothing stays selected for when they return.
+    if (ring === null) {
+      setPointed(null);
+      setFocused(null);
+      setPressed(null);
+      return;
+    }
     const gone = (n: number | null) => n !== null && !ring.tiles.some((t) => t.player === n);
     if (gone(pointed)) setPointed(null);
     if (gone(focused)) setFocused(null);

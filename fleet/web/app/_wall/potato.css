@@ -179,8 +179,9 @@
 .potato-cpus.compact { gap: 4px; }
 .potato-cpus.compact .cpus-heading { font-size: 14px; font-weight: 600; white-space: nowrap; }
 .potato-cpus .busy { display: block; font-weight: 400; font-size: 14px; color: var(--muted); }
-.potato-cpus.compact .slot-groups { gap: 2px 6px; flex-wrap: wrap; justify-content: center; }
-.potato-cpus.compact .slot-row { gap: 3px; }
+/* Chips wrap one by one, not a phase group at a time: a row holds the column count slotsLayout reserved, whatever the groups' sizes. */
+.potato-cpus.compact .slot-groups { gap: 3px; flex-wrap: wrap; justify-content: center; }
+.potato-cpus.compact .slot-group, .potato-cpus.compact .slot-row { display: contents; }
 .potato-cpus.compact .potato-swatch.sm, .potato-cpus.compact .slot.free { width: 20px; height: 20px; }
 .potato-cpus.compact .potato-swatch .num { font-size: 14px; padding: 0 1px; background: none; color: #0b0d10; }
 .potato-cpus.compact [data-label] { position: relative; }
