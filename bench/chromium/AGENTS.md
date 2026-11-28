@@ -817,9 +817,9 @@ holder and pasta to be discovered before they assert anything. That is not
 pedantry: until 2026-08-08 the clone test held the holder as a bare `Option` and
 asserted `!holder.is_some_and(running)`, which is `!false` when discovery returns
 `None` — an assertion that cannot fail when its subject is absent, and discovery
-is coupled to production by the literal string `sleep infinity`. Verified by
-fault injection (holder argv → `sleep 2147483647`): the old test still passed
-while a real orphan sat on the box.
+was coupled to production by a literal string (the holder's argv; it now reads
+the holder's own constants). Verified by fault injection (a changed holder
+argv): the old test still passed while a real orphan sat on the box.
 
 Because SIGKILL cannot be caught, `cleanup_vm` never runs and the state file, its
 `.json.lock`, and the data dir all survive. `reqbench.py` reaps them

@@ -3195,8 +3195,9 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
         let serve_start_time = serve_state
             .pid_start_time
             .context("memory server state has no process start time")?;
-        serve_state_path =
-            Some(fcvm::paths::state_dir().join(format!("{}.json", serve_state.vm_id)));
+        serve_state_path = Some(
+            fcvm::state::StateManager::new(fcvm::paths::state_dir()).state_file(&serve_state.vm_id),
+        );
         serve_socket_path = Some(fcvm::uffd::UffdServer::socket_path_for(
             &fcvm::paths::data_dir(),
             &snapshot_name,
@@ -3697,7 +3698,9 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
         "\nStep 3: Running clone with --snapshot {} (direct file mode)...",
         snapshot_name
     );
-    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+    // The clone's Firecracker logs at Info whatever the caller's environment says: the check
+    // below reads a line Firecracker writes at that level.
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_env(
         &[
             "snapshot",
             "run",
@@ -3706,7 +3709,7 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
             "--name",
             &clone_name,
         ],
-        &clone_name,
+        &[("FCVM_FIRECRACKER_LOG_LEVEL", "Info")],
     )
     .await
     .context("spawning clone from snapshot (direct mode)")?;
@@ -3715,6 +3718,30 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
     println!("\nStep 4: Waiting for clone to become healthy...");
     common::poll_health_by_pid(clone_pid, 120).await?;
     println!("  ✓ Clone is healthy (PID: {})", clone_pid);
+
+    // On x86_64, Firecracker ends a snapshot load with a paravirtual kick for the runnable
+    // vCPUs (#2131) and says so in its log at Info, the level the clone was started with. A
+    // build without the fix logs nothing of the kind. The line shows the step ran. It does
+    // not show that a vCPU needed the kick (an idle guest's vCPUs are halted and get none)
+    // or that the host kernel kept it.
+    let clone_state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+        .load_state_by_pid(clone_pid)
+        .await
+        .context("loading the clone's state")?;
+    if cfg!(target_arch = "x86_64") && clone_state.config.hypervisor.is_firecracker() {
+        let vmm_log_path = fcvm::paths::vm_runtime_dir(&clone_state.vm_id).join("firecracker.log");
+        let vmm_log = std::fs::read_to_string(&vmm_log_path)
+            .with_context(|| format!("reading {}", vmm_log_path.display()))?;
+        anyhow::ensure!(
+            vmm_log
+                .lines()
+                .any(|line| line.contains("restored vCPUs a paravirtual kick")),
+            "Firecracker's log at {} does not say the restore kicked the runnable vCPUs: the \
+             pinned build restores a snapshot without the kick",
+            vmm_log_path.display()
+        );
+        println!("  ✓ The restore ran its kick of the clone's runnable vCPUs");
+    }
 
     // Step 5: Verify clone works by executing a command
     println!("\nStep 5: Verifying clone works with exec...");
@@ -7016,6 +7043,407 @@ async fn an_exited_clone_returns_its_server_slot() -> Result<()> {
     }
 }
 
+/// A clone refused at the memory server's concurrent-clone cap says so, naming the cap and
+/// `FCVM_UFFD_MAX_CLONES`. The server kills a refused clone's VMM, and the clone used to report
+/// only that its snapshot load failed ("connection closed"), which reads as a crash.
+#[tokio::test]
+async fn a_clone_refused_at_the_cap_names_the_cap() -> Result<()> {
+    let (baseline_name, first_clone_name, snapshot_name, _) = common::unique_names("uffd-cap-name");
+    let refused_name = format!("{first_clone_name}-refused");
+    let mut baseline: Option<(tokio::process::Child, u32)> = None;
+    let mut serve: Option<(tokio::process::Child, u32)> = None;
+    let mut first_clone: Option<(tokio::process::Child, u32)> = None;
+    let mut refused: Option<(tokio::process::Child, u32)> = None;
+    // Four times what the server records at once.
+    const REFUSED_BURST: usize = 16;
+    let mut burst: Vec<(tokio::process::Child, u32)> = Vec::new();
+    let mut snapshot_created = false;
+
+    let verdict: Result<()> = async {
+        baseline = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    &baseline_name,
+                    common::TEST_IMAGE,
+                ],
+                &baseline_name,
+            )
+            .await?,
+        );
+        let (baseline_child, baseline_pid) = baseline.as_mut().unwrap();
+        common::poll_health(baseline_child, 120).await?;
+        common::create_snapshot_by_pid(*baseline_pid, &snapshot_name).await?;
+        snapshot_created = true;
+
+        // Every record of a refusal is held for two seconds first, so the records of the
+        // burst below overlap whatever the host's speed: five clones that arrive within two
+        // seconds are more than the server records at once. With all 16 at once the last
+        // waits 6 s for its turn, inside the server's 10 s.
+        let (serve_child, serve_pid, serve_log) = common::spawn_fcvm_with_env_and_log_path(
+            &["snapshot", "serve", &snapshot_name],
+            &[
+                ("FCVM_UFFD_MAX_CLONES", "1"),
+                ("FCVM_FAILPOINT", "uffd.refusal.pre_record:sleep:2000"),
+            ],
+        )
+        .await?;
+        serve = Some((serve_child, serve_pid));
+        common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+
+        let serve_pid_string = serve_pid.to_string();
+        first_clone = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &serve_pid_string,
+                    "--name",
+                    &first_clone_name,
+                ],
+                &first_clone_name,
+            )
+            .await?,
+        );
+        let (first_child, _) = first_clone.as_mut().unwrap();
+        common::poll_health(first_child, 120).await?;
+
+        let (refused_child, refused_pid, refused_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid_string,
+                "--name",
+                &refused_name,
+            ],
+            &[],
+        )
+        .await?;
+        refused = Some((refused_child, refused_pid));
+        let (refused_child, _) = refused.as_mut().unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(120), refused_child.wait())
+            .await
+            .context("the clone over the cap did not exit within 120 s")??;
+        refused = None;
+        anyhow::ensure!(!status.success(), "the clone over the cap exited 0");
+        let log = tokio::fs::read_to_string(&refused_log).await?;
+        anyhow::ensure!(
+            log.contains("concurrent-clone cap of 1") && log.contains("FCVM_UFFD_MAX_CLONES"),
+            "the refused clone's output does not name the cap; its last lines:\n{}",
+            log.lines()
+                .rev()
+                .take(25)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        // The refusal is not a VM the server had. Its log says the refused clone was killed,
+        // and with the admitted clone still running it has no `VM disconnected` or
+        // `VM exited` line: tests and the bench harness read those as the end of a clone the
+        // server served, and `active_vms` as the count of such clones.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let serve_output = loop {
+            let text = tokio::fs::read_to_string(&serve_log).await?;
+            if text.contains("refused clone killed") || text.contains("VM exited") {
+                break text;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the memory server did not log the refused clone's end within 30 s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let as_a_served_vm: Vec<&str> = serve_output
+            .lines()
+            .filter(|line| line.contains("VM disconnected") || line.contains("VM exited"))
+            .collect();
+        anyhow::ensure!(
+            as_a_served_vm.is_empty(),
+            "the memory server logged the refused clone as a VM it had served:\n{}",
+            as_a_served_vm.join("\n")
+        );
+        anyhow::ensure!(
+            serve_output.contains("refused clone killed"),
+            "the memory server did not log that it killed the refused clone"
+        );
+
+        // A burst of clones against the server at its cap, four times what it records at
+        // once, with each record taking two seconds: every one of them names the cap.
+        let mut logs = Vec::new();
+        for index in 0..REFUSED_BURST {
+            let name = format!("{refused_name}-{index}");
+            let (child, pid, log) = common::spawn_fcvm_with_env_and_log_path(
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &serve_pid_string,
+                    "--name",
+                    &name,
+                ],
+                &[],
+            )
+            .await?;
+            burst.push((child, pid));
+            logs.push(log);
+        }
+        let mut unnamed = Vec::new();
+        for (index, log) in logs.iter().enumerate() {
+            let status = tokio::time::timeout(Duration::from_secs(120), burst[index].0.wait())
+                .await
+                .with_context(|| format!("refused clone {index} did not exit within 120 s"))??;
+            anyhow::ensure!(!status.success(), "refused clone {index} exited 0");
+            let text = tokio::fs::read_to_string(log).await?;
+            if !(text.contains("concurrent-clone cap of 1")
+                && text.contains("FCVM_UFFD_MAX_CLONES"))
+            {
+                unnamed.push(format!(
+                    "clone {index}: {}",
+                    text.lines()
+                        .rev()
+                        .find(|line| line.contains("Error"))
+                        .unwrap_or("no error line")
+                ));
+            }
+        }
+        anyhow::ensure!(
+            unnamed.is_empty(),
+            "{} of {REFUSED_BURST} clones refused together do not name the cap:\n{}",
+            unnamed.len(),
+            unnamed.join("\n")
+        );
+        // The burst did make refusals wait their turn: by the server's own count, more were
+        // in flight at once than it records at once (REFUSAL_RECORDS, 4). Without that the
+        // check above passes whether or not a waiting refusal keeps its record.
+        let serve_output = tokio::fs::read_to_string(&serve_log).await?;
+        let most_in_flight = serve_output
+            .lines()
+            .filter_map(|line| {
+                line.split_once("refusals_in_flight=")?
+                    .1
+                    .split_whitespace()
+                    .next()
+            })
+            .filter_map(|count| count.parse::<usize>().ok())
+            .max()
+            .context("the memory server logged no count of refusals in flight")?;
+        anyhow::ensure!(
+            most_in_flight > 4,
+            "at most {most_in_flight} refusals were in flight at once, so none of the burst \
+             waited its turn to be recorded"
+        );
+        Ok(())
+    }
+    .await;
+
+    let mut cleanup_errors = Vec::new();
+    for (mut child, pid) in burst {
+        if let Err(e) = terminate_and_reap(&mut child, pid, "refused clone of the burst").await {
+            cleanup_errors.push(format!("refused clone of the burst: {e:#}"));
+        }
+    }
+    for (entry, label) in [
+        (&mut refused, "refused clone"),
+        (&mut first_clone, "first clone"),
+        (&mut serve, "memory server"),
+        (&mut baseline, "baseline VM"),
+    ] {
+        if let Some((mut child, pid)) = entry.take() {
+            if let Err(e) = terminate_and_reap(&mut child, pid, label).await {
+                cleanup_errors.push(format!("{label}: {e:#}"));
+            }
+        }
+    }
+    if snapshot_created {
+        if let Err(e) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("snapshot {snapshot_name}: {e:#}"));
+        }
+    }
+    if cleanup_errors.is_empty() {
+        verdict
+    } else {
+        let cleanup = cleanup_errors.join("; ");
+        match verdict {
+            Ok(()) => anyhow::bail!("test cleanup failed: {cleanup}"),
+            Err(e) => Err(e.context(format!("cleanup also failed: {cleanup}"))),
+        }
+    }
+}
+
+/// Fails as soon as the guest memory of any of `fcvm_pids`' Firecrackers reads a NUMA policy
+/// other than `default`, and never returns otherwise.
+async fn guest_memory_leaves_the_default_policy(fcvm_pids: &[u32]) -> anyhow::Error {
+    loop {
+        for &fcvm_pid in fcvm_pids {
+            let read = common::firecracker_child_of(fcvm_pid)
+                .and_then(common::largest_mapping_numa_policy);
+            if let Some((policy, file)) = read {
+                if policy != "default" {
+                    return anyhow::anyhow!(
+                        "the largest mapping ({file:?}) of the Firecracker of fcvm PID \
+                         {fcvm_pid} has the NUMA policy {policy:?}"
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The guest memory of a healthy `--uffd-mode minor` clone: the server's memfd, under the
+/// default NUMA policy.
+fn ensure_minor_guest_memory_is_unbound(fcvm_pid: u32, label: &str) -> Result<()> {
+    let firecracker = common::firecracker_child_of(fcvm_pid)
+        .with_context(|| format!("the {label} has no Firecracker"))?;
+    let (policy, file) = common::largest_mapping_numa_policy(firecracker)
+        .with_context(|| format!("reading the {label}'s guest memory mapping"))?;
+    anyhow::ensure!(
+        file.contains("memfd:"),
+        "the {label}'s largest mapping is of {file:?}, not the memory server's memfd"
+    );
+    anyhow::ensure!(
+        policy == "default",
+        "the {label}'s guest memory has the NUMA policy {policy:?}"
+    );
+    Ok(())
+}
+
+/// The clones of a `--uffd-mode minor` serve map one memfd, and a shmem mapping keeps its
+/// NUMA policy in the file, where every clone reads it. A clone that bound its guest memory
+/// for its NUMA window (`NUMA_BALANCING_AFTER_SECS`) would bind every clone's, and its timer
+/// would end every clone's window. So such memory is not bound: a clone's guest memory has
+/// the default policy from its start, and another clone starting does not change it.
+#[tokio::test]
+async fn a_minor_mode_clone_s_numa_policy_is_not_moved_by_another_clone() -> Result<()> {
+    let (baseline_name, first_name, snapshot_name, _) = common::unique_names("minor-numa");
+    let second_name = format!("{first_name}-second");
+    let mut baseline: Option<(tokio::process::Child, u32)> = None;
+    let mut serve: Option<(tokio::process::Child, u32)> = None;
+    let mut first: Option<(tokio::process::Child, u32)> = None;
+    let mut second: Option<(tokio::process::Child, u32)> = None;
+    let mut snapshot_created = false;
+
+    let verdict: Result<()> = async {
+        baseline = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    &baseline_name,
+                    common::TEST_IMAGE,
+                ],
+                &baseline_name,
+            )
+            .await?,
+        );
+        let (baseline_child, baseline_pid) = baseline.as_mut().unwrap();
+        common::poll_health(baseline_child, 120).await?;
+        common::create_snapshot_by_pid(*baseline_pid, &snapshot_name).await?;
+        snapshot_created = true;
+
+        serve = Some(
+            common::spawn_fcvm_with_logs(
+                &["snapshot", "serve", &snapshot_name, "--uffd-mode", "minor"],
+                &format!("{snapshot_name}-serve"),
+            )
+            .await?,
+        );
+        let serve_pid = serve.as_ref().unwrap().1;
+        common::poll_serve_ready(&snapshot_name, serve_pid, 60).await?;
+
+        // As in `clone_isolation_impl`: a Firecracker named in the environment reaches a
+        // clone only as a flag.
+        let firecracker_bin = std::env::var("FCVM_FIRECRACKER_BIN").ok();
+        let serve_pid_string = serve_pid.to_string();
+        let clone_args = |name: &str| -> Vec<String> {
+            let mut args: Vec<String> = [
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid_string,
+                "--name",
+                name,
+            ]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+            if let Some(bin) = &firecracker_bin {
+                args.extend(["--firecracker-bin".to_string(), bin.clone()]);
+            }
+            args
+        };
+
+        // The first clone, watched from its spawn.
+        let args = clone_args(&first_name);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        first = Some(common::spawn_fcvm_with_logs(&args, &first_name).await?);
+        let (first_child, first_pid) = first.as_mut().unwrap();
+        let first_pid = *first_pid;
+        let watched = [first_pid];
+        tokio::select! {
+            bound = guest_memory_leaves_the_default_policy(&watched) => {
+                return Err(bound.context("while the first clone started"));
+            }
+            healthy = common::poll_health(first_child, 120) => healthy?,
+        }
+        ensure_minor_guest_memory_is_unbound(first_pid, "first clone")?;
+
+        // A second clone of the same memfd starts: neither clone's policy moves.
+        let args = clone_args(&second_name);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        second = Some(common::spawn_fcvm_with_logs(&args, &second_name).await?);
+        let (second_child, second_pid) = second.as_mut().unwrap();
+        let second_pid = *second_pid;
+        let watched = [first_pid, second_pid];
+        tokio::select! {
+            bound = guest_memory_leaves_the_default_policy(&watched) => {
+                return Err(bound.context("while the second clone started"));
+            }
+            healthy = common::poll_health(second_child, 120) => healthy?,
+        }
+        ensure_minor_guest_memory_is_unbound(first_pid, "first clone")?;
+        ensure_minor_guest_memory_is_unbound(second_pid, "second clone")?;
+        Ok(())
+    }
+    .await;
+
+    let mut cleanup_errors = Vec::new();
+    for (entry, label) in [
+        (&mut second, "second clone"),
+        (&mut first, "first clone"),
+        (&mut serve, "memory server"),
+        (&mut baseline, "baseline VM"),
+    ] {
+        if let Some((mut child, pid)) = entry.take() {
+            if let Err(e) = terminate_and_reap(&mut child, pid, label).await {
+                cleanup_errors.push(format!("{label}: {e:#}"));
+            }
+        }
+    }
+    if snapshot_created {
+        if let Err(e) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("snapshot {snapshot_name}: {e:#}"));
+        }
+    }
+    if cleanup_errors.is_empty() {
+        verdict
+    } else {
+        let cleanup = cleanup_errors.join("; ");
+        match verdict {
+            Ok(()) => anyhow::bail!("test cleanup failed: {cleanup}"),
+            Err(e) => Err(e.context(format!("cleanup also failed: {cleanup}"))),
+        }
+    }
+}
+
 /// A panicking clone handler must not permanently consume a concurrency slot.
 ///
 /// The server caps concurrent clones with an atomic counter. That counter was decremented
@@ -7530,6 +7958,377 @@ async fn the_restore_hook_runs_in_the_restored_clone() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What a process in the container reports of itself: its user and groups, its
+/// working directory and environment, its cgroup and namespaces, its capability
+/// sets, no-new-privileges bit and seccomp mode, its resource limits, OOM score
+/// adjustment, umask and security label.
+const HOOK_SELF_VIEW: &str = r#"echo "uid=$(id -u) gid=$(id -g)"; grep '^Groups:' /proc/self/status; echo "cwd=$(pwd)"; env | sort; echo "cgroup=$(cat /proc/self/cgroup)"; for n in cgroup ipc mnt net pid user uts; do echo "ns-$n=$(readlink /proc/self/ns/$n)"; done; grep -E '^(Cap|NoNewPrivs|Seccomp)' /proc/self/status; cat /proc/self/limits; echo "oom_score_adj=$(cat /proc/self/oom_score_adj)"; echo "umask=$(umask)"; echo "label=$(cat /proc/self/attr/current)""#;
+
+/// The same namespaces and cgroup, read of the container's first process.
+const CONTAINER_INIT_VIEW: &str = r#"echo "cgroup=$(cat /proc/1/cgroup)"; for n in cgroup ipc mnt net pid user uts; do echo "ns-$n=$(readlink /proc/1/ns/$n)"; done"#;
+
+/// Boot `image` with `run_args`, snapshot it, and restore two clones: one whose
+/// hook records [`HOOK_SELF_VIEW`], and one whose hook fails. Returns the hook's
+/// record, the same view taken through `podman exec` (`fcvm exec` in the
+/// container) in that clone, the view of the container's first process, the
+/// failing clone's exit status and log, and the first clone's log.
+async fn restore_hook_views(
+    prefix: &str,
+    run_args: &[&str],
+) -> anyhow::Result<(
+    String,
+    String,
+    String,
+    std::process::ExitStatus,
+    String,
+    String,
+)> {
+    let (vm_name, clone_name, snap_tag, _) = common::unique_names(prefix);
+    let failing_name = format!("{clone_name}-failing");
+    let mut args = vec!["podman", "run", "--name", &vm_name];
+    args.extend_from_slice(run_args);
+    let (mut child, pid) = common::spawn_fcvm_with_logs(&args, &vm_name).await?;
+    let record = format!("{{ {HOOK_SELF_VIEW}; }} > /tmp/fcvm-hook-self 2>&1");
+    let outcome = async {
+        common::poll_health(&mut child, 300).await?;
+        common::create_snapshot_by_pid(pid, &snap_tag).await?;
+
+        let (mut clone, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snap_tag,
+                "--name",
+                &clone_name,
+                "--on-restore",
+                &record,
+            ],
+            &[],
+        )
+        .await?;
+        let views = async {
+            common::poll_health(&mut clone, 300).await?;
+            let by_hook =
+                common::exec_in_container(clone_pid, &["cat /tmp/fcvm-hook-self"]).await?;
+            let by_podman = common::exec_in_container(clone_pid, &[HOOK_SELF_VIEW]).await?;
+            let init = common::exec_in_container(clone_pid, &[CONTAINER_INIT_VIEW]).await?;
+            anyhow::Ok((by_hook, by_podman, init))
+        }
+        .await;
+        common::kill_process(clone_pid).await;
+        let _ = clone.wait().await;
+        let (by_hook, by_podman, init) = views?;
+        let clone_log = std::fs::read_to_string(&clone_log)?;
+
+        let (status, log) = restore_with_failing_hook(
+            &snap_tag,
+            &failing_name,
+            "echo hook-said-out; echo hook-said-err >&2; exit 7",
+        )
+        .await?;
+        anyhow::Ok((by_hook, by_podman, init, status, log, clone_log))
+    }
+    .await;
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    let _ = common::delete_snapshot(&snap_tag).await;
+    outcome
+}
+
+/// The lines of `view` that start with one of `prefixes`.
+fn view_lines<'a>(view: &'a str, prefixes: &[&str]) -> Vec<&'a str> {
+    view.lines()
+        .filter(|line| prefixes.iter().any(|p| line.starts_with(p)))
+        .collect()
+}
+
+fn assert_restore_hook_views(
+    (by_hook, by_podman, init, status, log, clone_log): (
+        String,
+        String,
+        String,
+        std::process::ExitStatus,
+        String,
+        String,
+    ),
+) {
+    // The container was running when the snapshot was taken, and podman had said
+    // so: the hook's command is run without a read of the runtime's state, and a
+    // hook that fails is not followed by one either (its failure is its own).
+    assert!(
+        clone_log.contains("restore hook") && clone_log.contains("exited 0 in"),
+        "the first clone's log does not show its hook"
+    );
+    for (which, log) in [("ran", &clone_log), ("failed", &log)] {
+        assert!(
+            !log.contains("the restore hook returned"),
+            "the hook that {which}, in a container podman reported running, came with a state read"
+        );
+    }
+    // The hook is the process a `podman exec` session is: every line it reports of
+    // itself is the line a session reports.
+    assert_eq!(
+        by_hook, by_podman,
+        "the restore hook (left) does not see itself as a podman exec session does (right)"
+    );
+    assert!(
+        by_hook.contains("uid=")
+            && by_hook.contains("CapEff:")
+            && by_hook.contains("Max open files"),
+        "the hook's record is not a view of a process: {by_hook}"
+    );
+    // And it is inside the container: the namespaces and the cgroup of the
+    // container's first process.
+    let inside = ["cgroup=", "ns-"];
+    assert_eq!(
+        view_lines(&by_hook, &inside),
+        view_lines(&init, &inside),
+        "the restore hook is not in the namespaces and cgroup of the container's first process"
+    );
+    assert_eq!(view_lines(&init, &inside).len(), 8, "{init}");
+    // A hook that fails fails the restore, and what it printed is reported.
+    assert!(
+        !status.success(),
+        "a clone whose restore hook exited 7 ran to a clean exit"
+    );
+    for said in ["exited exit status: 7", "hook-said-out", "hook-said-err"] {
+        assert!(
+            log.lines()
+                .any(|line| line.contains("restore hook") && line.contains(said)),
+            "the failed hook's report does not carry {said:?}"
+        );
+    }
+}
+
+/// Restore `snap_tag` as `name` with `hook`, a hook that is expected to fail the
+/// restore; the clone's exit status and its log.
+async fn restore_with_failing_hook(
+    snap_tag: &str,
+    name: &str,
+    hook: &str,
+) -> anyhow::Result<(std::process::ExitStatus, String)> {
+    let (mut clone, clone_pid, log_path) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            snap_tag,
+            "--name",
+            name,
+            "--on-restore",
+            hook,
+        ],
+        &[],
+    )
+    .await?;
+    let status = tokio::time::timeout(Duration::from_secs(180), clone.wait()).await;
+    common::kill_process(clone_pid).await;
+    let status = match status {
+        Ok(status) => status?,
+        Err(_) => clone.wait().await?,
+    };
+    Ok((status, std::fs::read_to_string(&log_path)?))
+}
+
+/// A hook is over when its command exits, whatever it left running, and every way
+/// a hook can fail fails the restore with its status.
+///
+/// - A hook that starts a process and returns (what a hook that restarts a
+///   service does) ends at once: the restore succeeds, and the process is still
+///   running in the container. A process it left that writes to its output later
+///   fares as one a `podman exec` session left does in the same clone.
+/// - A command that is not found (127), one that cannot be executed (126), one
+///   that a signal ends (137) and one that runs past its 45 s (143: the image's
+///   busybox `timeout` execs the command and ends it with SIGTERM) each fail the
+///   restore, and the log names the status.
+///
+/// RED BEFORE THE FIX: the agent waited for the end of the hook's output, which
+/// the process it left running held open, so the hook ended at its 60 s budget
+/// and the restore failed.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn a_restore_hook_ends_at_its_exit_and_its_failures_fail_the_restore() -> anyhow::Result<()> {
+    // A process that stays, one that writes after the hook has returned and then
+    // leaves a mark, and the hook's own line.
+    let leaves = |mark: &str| {
+        format!("sleep 300 & (sleep 2; echo late; echo late >&2; touch /tmp/{mark}) & echo started")
+    };
+    let (vm_name, clone_name, snap_tag, _) = common::unique_names("rhookexit");
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            "--health-check",
+            "http://localhost/",
+            common::TEST_IMAGE,
+        ],
+        &vm_name,
+    )
+    .await?;
+    let outcome = async {
+        common::poll_health(&mut child, 300).await?;
+        common::create_snapshot_by_pid(pid, &snap_tag).await?;
+
+        let hook = leaves("fcvm-hook-late");
+        let (mut clone, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snap_tag,
+                "--name",
+                &clone_name,
+                "--on-restore",
+                &hook,
+            ],
+            &[],
+        )
+        .await?;
+        let left = async {
+            common::poll_health(&mut clone, 300).await?;
+            // The same through a `podman exec` session, then time for both writers.
+            common::exec_in_container(clone_pid, &[leaves("fcvm-session-late").as_str()]).await?;
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            common::exec_in_container(
+                clone_pid,
+                &["echo sleepers=$(ps | grep -c '[s]leep 300'); for m in hook session; do test -e /tmp/fcvm-$m-late && echo $m=wrote || echo $m=ended; done"],
+            )
+            .await
+        }
+        .await;
+        common::kill_process(clone_pid).await;
+        let _ = clone.wait().await;
+        let left = left?;
+        let clone_log = std::fs::read_to_string(&clone_log)?;
+
+        let failing = |case: &str, hook: &'static str| {
+            let name = format!("{clone_name}-{case}");
+            let snap_tag = snap_tag.clone();
+            async move { restore_with_failing_hook(&snap_tag, &name, hook).await }
+        };
+        let (not_found, not_executable, signalled, timed_out) = tokio::join!(
+            failing("notfound", "/no-such-fcvm-hook"),
+            failing("notexec", "/etc/hostname"),
+            failing("signal", "kill -9 $$"),
+            failing("timeout", "sleep 300"),
+        );
+        anyhow::Ok((
+            left,
+            clone_log,
+            [
+                ("127", not_found?),
+                ("126", not_executable?),
+                ("137", signalled?),
+                ("143", timed_out?),
+            ],
+        ))
+    }
+    .await;
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    let _ = common::delete_snapshot(&snap_tag).await;
+    let (left, clone_log, failures) = outcome?;
+
+    let hook_line = clone_log
+        .lines()
+        .find(|line| line.contains("restore hook") && line.contains("exited 0 in"))
+        .unwrap_or_else(|| panic!("the hook that left a process running did not exit 0"));
+    assert!(
+        hook_line.contains("stdout: started"),
+        "the hook's own output is missing: {hook_line}"
+    );
+    // The hook's sleeper and the session's.
+    assert!(
+        left.contains("sleepers=2"),
+        "the processes the hook and the session left are not both running: {left}"
+    );
+    let fared = |who: &str| {
+        left.lines()
+            .find_map(|line| line.strip_prefix(&format!("{who}=")).map(str::to_string))
+            .unwrap_or_else(|| panic!("no {who} line in {left}"))
+    };
+    assert_eq!(
+        fared("hook"),
+        fared("session"),
+        "a process the hook left that writes later does not fare as a podman exec session's: {left}"
+    );
+    for (status, (exit, log)) in failures {
+        assert!(
+            !exit.success(),
+            "a clone whose restore hook exits {status} ran to a clean exit"
+        );
+        let said = format!("exited exit status: {status}");
+        assert!(
+            log.lines()
+                .any(|line| line.contains("restore hook") && line.contains(&said)),
+            "the failed hook's report does not carry {said:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The restore hook runs as a `podman exec` session of the container would: the
+/// same user and groups, working directory, environment, cgroup, namespaces,
+/// capabilities, seccomp mode, limits and label, in the container's namespaces.
+/// The agent runs it through `crun exec` with a process it makes from the
+/// container's config, and the session it is compared with is podman's own, in
+/// the same clone. A hook that exits non-zero fails the restore with its status
+/// and output. Here podman runs as root and the container has no user set, so
+/// its first process holds the groups Alpine's /etc/group gives root and a
+/// HOSTNAME the start added, neither of which a session has.
+///
+/// RED BEFORE THE FIX: with the hook's process taken unchanged from the
+/// container's config, its Groups line listed root's groups and its environment
+/// held HOSTNAME.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn the_restore_hook_is_a_podman_exec_session_of_the_container() -> anyhow::Result<()> {
+    assert_restore_hook_views(
+        restore_hook_views(
+            "rhookself",
+            &[
+                "--network",
+                "rootless",
+                "--health-check",
+                "http://localhost/",
+                common::TEST_IMAGE,
+            ],
+        )
+        .await?,
+    );
+    Ok(())
+}
+
+/// The same with podman run as a user in the guest (`--user`): the container's
+/// processes are that user's in a user namespace podman keeps, and crun runs as
+/// that user too, under the prefix podman runs under, so the hook holds nothing
+/// that user's podman could not give it.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn the_restore_hook_is_a_podman_exec_session_of_a_users_container() -> anyhow::Result<()> {
+    assert_restore_hook_views(
+        restore_hook_views(
+            "rhookuser",
+            &[
+                "--kernel-profile",
+                "btrfs",
+                "--user",
+                "1000:1000",
+                common::ALPINE_IMAGE,
+                "sleep",
+                "600",
+            ],
+        )
+        .await?,
+    );
+    Ok(())
+}
+
 /// A VM that boots from its startup snapshot (the snapshot lifecycle's cache hit,
 /// taken when a previous boot of the same configuration became healthy) restores a
 /// running container, so the hook runs there too: the restored VM becomes healthy
@@ -7968,7 +8767,7 @@ async fn clone_disks_are_subvolume_snapshots_of_the_snapshot_directory() -> anyh
     // nextest runs each test in a process of its own; the fcvm processes it starts inherit this
     std::env::set_var(fcvm::storage::disk::REFLINK_MAX_EXTENTS_ENV, "0");
     let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
-        clone_disks_case("subvol").await?;
+        clone_disks_case("subvol", Held::Nothing).await?;
     assert_eq!(
         snapshot_ino, 256,
         "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
@@ -7982,14 +8781,14 @@ async fn clone_disks_are_subvolume_snapshots_of_the_snapshot_directory() -> anyh
 }
 
 /// A clone whose disks have at most `REFLINK_MAX_EXTENTS` extents (a test VM's do) gets
-/// them as reflinks into an ordinary directory, with no subvolume snapshot and so no
-/// btrfs commit on the restore's path; the snapshot's own disk directory is still a
-/// subvolume.
+/// them as reflinks into an ordinary directory while one of the snapshot's
+/// `REFLINK_SLOTS` reflink slots is free, with no subvolume snapshot and so no btrfs
+/// commit on the restore's path; the snapshot's own disk directory is still a subvolume.
 #[tokio::test]
 #[cfg_attr(not(feature = "privileged-tests"), ignore)]
 async fn clone_disks_with_few_extents_are_reflinks() -> anyhow::Result<()> {
     let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
-        clone_disks_case("reflinked").await?;
+        clone_disks_case("reflinked", Held::Nothing).await?;
     assert_eq!(
         snapshot_ino, 256,
         "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
@@ -8000,6 +8799,289 @@ async fn clone_disks_with_few_extents_are_reflinks() -> anyhow::Result<()> {
     );
     clone_disks_hold_the_snapshots_disks(entries, extra_disk_names, &served);
     Ok(())
+}
+
+/// A clone of a small disk that finds every reflink slot of its snapshot held (that many
+/// reflinks of the disk queued, each waiting for the last on the source inode's lock)
+/// takes the subvolume snapshot instead.
+///
+/// RED BEFORE THE FIX: the clone reflinked whatever the queue.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn a_clone_that_finds_every_reflink_slot_held_takes_the_subvolume_snapshot(
+) -> anyhow::Result<()> {
+    let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
+        clone_disks_case("slotsheld", Held::EverySlot).await?;
+    assert_eq!(
+        snapshot_ino, 256,
+        "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
+    );
+    assert_eq!(
+        disks_ino, 256,
+        "with every reflink slot held the clone reflinked (inode {disks_ino})"
+    );
+    clone_disks_hold_the_snapshots_disks(entries, extra_disk_names, &served);
+    Ok(())
+}
+
+/// A clone of a small disk made in a burst (SNAPSHOT_BURST clones of its snapshot taking the
+/// subvolume snapshot) takes one too, with every reflink slot free: a reflink waits out
+/// each commit that starts while it runs, and the commits carry what it dirtied.
+///
+/// RED BEFORE THE CHANGE: with a slot free the clone reflinked whatever the others did.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn a_clone_made_in_a_burst_of_snapshots_takes_the_subvolume_snapshot() -> anyhow::Result<()> {
+    let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
+        clone_disks_case("snapburst", Held::SnapshotBurst).await?;
+    assert_eq!(
+        snapshot_ino, 256,
+        "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
+    );
+    assert_eq!(
+        disks_ino, 256,
+        "in a burst of subvolume snapshots the clone reflinked (inode {disks_ino})"
+    );
+    clone_disks_hold_the_snapshots_disks(entries, extra_disk_names, &served);
+    Ok(())
+}
+
+/// A clone made while two clones of its snapshot are taking the subvolume snapshot
+/// reflinks, as it did before the mark: one clone that found every slot
+/// held does not send the clones after it down the snapshot path, which on a store that is
+/// writing snapshots is the slower one.
+///
+/// RED WHEN ONE MARK OR TWO ARE ENOUGH: the clone gets a subvolume.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn a_clone_made_beside_fewer_snapshots_than_a_burst_reflinks() -> anyhow::Result<()> {
+    let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
+        clone_disks_case("underburst", Held::UnderABurst).await?;
+    assert_eq!(
+        snapshot_ino, 256,
+        "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
+    );
+    assert_ne!(
+        disks_ino, 256,
+        "beside fewer snapshots than a burst the clone took a subvolume snapshot, not a reflink"
+    );
+    clone_disks_hold_the_snapshots_disks(entries, extra_disk_names, &served);
+    Ok(())
+}
+
+/// A clone that takes the subvolume snapshot holds the snapshot's mark for the snapshot and
+/// for the linger after it, and no longer: the mark outliving the snapshot is what makes
+/// the clones that arrive just after a commit take the snapshot too.
+///
+/// The mark is watched from outside the clone, every millisecond, while the clone is made
+/// with every reflink slot held. The mark was held for at least the time between the first
+/// and the last probe that saw it, and for at most that plus the watcher's gap before the
+/// first and its gap after the last. That upper bound must exceed the snapshot's own
+/// duration (the clone logs it) by at least half the linger, so a watcher that a loaded
+/// host kept off the CPU around either edge does not fail a mark that was held. The mark
+/// must be gone 2 s after the linger at the latest.
+///
+/// RED WITHOUT THE MARK: no probe sees it held. RED WITHOUT THE LINGER: it is held for the
+/// snapshot's duration and no longer, unless the watcher's two gaps add up to half the
+/// linger (50 ms against the 1 ms it sleeps between probes).
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn a_clone_holds_the_mark_for_its_snapshot_and_the_linger_after_it() -> anyhow::Result<()> {
+    let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
+        clone_disks_case("markheld", Held::EverySlotWatched).await?;
+    assert_eq!(
+        snapshot_ino, 256,
+        "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
+    );
+    assert_eq!(
+        disks_ino, 256,
+        "with every reflink slot held the clone reflinked (inode {disks_ino})"
+    );
+    clone_disks_hold_the_snapshots_disks(entries, extra_disk_names, &served);
+    Ok(())
+}
+
+/// What a [`MarkWatch`] saw.
+#[derive(Default)]
+struct MarkSeen {
+    /// The first and the last probe that found the mark held.
+    first: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+    /// From the probe before `first` (or the watcher's start) to `first`.
+    gap_before: std::time::Duration,
+    /// From `last` to the first probe after it, which found the mark gone, or to the
+    /// watcher's stop.
+    gap_after: std::time::Duration,
+    probes: u64,
+}
+
+impl MarkSeen {
+    /// The time between the first and the last probe that saw the mark, which is the
+    /// shortest it can have been held. `None` when no probe saw it.
+    fn held_at_least(&self) -> Option<std::time::Duration> {
+        Some(self.last? - self.first?)
+    }
+
+    /// The longest the mark can have been held: it was taken after the probe before
+    /// `first` and dropped before the probe after `last`.
+    fn held_at_most(&self) -> Option<std::time::Duration> {
+        Some(self.held_at_least()? + self.gap_before + self.gap_after)
+    }
+
+    /// Whether the mark can have outlived a snapshot that took `snapshot` by half of
+    /// `linger`.
+    fn outlived(&self, snapshot: std::time::Duration, linger: std::time::Duration) -> bool {
+        self.held_at_most()
+            .is_some_and(|held| held >= snapshot + linger / 2)
+    }
+}
+
+/// The bound `a_clone_holds_the_mark_for_its_snapshot_and_the_linger_after_it` puts on what
+/// its watcher saw, on two made-up watches of a 30 ms snapshot with a 100 ms linger.
+///
+/// RED BEFORE THE WATCHER'S GAPS WERE COUNTED: the first watch, of a mark held for all
+/// 130 ms by a watcher that was off the CPU for 60 ms around each edge, saw the mark for
+/// 20 ms and was failed.
+#[test]
+fn a_starved_watcher_does_not_fail_a_mark_that_was_held() {
+    let ms = std::time::Duration::from_millis;
+    let (snapshot, linger) = (ms(30), ms(100));
+    let taken = std::time::Instant::now();
+    let starved = MarkSeen {
+        first: Some(taken + ms(55)),
+        last: Some(taken + ms(75)),
+        gap_before: ms(60),
+        gap_after: ms(60),
+        probes: 100,
+    };
+    assert_eq!(starved.held_at_least(), Some(ms(20)));
+    assert!(starved.outlived(snapshot, linger));
+    // A mark dropped with its snapshot, seen by a watcher that probed every millisecond.
+    let no_linger = MarkSeen {
+        first: Some(taken + ms(1)),
+        last: Some(taken + ms(29)),
+        gap_before: ms(1),
+        gap_after: ms(1),
+        probes: 100,
+    };
+    assert!(!no_linger.outlived(snapshot, linger));
+    assert!(!MarkSeen::default().outlived(snapshot, linger));
+}
+
+/// How long a [`MarkWatch`] sleeps between probes.
+const MARK_WATCH_SLEEP_MS: u64 = 1;
+
+/// Probes a snapshot's subvolume-snapshot mark every millisecond from a thread of its own.
+struct MarkWatch {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<MarkSeen>,
+}
+
+impl MarkWatch {
+    fn start(snapshot_disk_dir: std::path::PathBuf) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut seen = MarkSeen::default();
+            // The time of the probe before this one, and whether `last` still waits for
+            // the probe that finds the mark gone.
+            let mut previous = std::time::Instant::now();
+            let mut open = false;
+            while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                let held =
+                    fcvm::storage::disk::subvolume_snapshot_marks_held(&snapshot_disk_dir, 1) > 0;
+                let now = std::time::Instant::now();
+                if held {
+                    if seen.first.is_none() {
+                        seen.first = Some(now);
+                        seen.gap_before = now - previous;
+                    }
+                    seen.last = Some(now);
+                    open = true;
+                } else if open {
+                    seen.gap_after = now - previous;
+                    open = false;
+                }
+                seen.probes += 1;
+                previous = now;
+                std::thread::sleep(std::time::Duration::from_millis(MARK_WATCH_SLEEP_MS));
+            }
+            if open {
+                seen.gap_after = previous.elapsed();
+            }
+            seen
+        });
+        Self { stop, thread }
+    }
+
+    /// Stop probing and check what was seen against the snapshot the clone logged in
+    /// `clone_log`.
+    async fn check(
+        self,
+        clone_log: &std::path::Path,
+        snapshot_disk_dir: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let linger = fcvm::storage::disk::SUBVOLUME_SNAPSHOT_LINGER;
+        // The linger is over well before a clone is healthy; give it the bound checked below.
+        tokio::time::sleep(linger + std::time::Duration::from_secs(2)).await;
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let seen = self
+            .thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("the mark watcher panicked"))?;
+        let probes = seen.probes;
+        let log = std::fs::read_to_string(clone_log)?;
+        let snapshot_ms = log
+            .lines()
+            .find(|line| line.contains("created the disk directory as a btrfs subvolume snapshot"))
+            .and_then(|line| {
+                // Field values can carry terminal escapes: take the digits after the name.
+                let rest = &line[line.find("duration_ms")? + "duration_ms".len()..];
+                let digits: String = rest
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits.parse::<u64>().ok()
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the clone logged no subvolume snapshot with a duration in {}",
+                    clone_log.display()
+                )
+            })?;
+        let snapshot = std::time::Duration::from_millis(snapshot_ms);
+        let (Some(held), Some(held_at_most)) = (seen.held_at_least(), seen.held_at_most()) else {
+            anyhow::bail!("the clone took a subvolume snapshot ({snapshot_ms} ms) and no probe of {probes} saw its mark held");
+        };
+        let (gap_before, gap_after) = (seen.gap_before, seen.gap_after);
+        anyhow::ensure!(
+            seen.outlived(snapshot, linger),
+            "the mark was seen held for {held:?} (at most {held_at_most:?}: the watcher's gaps were {gap_before:?} before and {gap_after:?} after): the snapshot took {snapshot_ms} ms and the mark must outlive it by the linger ({linger:?})"
+        );
+        anyhow::ensure!(
+            held <= snapshot + linger + std::time::Duration::from_secs(2),
+            "the mark was seen held for {held:?}, over 2 s past the snapshot ({snapshot_ms} ms) and the linger ({linger:?})"
+        );
+        anyhow::ensure!(
+            fcvm::storage::disk::subvolume_snapshot_marks_held(snapshot_disk_dir, 1) == 0,
+            "the mark is still held after the clone is healthy"
+        );
+        Ok(())
+    }
+}
+
+/// What `clone_disks_case` holds while its clone is made.
+enum Held {
+    Nothing,
+    /// Every reflink slot of the snapshot.
+    EverySlot,
+    /// Every reflink slot, with the snapshot's mark watched while the clone is made.
+    EverySlotWatched,
+    /// The marks of a burst: SNAPSHOT_BURST clones taking the snapshot's subvolume snapshot.
+    SnapshotBurst,
+    /// Two marks: a clone that found every slot held, and one more. Not a burst.
+    UnderABurst,
 }
 
 /// The clone's disk directory holds the root disk and the snapshot's extra disks and
@@ -8018,11 +9100,13 @@ fn clone_disks_hold_the_snapshots_disks(entries: Vec<String>, extra: Vec<String>
     );
 }
 
-/// A VM with one extra disk, its snapshot, and a clone of it: the inode of the snapshot's
+/// A VM with one extra disk, its snapshot, and a clone of it (made while this test holds
+/// what `held` names): the inode of the snapshot's
 /// disk directory, the snapshot's extra disk names, the inode of the clone's disk
 /// directory and what it holds, and what the clone read from the extra disk.
 async fn clone_disks_case(
     prefix: &str,
+    held: Held,
 ) -> anyhow::Result<(u64, Vec<String>, u64, Vec<String>, String)> {
     use std::os::unix::fs::MetadataExt;
 
@@ -8071,12 +9155,53 @@ async fn clone_disks_case(
             extra_disk_names.len() == 1,
             "the snapshot records {extra_disk_names:?} extra disks, wanted one"
         );
+        let mut slots = Vec::new();
+        let mut snapshot_marks = Vec::new();
+        let marks = match held {
+            Held::SnapshotBurst => fcvm::storage::disk::SNAPSHOT_BURST,
+            Held::UnderABurst => 2,
+            _ => 0,
+        };
+        for byte in 0..marks as u8 {
+            snapshot_marks.push(
+                fcvm::storage::disk::mark_subvolume_snapshot_at(&snapshot_disk_dir, byte)
+                    .ok_or_else(|| anyhow::anyhow!("a subvolume snapshot mark was not taken"))?,
+            );
+        }
+        if matches!(held, Held::EverySlot | Held::EverySlotWatched) {
+            for _ in 0..fcvm::storage::disk::REFLINK_SLOTS {
+                slots.push(
+                    fcvm::storage::disk::take_reflink_slot(
+                        &snapshot_disk_dir,
+                        fcvm::storage::disk::REFLINK_SLOTS,
+                    )?
+                    .ok_or_else(|| anyhow::anyhow!("a reflink slot was already held"))?,
+                );
+            }
+        }
         let (mut serve, serve_pid) = common::start_memory_server(&snap_tag).await?;
         let clone = async {
             common::poll_serve_ready(&snap_tag, serve_pid, 60).await?;
-            let (mut clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
+            let watch = matches!(held, Held::EverySlotWatched)
+                .then(|| MarkWatch::start(snapshot_disk_dir.clone()));
+            let serve_pid_text = serve_pid.to_string();
+            let (mut clone, clone_pid, clone_log) = common::spawn_fcvm_with_log_path(
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &serve_pid_text,
+                    "--name",
+                    &clone_name,
+                ],
+                &clone_name,
+            )
+            .await?;
             let result = async {
                 common::poll_health(&mut clone, 300).await?;
+                if let Some(watch) = watch {
+                    watch.check(&clone_log, &snapshot_disk_dir).await?;
+                }
                 let states = fcvm::state::StateManager::new(fcvm::paths::state_dir());
                 let clone_state = states.load_state_by_pid(clone_pid).await?;
                 let disks = fcvm::paths::vm_runtime_dir(&clone_state.vm_id).join("disks");
@@ -8098,6 +9223,8 @@ async fn clone_disks_case(
         .await;
         common::kill_process(serve_pid).await;
         let _ = serve.wait().await;
+        drop(slots);
+        drop(snapshot_marks);
         anyhow::Ok((snapshot_ino, extra_disk_names, clone?))
     }
     .await;
@@ -8703,4 +9830,829 @@ async fn an_unprivileged_user_restores_a_snapshot_another_uid_owns() -> Result<(
         data.path().display()
     );
     Ok(())
+}
+
+/// A File-backend clone records the pages it wrote after its restore beside the memory image
+/// (`storage::write_set`), and the next clone's Firecracker populates them writable before it
+/// runs: its log says how many ranges it populated, the same number the first clone recorded.
+/// A set Firecracker cannot use (here, rewritten to garbage) is logged and the clone still
+/// comes up healthy.
+#[tokio::test]
+async fn a_file_clone_records_its_write_set_and_the_next_clone_populates_it() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("writeset");
+    let (_baseline, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
+    common::kill_process(baseline_pid).await;
+    let snapshot_dir = fcvm::paths::snapshot_dir().join(&snapshot_name);
+    let sidecar = fcvm::storage::write_set::sidecar_path(
+        &snapshot_dir,
+        &snapshot_dir.join("memory.bin"),
+        &snapshot_dir.join("config.json"),
+    )?;
+
+    let outcome = async {
+        let mut recorded = None;
+        for round in 0..3 {
+            if round == 2 {
+                std::fs::write(&sidecar, "not a write set\n")?;
+            }
+            let name = format!("{clone_name}-{round}");
+            let (mut clone, clone_pid) = common::spawn_fcvm_with_logs(
+                &[
+                    "snapshot",
+                    "run",
+                    "--snapshot",
+                    &snapshot_name,
+                    "--name",
+                    &name,
+                ],
+                &name,
+            )
+            .await?;
+            let result = async {
+                common::poll_health_by_pid(clone_pid, 120).await?;
+                let vm_id = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+                    .load_state_by_pid(clone_pid)
+                    .await?
+                    .vm_id;
+                if round == 0 {
+                    // Recorded RECORD_AFTER after the restore completed.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                    while !sidecar.is_file() {
+                        anyhow::ensure!(
+                            std::time::Instant::now() < deadline,
+                            "the first clone recorded no write set"
+                        );
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    let ranges = std::fs::read_to_string(&sidecar)?.lines().count();
+                    anyhow::ensure!(ranges > 0, "the recorded write set is empty");
+                    recorded = Some(ranges);
+                }
+                anyhow::Ok(vm_id)
+            }
+            .await;
+            common::kill_process(clone_pid).await;
+            let _ = clone.wait().await;
+            let vm_id = result?;
+            if round > 0 {
+                let log_path = format!("/tmp/fcvm-firecracker-{vm_id}.log");
+                let log = std::fs::read_to_string(&log_path)
+                    .with_context(|| format!("reading {log_path}"))?;
+                if round == 1 {
+                    let line = log
+                        .lines()
+                        .find(|l| l.contains("populated the write set"))
+                        .with_context(|| {
+                            format!("the second clone populated no write set: {log_path}")
+                        })?;
+                    let wanted = format!("{} ranges", recorded.unwrap());
+                    anyhow::ensure!(line.contains(&wanted), "{line} (wanted {wanted})");
+                } else {
+                    anyhow::ensure!(
+                        log.contains("did not populate the write set"),
+                        "a garbage write set was not reported: {log_path}"
+                    );
+                }
+            }
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    let _ = common::delete_snapshot(&snapshot_name).await;
+    outcome?;
+    // The set and its claim live in the snapshot directory and go with the generation.
+    anyhow::ensure!(!sidecar.exists(), "the write set outlived its snapshot");
+    Ok(())
+}
+
+/// What a restoring clone's guest shows of its restore, one `key=value` per line: the
+/// snapshot gate's two chains, the socket manifest, the container's freeze, the boundary
+/// lock and the connections to the container's port 80.
+const RESTORE_PROGRESS_VIEW: &str = r#"rules=$(/usr/sbin/iptables -w -S)
+echo "ingress_rules=$(echo "$rules" | grep -c FCVM_SNAPSHOT_IN)"
+echo "egress_rules=$(echo "$rules" | grep -c FCVM_SNAPSHOT_OUT)"
+test -e /run/fcvm/snapshot-network.json && echo manifest=present || echo manifest=absent
+frozen=0
+for f in /sys/fs/cgroup/system.slice/fc-agent.service/libpod-payload-*/cgroup.freeze; do
+  [ "$(cat "$f")" = 1 ] && frozen=1
+done
+echo "container_frozen=$frozen"
+/usr/bin/flock -n /run/fcvm/snapshot-network.lock true && echo boundary_lock=free || echo boundary_lock=held
+echo "port_80_connections=$(/usr/bin/ss -Htn state established '( sport = :80 )' | wc -l)""#;
+
+/// [`RESTORE_PROGRESS_VIEW`] of the VM whose fcvm is `pid`.
+async fn restore_progress(pid: u32) -> Result<std::collections::BTreeMap<String, String>> {
+    let said = common::exec_in_vm(pid, &[RESTORE_PROGRESS_VIEW]).await?;
+    let view: std::collections::BTreeMap<String, String> = said
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.trim().to_string()))
+        .collect();
+    anyhow::ensure!(view.len() == 6, "the guest's view is incomplete: {said:?}");
+    Ok(view)
+}
+
+/// `fcvm snapshot create --pid <pid> --tag <tag> <extra>` to its end: its exit status and
+/// everything it printed.
+async fn snapshot_create_said(
+    pid: u32,
+    tag: &str,
+    extra: &[&str],
+) -> Result<(std::process::ExitStatus, String)> {
+    let output = tokio::process::Command::new(common::find_fcvm_binary()?)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &pid.to_string(),
+            "--tag",
+            tag,
+        ])
+        .args(extra)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("running snapshot create")?;
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok((output.status, said))
+}
+
+/// The refusal `snapshot create` gives a clone whose restore is not acknowledged.
+const RESTORE_NOT_ACKNOWLEDGED: &str = "its restore has not been acknowledged";
+
+/// The guest hold every restore of the test's snapshot stops at: inside the boundary,
+/// before the restore reads its gate.
+const GATE_HOLD: &str = "restore.pre_gate_verify";
+
+/// Wait until `log` holds `marker`.
+async fn log_shows(log: &std::path::Path, marker: &str, limit: Duration) -> Result<()> {
+    let deadline = Instant::now() + limit;
+    while !std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .contains(marker)
+    {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "no {marker:?} in {} within {limit:?}",
+            log.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+/// `snapshot create` refuses a clone whose restore has not been acknowledged, leaves the
+/// refused clone as it was, and takes a clone from the moment `snapshot run` has printed
+/// its restored record (issue 2138). Three clones of one snapshot:
+///
+/// 1. The first is stopped at the guest hold `restore.pre_gate_verify`, a sleep the source
+///    booted with: the gate closed both ways, the socket manifest present, the container
+///    frozen, and a connection the source held still established. A create, a create with
+///    `--stop` and a create that waits one second are each refused; the guest shows the
+///    same state after them, the clone still runs, no snapshot exists, and a client
+///    outside is still refused. The test checks afterwards that the hold had not ended.
+/// 2. The same clone, in its restore hook, which waits for a file: egress open, ingress
+///    closed, the container running the hook. A create is refused and the hook is not
+///    frozen. A create given `--await-restore` waits, and takes its snapshot once the hook
+///    has been let go and the restore is acknowledged.
+/// 3. A clone whose hook fails, its fcvm held at the start of its teardown: its state says
+///    the restore failed, a create is refused with nothing sent to the guest, and a create
+///    that would wait a minute is refused at once.
+/// 4. A clone with no hook, its fcvm held between its restored record and its own checks of
+///    the clone (`restore.acked_pre_verify`): a create with no wait, issued when the record
+///    appears, is not refused and does not run yet. It waits for the owner, takes its
+///    snapshot once the owner has published the clone, and the clone goes on to healthy.
+///
+/// WHAT THE HOLD AT 1 IS NOT. It is inside the boundary, with the boundary lock held by
+/// the restore. The state in which main opened the gate is one step earlier: the restore
+/// has asked for the exec server and has not yet taken the lock. fc-agent has no failpoint
+/// there, and this change does not touch the file it would go in. Holding a restore there
+/// in a test takes a guest failpoint in `handle_clone_restore` (fc-agent/src/restore.rs)
+/// between the exec re-register request and `restore_snapshot_network`, listed in
+/// `failpoint::GUEST_POINTS`; a clone held at it would show `boundary_lock=free`, and on
+/// main a create of it exits 0 with the gate open. It was reproduced by hand with a FIFO
+/// in place of the guest's /etc/resolv.conf, which stops the restore where it reads that
+/// file. That read blocks a worker of the agent's runtime, and in 1 try of 9 the guest
+/// then answered no exec for 15 s, so the FIFO is not used here.
+///
+/// RED BEFORE THE FIX, on main at 1df89a80e. Held before the boundary lock (the FIFO), a
+/// create exited 0 in 0.2 s and left a snapshot; after it the guest had no gate rule and
+/// no manifest, its container was thawed, the source's connection was still established,
+/// and a client outside got HTTP 200 from a clone that `snapshot run` had not reported.
+/// At this test's hold a create ran its prepare one-shot in the guest and waited behind
+/// the restore's lock instead of being refused. A create during the hook froze the
+/// container the hook ran in, so the hook ran out its 60 s and the restore failed. With
+/// the check keyed on `lifecycle_ready`, which `snapshot run` writes after the record, the
+/// output handshake and the port check, the create at 4 was refused, and the state at 3
+/// still said `running`. With the owner holding no lock, the create at 4 ran at once, while
+/// the owner's port check was still to come: a pause longer than that check's 5 s fails it,
+/// and the owner then tears down the VM being saved.
+#[tokio::test]
+async fn a_snapshot_of_a_clone_is_refused_until_its_restore_is_acknowledged() -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const BLOCKING_HOOK: &str = "touch /tmp/fcvm-hook-started; \
+         while [ ! -e /tmp/fcvm-hook-release ]; do sleep 0.1; done";
+    // How long a refusal may take. The refusal reads one state file; main's create waits
+    // behind the restore's lock for the rest of the hold and the hook.
+    const REFUSAL_LIMIT: Duration = Duration::from_secs(10);
+    let (vm_name, clone_name, snap_tag, clone_snap_tag) = common::unique_names("unacked");
+    let refused_tag = format!("{clone_snap_tag}-refused");
+    let failed_name = format!("{clone_name}-failed");
+    let reported_name = format!("{clone_name}-reported");
+    let reported_tag = format!("{clone_snap_tag}-reported");
+    let host_port = common::find_available_high_port().context("finding a host port")?;
+    let publish = format!("{host_port}:80");
+    let teardown_go = std::env::temp_dir().join(format!("{failed_name}-teardown-go"));
+    let _ = std::fs::remove_file(&teardown_go);
+    let publication_go = std::env::temp_dir().join(format!("{reported_name}-publication-go"));
+    let _ = std::fs::remove_file(&publication_go);
+    let reached = format!("FAILPOINT {GATE_HOLD} reached");
+    let released = format!("FAILPOINT {GATE_HOLD} released");
+
+    // The source cold-boots with the hold armed and without a pre-start snapshot, so only
+    // a restore of its snapshot reaches the hold.
+    let (mut source, source_pid, _) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            "--publish",
+            &publish,
+            "--health-check",
+            "http://localhost/",
+            common::TEST_IMAGE,
+        ],
+        &[
+            (
+                "FCVM_GUEST_FAILPOINT",
+                "restore.pre_gate_verify:sleep:20000",
+            ),
+            ("FCVM_NO_SNAPSHOT", "1"),
+        ],
+    )
+    .await
+    .context("spawning the source VM")?;
+    let prepared: Result<()> = async {
+        common::poll_health(&mut source, 300).await?;
+        // A connection the source holds when it is snapshotted: one request answered,
+        // kept alive.
+        let source_ip = common::get_loopback_ip(source_pid).await?;
+        let mut held = tokio::net::TcpStream::connect((source_ip.as_str(), host_port))
+            .await
+            .context("connecting to the source's published port")?;
+        held.write_all(b"GET / HTTP/1.1\r\nHost: source\r\n\r\n")
+            .await?;
+        let mut answer = [0u8; 64];
+        let read = held.read(&mut answer).await?;
+        anyhow::ensure!(
+            answer[..read].starts_with(b"HTTP/1.1 200"),
+            "the source did not answer on its published port"
+        );
+        let view = restore_progress(source_pid).await?;
+        anyhow::ensure!(
+            view["port_80_connections"] != "0",
+            "the source's guest shows no connection to port 80: {view:?}"
+        );
+        common::create_snapshot_by_pid(source_pid, &snap_tag).await
+    }
+    .await;
+    common::kill_process(source_pid).await;
+    let _ = source.wait().await;
+
+    let checked: Result<()> = async {
+        prepared?;
+        let state_manager = fcvm::state::StateManager::new(fcvm::paths::state_dir());
+
+        // 1 and 2. A restore held in its boundary, and then in its hook.
+        let a_held_restore = async {
+            let (mut clone, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+                &[
+                    "snapshot",
+                    "run",
+                    "--snapshot",
+                    &snap_tag,
+                    "--name",
+                    &clone_name,
+                    "--on-restore",
+                    BLOCKING_HOOK,
+                ],
+                &[],
+            )
+            .await
+            .context("spawning the clone")?;
+            let on_clone: Result<()> = async {
+                // 1. At the hold inside the boundary. The exec server comes back early in the
+                // restore; retry until it answers.
+                log_shows(&clone_log, &reached, Duration::from_secs(120)).await?;
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let held = loop {
+                    match restore_progress(clone_pid).await {
+                        Ok(view) => break view,
+                        Err(error) => anyhow::ensure!(
+                            Instant::now() < deadline,
+                            "the restoring clone answered no exec: {error:#}"
+                        ),
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                };
+                let clone_ip = common::get_loopback_ip(clone_pid).await?;
+                let answers =
+                    || async { common::curl_check(&clone_ip, host_port, 3).await.success };
+                anyhow::ensure!(
+                    held["ingress_rules"] != "0"
+                        && held["egress_rules"] != "0"
+                        && held["manifest"] == "present"
+                        && held["container_frozen"] == "1"
+                        && held["port_80_connections"] != "0",
+                    "the restore is not held with its gate closed, so nothing below is tested: \
+                 {held:?}"
+                );
+                let state = state_manager.load_state_by_pid(clone_pid).await?;
+                anyhow::ensure!(
+                    !state.restore_acknowledged && !state.lifecycle_ready,
+                    "the held clone's restore is already recorded as acknowledged"
+                );
+                anyhow::ensure!(!answers().await, "a held clone answered a client outside");
+
+                let refused = tokio::time::timeout(
+                    REFUSAL_LIMIT,
+                    snapshot_create_said(clone_pid, &refused_tag, &[]),
+                )
+                .await;
+                let (status, said) = match refused {
+                    Ok(outcome) => outcome?,
+                    Err(_) => anyhow::bail!(
+                        "snapshot create of a clone held in its restore was not refused: it had \
+                     not returned after {REFUSAL_LIMIT:?}. The guest then: {:?}",
+                        restore_progress(clone_pid).await
+                    ),
+                };
+                anyhow::ensure!(
+                    !status.success() && said.contains(RESTORE_NOT_ACKNOWLEDGED),
+                    "snapshot create of a clone held in its restore was not refused ({status}). \
+                 It left a snapshot: {}. The guest before: {held:?}; after: {:?}. It said:\n{said}",
+                    common::snapshot_exists(&refused_tag),
+                    restore_progress(clone_pid).await
+                );
+
+                let (status, said) =
+                    snapshot_create_said(clone_pid, &refused_tag, &["--stop"]).await?;
+                anyhow::ensure!(
+                    !status.success() && said.contains(RESTORE_NOT_ACKNOWLEDGED),
+                    "snapshot create --stop of the held clone was not refused ({status}):\n{said}"
+                );
+                anyhow::ensure!(
+                    clone.try_wait()?.is_none(),
+                    "the refused snapshot create --stop stopped the clone"
+                );
+
+                let waited = Instant::now();
+                let (status, said) =
+                    snapshot_create_said(clone_pid, &refused_tag, &["--await-restore", "1"])
+                        .await?;
+                anyhow::ensure!(
+                    !status.success()
+                        && said.contains(RESTORE_NOT_ACKNOWLEDGED)
+                        && said.contains("within the 1 s of --await-restore")
+                        && waited.elapsed() >= Duration::from_secs(1),
+                    "a one second wait for the held restore did not end in the refusal \
+                 ({status}, {:?}):\n{said}",
+                    waited.elapsed()
+                );
+                anyhow::ensure!(
+                    restore_progress(clone_pid).await? == held && !answers().await,
+                    "the refused creates changed the clone"
+                );
+                anyhow::ensure!(
+                    !common::snapshot_exists(&refused_tag),
+                    "a refused create left a snapshot"
+                );
+                anyhow::ensure!(
+                    !std::fs::read_to_string(&clone_log)
+                        .unwrap_or_default()
+                        .contains(&released),
+                    "the hold ended before the creates were refused, so they were not tested in it"
+                );
+
+                // 2. In the restore hook, which starts once the hold has ended and the restore
+                // has opened egress.
+                log_shows(&clone_log, &released, Duration::from_secs(60)).await?;
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while common::exec_in_container(clone_pid, &["test -e /tmp/fcvm-hook-started"])
+                    .await
+                    .is_err()
+                {
+                    anyhow::ensure!(
+                        clone.try_wait()?.is_none(),
+                        "the clone exited before its restore hook started"
+                    );
+                    anyhow::ensure!(Instant::now() < deadline, "the restore hook never started");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let in_hook = restore_progress(clone_pid).await?;
+                anyhow::ensure!(
+                    in_hook["ingress_rules"] != "0"
+                        && in_hook["egress_rules"] == "0"
+                        && in_hook["container_frozen"] == "0"
+                        && in_hook["boundary_lock"] == "held",
+                    "the restore is not in its hook with only ingress closed: {in_hook:?}"
+                );
+                let (status, said) = snapshot_create_said(clone_pid, &refused_tag, &[]).await?;
+                anyhow::ensure!(
+                    !status.success() && said.contains(RESTORE_NOT_ACKNOWLEDGED),
+                    "snapshot create during the restore hook was not refused ({status}):\n{said}"
+                );
+                anyhow::ensure!(
+                    restore_progress(clone_pid).await? == in_hook && !answers().await,
+                    "the create refused during the hook changed the clone"
+                );
+
+                // A create that waits takes its snapshot once the restore is acknowledged.
+                let mut waiting = tokio::process::Command::new(common::find_fcvm_binary()?)
+                    .args(["snapshot", "create", "--pid", &clone_pid.to_string()])
+                    .args(["--tag", &clone_snap_tag, "--await-restore", "180"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .context("spawning the waiting snapshot create")?;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                anyhow::ensure!(
+                    waiting.try_wait()?.is_none() && !common::snapshot_exists(&clone_snap_tag),
+                    "a create given --await-restore did not wait for the restore"
+                );
+                // The waiting create pauses the VM within milliseconds of the hook's end, and
+                // the pause can drop this exec's answer on its way back. What shows that the
+                // hook was let go is the restore going on, so the answer is kept only to explain
+                // a failure.
+                let let_go =
+                    common::exec_in_container(clone_pid, &["touch /tmp/fcvm-hook-release"]).await;
+                let status = tokio::time::timeout(Duration::from_secs(240), waiting.wait())
+                    .await
+                    .with_context(|| {
+                        format!(
+                        "the waiting snapshot create did not end; the hook's release: {let_go:?}"
+                    )
+                    })??;
+                anyhow::ensure!(
+                    status.success() && common::snapshot_exists(&clone_snap_tag),
+                    "the create that waited for the restore did not take its snapshot ({status}); \
+                 the hook's release: {let_go:?}"
+                );
+                common::poll_health(&mut clone, 180).await?;
+                let state = state_manager.load_state_by_pid(clone_pid).await?;
+                anyhow::ensure!(
+                    state.restore_acknowledged && state.lifecycle_ready,
+                    "the healthy clone's state does not say its restore was acknowledged"
+                );
+                let published = restore_progress(clone_pid).await?;
+                anyhow::ensure!(
+                    published["ingress_rules"] == "0" && published["egress_rules"] == "0",
+                    "the acknowledged clone still has a gate: {published:?}"
+                );
+                anyhow::ensure!(
+                    answers().await,
+                    "the acknowledged clone does not answer a client outside"
+                );
+                Ok(())
+            }
+            .await;
+            common::kill_process(clone_pid).await;
+            let _ = clone.wait().await;
+            on_clone
+        };
+
+        // 3. A restore that failed: the clone's fcvm is held as its teardown starts, with
+        // the clone's state still on disk.
+        let a_failed_restore = async {
+            let hold = format!(
+                "teardown.pre_kill:block_until_file:{}",
+                teardown_go.display()
+            );
+            let (mut failed, failed_pid, failed_log) = common::spawn_fcvm_with_env_and_log_path(
+                &[
+                    "snapshot",
+                    "run",
+                    "--snapshot",
+                    &snap_tag,
+                    "--name",
+                    &failed_name,
+                    "--on-restore",
+                    "exit 7",
+                ],
+                &[("FCVM_FAILPOINT", hold.as_str())],
+            )
+            .await
+            .context("spawning the clone whose restore fails")?;
+            let on_failed: Result<()> = async {
+                log_shows(
+                    &failed_log,
+                    "FAILPOINT teardown.pre_kill reached",
+                    Duration::from_secs(180),
+                )
+                .await?;
+                let state = state_manager.load_state_by_pid(failed_pid).await?;
+                anyhow::ensure!(
+                    matches!(state.status, fcvm::state::VmStatus::Failed)
+                        && !state.restore_acknowledged,
+                    "the state of a clone whose restore failed does not say so: status {:?}, \
+                     restore_acknowledged {}",
+                    state.status,
+                    state.restore_acknowledged
+                );
+                let (status, said) = snapshot_create_said(failed_pid, &refused_tag, &[]).await?;
+                anyhow::ensure!(
+                    !status.success()
+                        && said.contains("its restore failed")
+                        && !said.contains("preparing guest network"),
+                    "snapshot create of a clone whose restore failed was not refused before \
+                     it reached for the guest ({status}):\n{said}"
+                );
+                let asked = Instant::now();
+                let (status, said) =
+                    snapshot_create_said(failed_pid, &refused_tag, &["--await-restore", "60"])
+                        .await?;
+                anyhow::ensure!(
+                    !status.success()
+                        && said.contains("the VM's restore failed")
+                        && asked.elapsed() < Duration::from_secs(30),
+                    "a create waiting for a restore that had failed was not refused at once \
+                     ({status}, {:?}):\n{said}",
+                    asked.elapsed()
+                );
+                anyhow::ensure!(
+                    !common::snapshot_exists(&refused_tag),
+                    "a create of a failed clone left a snapshot"
+                );
+                Ok(())
+            }
+            .await;
+            std::fs::write(&teardown_go, b"")?;
+            let status = tokio::time::timeout(Duration::from_secs(60), failed.wait()).await;
+            common::kill_process(failed_pid).await;
+            on_failed?;
+            anyhow::ensure!(
+                !status
+                    .context("the failed clone's fcvm did not exit")??
+                    .success(),
+                "a clone whose restore hook exited 7 ran to a clean exit"
+            );
+            anyhow::Ok(())
+        };
+
+        // 4. The rule a caller can follow: the restored record is printed, so a create
+        // with no wait is taken. The clone's owner is held between the record and its own
+        // checks of the clone (the output handshake, the port check), and the create waits
+        // for it instead of pausing the guest under those checks.
+        let a_reported_restore = async {
+            let hold = format!(
+                "restore.acked_pre_verify:block_until_file:{}",
+                publication_go.display()
+            );
+            let (mut reported, reported_pid, reported_log) =
+                common::spawn_fcvm_with_env_and_log_path(
+                    &[
+                        "snapshot",
+                        "run",
+                        "--snapshot",
+                        &snap_tag,
+                        "--name",
+                        &reported_name,
+                    ],
+                    &[("FCVM_FAILPOINT", hold.as_str())],
+                )
+                .await
+                .context("spawning the clone that is snapshotted when it is reported")?;
+            let on_reported: Result<()> = async {
+                let deadline = Instant::now() + Duration::from_secs(180);
+                while !std::fs::read_to_string(&reported_log)
+                    .unwrap_or_default()
+                    .contains("\"status\":\"restored\"")
+                {
+                    anyhow::ensure!(
+                        reported.try_wait()?.is_none(),
+                        "the clone exited before it printed its restored record"
+                    );
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "no restored record in {}",
+                        reported_log.display()
+                    );
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                let mut create = tokio::process::Command::new(common::find_fcvm_binary()?)
+                    .args(["snapshot", "create", "--pid", &reported_pid.to_string()])
+                    .args(["--tag", &reported_tag])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .context("spawning snapshot create at the restored record")?;
+                // The owner is held, so its checks of the clone are still to come: a create
+                // that ran now would pause the guest under them.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let state = state_manager.load_state_by_pid(reported_pid).await?;
+                anyhow::ensure!(
+                    state.restore_acknowledged && !state.lifecycle_ready,
+                    "the owner is not held between the acknowledgement and its publication: \
+                     restore_acknowledged {}, lifecycle_ready {}",
+                    state.restore_acknowledged,
+                    state.lifecycle_ready
+                );
+                if let Some(status) = create.try_wait()? {
+                    anyhow::bail!(
+                        "snapshot create of a clone whose restored record was printed did \
+                         not wait for the clone's owner: it ended ({status}, a snapshot \
+                         left: {}) while the owner was still between the acknowledgement \
+                         and its port check, which is where a snapshot's pause fails that \
+                         check",
+                        common::snapshot_exists(&reported_tag)
+                    );
+                }
+                anyhow::ensure!(
+                    !common::snapshot_exists(&reported_tag),
+                    "a snapshot exists while the create still waits"
+                );
+                // Let the owner go on: it publishes, and the create is taken.
+                std::fs::write(&publication_go, b"")?;
+                let output =
+                    tokio::time::timeout(Duration::from_secs(240), create.wait_with_output())
+                        .await
+                        .context("the create that waited for the clone's owner did not end")??;
+                anyhow::ensure!(
+                    output.status.success() && common::snapshot_exists(&reported_tag),
+                    "snapshot create of a clone whose restored record was printed was not \
+                     taken ({}):\n{}{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                anyhow::ensure!(
+                    state_manager
+                        .load_state_by_pid(reported_pid)
+                        .await?
+                        .lifecycle_ready,
+                    "the create ended before the clone's owner had published it"
+                );
+                common::poll_health(&mut reported, 180).await
+            }
+            .await;
+            let _ = std::fs::write(&publication_go, b"");
+            common::kill_process(reported_pid).await;
+            let _ = reported.wait().await;
+            on_reported
+        };
+
+        // The three clones run side by side, and every one that fails is reported.
+        let (held, failed, reported) =
+            tokio::join!(a_held_restore, a_failed_restore, a_reported_restore);
+        let failures: Vec<String> = [
+            ("the held restore", held),
+            ("the failed restore", failed),
+            ("the reported restore", reported),
+        ]
+        .into_iter()
+        .filter_map(|(which, outcome)| outcome.err().map(|error| format!("{which}: {error:#}")))
+        .collect();
+        anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n\n"));
+        Ok(())
+    }
+    .await;
+    let _ = std::fs::remove_file(&teardown_go);
+    let _ = std::fs::remove_file(&publication_go);
+    for tag in [&snap_tag, &clone_snap_tag, &refused_tag, &reported_tag] {
+        let _ = common::delete_snapshot(tag).await;
+    }
+    checked
+}
+
+/// A read-only `--map` moved between two runs shares the pre-start snapshot, and the
+/// second run's container reads the second run's directory (#2239).
+///
+/// The pre-start key holds a read-only map's guest path and mode, not its host path, and a
+/// hit serves the map from the run's own directory. The two directories hold the same tree
+/// with different content, so a guest that served the first run's files (from the snapshot's
+/// memory or from the first directory) reads the wrong bytes. The snapshot's inode table for
+/// the volume is printed: what the guest held at the pre-start snapshot is what a moved
+/// directory must still hold.
+#[tokio::test]
+async fn test_a_read_only_map_moved_between_runs_shares_the_pre_start_snapshot() -> Result<()> {
+    let (first_name, second_name, _, _) = common::unique_names("romap-move");
+    let unique = format!("ROMAP_ID={first_name}");
+    let root = tempfile::tempdir().context("making the map directories")?;
+    let dirs = [root.path().join("a"), root.path().join("b")];
+    for (dir, content) in dirs.iter().zip(["first", "second"]) {
+        std::fs::create_dir_all(dir.join("sub"))?;
+        std::fs::write(dir.join("which"), format!("{content}\n"))?;
+        std::fs::write(dir.join("sub").join("which"), format!("{content}\n"))?;
+    }
+    let mut running: Vec<u32> = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
+    let result = async {
+        let mut reads = Vec::new();
+        let mut choices = Vec::new();
+        for (name, dir) in [(&first_name, &dirs[0]), (&second_name, &dirs[1])] {
+            let map = format!("{}:/data:ro", dir.display());
+            let (_child, pid, log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    name,
+                    "--map",
+                    &map,
+                    "--env",
+                    &unique,
+                    common::TEST_IMAGE,
+                ],
+                &[],
+            )
+            .await
+            .with_context(|| format!("spawning {name}"))?;
+            running.push(pid);
+            common::poll_health_by_pid(pid, 300)
+                .await
+                .with_context(|| format!("{name} never turned healthy"))?;
+            let read = common::exec_in_container(pid, &["cat /data/which /data/sub/which"])
+                .await
+                .with_context(|| format!("reading the map in {name}"))?;
+            common::kill_process(pid).await;
+            running.retain(|p| *p != pid);
+            let choice = common::cache_choice(&log)
+                .with_context(|| format!("{name}'s log names no cache choice"))?;
+            if !keys.contains(&choice.1) {
+                keys.push(choice.1.clone());
+            }
+            reads.push(read.split_whitespace().collect::<Vec<_>>().join(" "));
+            choices.push(choice);
+        }
+        let config = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir())
+            .load_snapshot(&choices[0].1)
+            .await
+            .context("loading the pre-start snapshot")?;
+        let generation = config.memory_path.parent().context("memory path")?;
+        for volume in &config.metadata.volumes {
+            let table = generation.join(fcvm::volume::inode_table_file_name(volume.vsock_port));
+            println!(
+                "  pre-start inode table of {}: {}",
+                volume.guest_path,
+                std::fs::read_to_string(&table).unwrap_or_else(|e| format!("({e})"))
+            );
+        }
+        anyhow::ensure!(
+            choices[0].0 == "cold boot",
+            "control: the first run starts from a cold cache and started from a {}",
+            choices[0].0
+        );
+        anyhow::ensure!(
+            choices[1] == ("pre-start snapshot", choices[0].1.clone()),
+            "the run with the map moved did not restore the first run's pre-start snapshot \
+             {}: {:?}",
+            choices[0].1,
+            choices[1]
+        );
+        anyhow::ensure!(
+            reads[0] == "first first",
+            "the first run read {:?}",
+            reads[0]
+        );
+        anyhow::ensure!(
+            reads[1] == "second second",
+            "the second run read {:?}, not its own directory's files",
+            reads[1]
+        );
+        Ok(())
+    }
+    .await;
+    for pid in running {
+        common::kill_process(pid).await;
+    }
+    for key in keys {
+        if common::snapshot_exists(&key) {
+            let _ = common::delete_snapshot(&key).await;
+        }
+    }
+    result
 }

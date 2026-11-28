@@ -89,21 +89,40 @@ def ipv4(host, port):
 
 def public(host, port, family):
     """A TLS socket to host over one family only, through the system resolver; private
-    endpoints are refused. For the coordinator's own names, which are not launch names."""
+    endpoints are refused. For the coordinator's own names, which are not launch names. When
+    no address answers it raises what the last one did, as `opener` does, so the failure says
+    whether TCP was refused, TCP timed out or the TLS handshake failed."""
     addresses = socket.getaddrinfo(host, port, FAMILIES[family][0], socket.SOCK_STREAM)
+    last, handshake_timed_out = None, False
     for _, _, _, _, address in addresses:
         if not ipaddress.ip_address(address[0]).is_global:
             continue
         try:
             raw = socket.create_connection(address[:2], timeout=20)
-            return ssl.create_default_context().wrap_socket(raw, server_hostname=host)
-        except OSError:
+        except OSError as error:
+            last, handshake_timed_out = error, False
             continue
+        try:
+            return ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+        except OSError as error:
+            raw.close()
+            # A handshake timeout is a TimeoutError like a connect timeout: say which.
+            last, handshake_timed_out = error, isinstance(error, (TimeoutError, socket.timeout))
+    if handshake_timed_out:
+        raise RuntimeError("the TLS handshake did not finish in time") from last
+    if last is not None:
+        raise last
     raise RuntimeError("no reachable public endpoint in this family")
 
 
 class WebSocketClosed(RuntimeError):
     """The peer closed the connection, distinct from a malformed WebSocket message."""
+
+
+# A /live connection that is gone: closed by its peer, or dropped under TLS (an SSLEOFError
+# from a send onto a connection that closed while the probe was not reading, run 44764745380)
+# or TCP. A malformed message is not one of these and is never retried.
+LOST = (WebSocketClosed, ConnectionError, ssl.SSLEOFError)
 
 
 class InvalidViewerPayload(AssertionError):
@@ -483,6 +502,7 @@ PROBE_SECONDS = 40
 # How long the viewer path waits for every mode's tiles to run before it probes what it has. A
 # tile still not running then fails its probe as "the tile is not running".
 SETTLE_SECONDS = 600
+HOLD_SECONDS = 1800
 CONNECT_SECONDS = 10
 # Control endpoints that say whether this viewer has a family at all: Cloudflare's resolver,
 # on 443, in each family.
@@ -584,7 +604,8 @@ def tile_attribution(tile):
     """The (host instance ids, tile instance ids) /live reports serving a tile: a GPU host's tile,
     phone, sandbox, server or aggregate names its host; an EC2 tile names the instance it runs on
     (`vm`); the EC2 half's aggregate relays its tiles' frames (`sweep_jobs` lists their instances
-    under `_instances`). Empty when /live names none."""
+    under `_instances`). Empty when /live names none, as for a Lambda tile, whose `vm` is a Lambda
+    environment on an instance the fleet cannot see."""
     if tile.get("_instances") is not None:
         return [], list(tile["_instances"])
     if tile.get("half") == "ec2":
@@ -606,6 +627,8 @@ class Probe:
         # The host and tile instance ids /live reported serving it; only digests are printed,
         # and only in the summary line (`attributed`).
         self.hosts, self.instances = list(attribution[0]), list(attribution[1])
+        # Why the fleet runs no such tile, when its snapshot says (`fleet_cause`), fixed text.
+        self.cause = None
 
     def attributed(self):
         verdict = "pass" if self.ok else "image_failure" if self.image_failure else "inconclusive"
@@ -621,6 +644,8 @@ class Probe:
             out.update(step=self.step, errorType=self.error[0], error=self.error[1])
             if self.seen is not None:
                 out["seen"] = self.seen
+            if self.cause is not None:
+                out["cause"] = self.cause
         return out
 
 
@@ -895,6 +920,40 @@ def probe_all(jobs):
     return out
 
 
+# What a snapshot says keeps the fleet from running tiles, as fixed text: the spend ceiling's
+# rest (`fleet.power.reason`), or the `scale` component degraded for a refused GPU host launch
+# (`failures`, fleet/PROTOCOL.md). Seven of the eight staging and prod smoke failures of
+# 2026-11-21 to 11-24 were one of these, and each line said only "the tile is not running" or
+# "the coordinator reports no tiles of this mode"; the cause was in the coordinator's log.
+def quota_codes():
+    # The coordinator's own list (src/fleet/coord/hosts.rs QUOTA_CODES), from the same commit.
+    source = (Path(__file__).resolve().parent.parent.parent / "src/fleet/coord/hosts.rs").read_text()
+    value = re.search(r"pub const QUOTA_CODES: &\[&str\] = &\[([^\]]*)\];", source)
+    if value is None:
+        raise ValueError("coordinator quota codes unavailable")
+    return tuple(re.findall(r'"([A-Za-z]+)"', value[1]))
+
+
+def fleet_cause(state, half=None):
+    """The cause for a tile of `half` (None: a whole mode). The GPU hosts' scaling is no
+    cause for an EC2 tile."""
+    power = ((state.get("fleet") or {}).get("power") or {})
+    if power.get("reason") == "budget":
+        return "the day's spend ceiling holds the fleet asleep"
+    if half == "ec2":
+        return None
+    for failure in state.get("failures") or []:
+        if not isinstance(failure, dict) or failure.get("kind") != "coordinator_degraded" \
+                or failure.get("component") != "scale":
+            continue
+        # Each refusal in the reason starts "<region> <market>: <code>: ..." (hosts.rs).
+        codes = {part.split(":", 1)[0].strip() for part in str(failure.get("reason") or "").split(": ")[1:]}
+        if codes & set(quota_codes()):
+            return "EC2 refused a GPU host launch for the account's quota"
+        return "the coordinator's GPU host scaling is degraded"
+    return None
+
+
 def sweep_jobs(state, modes, family, admit, viewer, resolvers):
     """A probe per tile of every mode (and per serving aggregate), and a Probe failed already
     for each tile the coordinator has no running stream of and each mode it reports nothing of."""
@@ -906,6 +965,7 @@ def sweep_jobs(state, modes, family, admit, viewer, resolvers):
         if tiles is None:
             p = Probe(mode, None, family)
             p.step, p.error = "coordinator state", ("AssertionError", "the coordinator reports no tiles of this mode")
+            p.cause = fleet_cause(state)
             failed.append(p)
             continue
         for half, t in tiles:
@@ -921,6 +981,7 @@ def sweep_jobs(state, modes, family, admit, viewer, resolvers):
             if t.get("phase", "running") not in ("running", "borrowed"):
                 p = Probe(mode, t.get("id"), family, tile_attribution(t))
                 p.step, p.error = "coordinator state", ("AssertionError", "the tile is not running")
+                p.cause = fleet_cause(state, t.get("half"))
                 failed.append(p)
                 continue
             jobs.append((mode, half, t, family, admit, viewer, resolvers))
@@ -1005,6 +1066,16 @@ def relaunch_interval_seconds():
     return int(value[1].replace("_", "")) / 1000
 
 
+def minecraft_claim_cooldown_seconds():
+    # As above: how long a client waits after giving a Minecraft server back to borrow again.
+    source = (Path(__file__).resolve().parent.parent / "core/src/state.rs").read_text()
+    defaults = source.split("impl Default for Config", 1)[1]
+    value = re.search(r"minecraft_claim_cooldown_secs:\s*([0-9_]+)", defaults)
+    if value is None:
+        raise ValueError("coordinator Minecraft borrow cooldown unavailable")
+    return int(value[1].replace("_", ""))
+
+
 def ec2_relaunch_cooldown_seconds():
     # As above: the coordinator's own constant, from the same commit as the image.
     source = (Path(__file__).resolve().parent.parent / "core/src/apply.rs").read_text()
@@ -1056,6 +1127,25 @@ def refused_relaunch_messages():
     return {f"staging refused the relaunch: {why}" for why in {w for _, w in REFUSALS} | {UNLISTED_REFUSAL}}
 
 
+# A Minecraft borrow refusal's reason, as fixed text (fleet/core/src/apply.rs claim_minecraft).
+# The per-client cooldown counts by client key, an IPv6 viewer's /64, so the smoke's previous run
+# from another runner in the same subnet holds it: on 2026-11-23 (45149219637) the IPv6 viewer
+# claimed 49 s after the previous run's IPv6 viewer gave its server back, and was refused.
+CLAIM_COOLDOWN = "this client's borrow cooldown"
+CLAIM_REFUSALS = (
+    ("borrow again in", CLAIM_COOLDOWN),
+    ("one server per client", "this client holds a server already"),
+    ("servers are already lent", "every server that may be lent is lent"),
+    ("none is running and free", "no server is running and free"),
+    ("GPUs are asleep", "the GPUs are asleep"),
+    ("budget is spent", "the day's GPU budget is spent"),
+)
+
+
+def claim_refusal(reason):
+    return next((why for text, why in CLAIM_REFUSALS if text in (reason or "")), UNLISTED_REFUSAL)
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -1069,6 +1159,37 @@ def get(url, headers=None):
             return response.status, response.headers, response.read(65536)
     except urllib.error.HTTPError as error:
         return error.code, error.headers, b""
+
+
+def commit_attribution(api, headers, run):
+    """Which commit this smoke tests: the coordinator's GET /version (its image's commit), beside the run's
+    commit. A coordinator that cannot say is reported as unknown; a smoke never assumes it tested its run."""
+    try:
+        code, _, body = get(api + "/version", headers)
+    except (OSError, http.client.HTTPException):
+        # Informational: a request that fails in transport (a timeout, a reset) leaves the commit unknown and
+        # the smoke goes on. OSError covers urllib's URLError, timeouts and connection errors.
+        code, body = None, b""
+    tested = None
+    if code == 200:
+        try:
+            value = json.loads(body).get("commit")
+        except (ValueError, AttributeError):
+            value = None
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value):
+            tested = value
+    return {"tested_commit": tested, "run_commit": run, "same": tested is not None and tested == run}
+
+
+def commit_lines(tested, released):
+    """The attribution line, and, for a smoke that follows its own run's coordinator release (SMOKE_RELEASED, set
+    by the deploy workflow), a notice when it tests another commit: another run's release replaced this run's,
+    or the coordinator cannot say. A smoke that released nothing (web deploy, release gate, schedule, dispatch)
+    prints the attribution alone."""
+    lines = [tested]
+    if released and tested["run_commit"] and not tested["same"]:
+        lines.append({"notice": "this smoke tests the commit in tested_commit, not the one its run released"})
+    return lines
 
 
 def live_target(target="stage"):
@@ -1097,7 +1218,7 @@ def plain(host, port):
 
 
 def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, agents=False,
-         settle_seconds=SETTLE_SECONDS, target="stage", unverified=False, broadcast=False):
+         settle_seconds=SETTLE_SECONDS, target="stage", unverified=False, broadcast=False, hold_seconds=0):
     """The smoke. With no `modes` it is the deploy probe alone (Access, the relaunch and fresh
     names); `modes` adds the viewer path over `family` for every tile of each mode."""
     if unverified:
@@ -1135,6 +1256,13 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
         code, _, _ = get(agents_url, headers)
         if code not in (401, 403, 302):
             raise AssertionError("the CI token reached the agents-only endpoint")
+        # --agents prints the agents record and nothing else (the release gate reads it).
+        if not agents:
+            step("coordinator commit")
+            run_commit = os.environ.get("GITHUB_SHA") if re.fullmatch(r"[0-9a-f]{40}", os.environ.get("GITHUB_SHA", "")) else None
+            tested = commit_attribution(api, headers, run_commit)
+            for line in commit_lines(tested, released=os.environ.get("SMOKE_RELEASED") == "true"):
+                print(json.dumps(line), flush=True)
     def live():
         if stage is None:
             parsed = urllib.parse.urlsplit(live_url)
@@ -1148,7 +1276,7 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
     try:
         # The first message on /live: a page's seat ticket (none here).
         connection.send({"type": "seat", "ticket": None})
-        deadline = time.monotonic() + 720 + (900 if modes else 0)
+        deadline = time.monotonic() + 720 + (900 if modes else 0) + (hold_seconds + 900 if hold_seconds else 0)
         interval, next_relaunch = relaunch_interval_seconds(), 0.0
         cooldown = ec2_relaunch_cooldown_seconds()
         state, admission = {}, {}
@@ -1162,6 +1290,20 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
                 seat = message.get("seat")
             elif message.get("type") == "hello":
                 viewer = message.get("viewer")
+        def reopen(limit):
+            """Replace a /live connection that closed or dropped with a new one that sends the
+            seat ticket first, at most three times in the run and only before `limit`; False
+            when neither is left."""
+            nonlocal connection, state, admission, reconnects
+            if reconnects >= 3 or time.monotonic() >= limit:
+                return False
+            connection.close()
+            state, admission = {}, {}
+            reconnects += 1
+            connection = live()
+            connection.send({"type": "seat", "ticket": seat})
+            print(json.dumps({"reconnect": reconnects}), flush=True)
+            return True
         def until(predicate, by=None):
             """Read /live until `predicate(state)`. With `by` (a monotonic time), the wait is
             bounded: at `by` it returns the state as it is, so the caller states its own
@@ -1177,16 +1319,9 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
                     if limit < deadline:
                         break
                     raise
-                except WebSocketClosed:
-                    if reconnects >= 3 or time.monotonic() >= limit:
+                except LOST:
+                    if not reopen(limit):
                         raise
-                    # A readiness wait can resume; an intent awaiting its receipt cannot.
-                    connection.close()
-                    state, admission = {}, {}
-                    reconnects += 1
-                    connection = live()
-                    connection.send({"type": "seat", "ticket": seat})
-                    print(json.dumps({"reconnect": reconnects}), flush=True)
                     continue
                 if opcode != 1:
                     continue
@@ -1206,26 +1341,45 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
         def commit(name, args, by=None):
             """Send an intent and wait for its receipt; whether it committed. With `by`, a
             receipt that has not come by then counts as not committed. A refusal's reason is
-            left in `refusal["reason"]`."""
+            left in `refusal["reason"]`. A connection that closes or drops before the receipt is
+            replaced (`reopen`) and the intent sent again with the same id: the coordinator
+            answers an id it has seen with that id's first receipt and changes nothing
+            (fleet/PROTOCOL.md, "receipt")."""
             refusal.clear()
-            intent = str(uuid.uuid4())
-            connection.send({"type": "intent", "id": intent, "name": name, "args": args})
+            intent = {"type": "intent", "id": str(uuid.uuid4()), "name": name, "args": args}
             limit = deadline if by is None else min(deadline, by)
+            sent = False
             # A refused intent must fail explicitly, rather than wait for an unrelated change.
             while True:
                 try:
+                    if not sent:
+                        # Opening a replacement connection can use up the wait: no intent goes
+                        # out after it.
+                        if time.monotonic() >= limit:
+                            if limit < deadline:
+                                return False
+                            raise TimeoutError("staging did not reach the required state")
+                        connection.send(intent)
+                        sent = True
                     opcode, payload = connection.message(limit)
                 except TimeoutError:
                     if limit < deadline:
                         return False
                     raise
+                except LOST:
+                    if not reopen(limit):
+                        raise
+                    sent = False
+                    continue
                 if opcode != 1:
                     continue
                 message = json.loads(payload)
                 take(message)
-                if message.get("type") == "receipt" and message.get("id") == intent:
+                if message.get("type") == "receipt" and message.get("id") == intent["id"]:
                     refusal["reason"] = message.get("reason")
                     return message.get("outcome") == "committed"
+        # The take-over reads why a claim was refused (`claim_refusal`).
+        commit.refusal = refusal
         if agents:
             step("/live: registered agents")
             until(lambda s: agents_line(s, 0) is not None)
@@ -1234,6 +1388,14 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
         if modes:
             failures = viewer_path(family, modes, takeover, resolvers, until, commit,
                                    lambda: (state, admission, viewer), settle_seconds)
+            if hold_seconds:
+                # A drill (a Spot reclaim, a host replacement) runs while this viewer keeps its seat,
+                # which keeps the fleet awake; then every tile must reach this viewer again.
+                step(f"/live: hold the seat for {hold_seconds} s")
+                until(lambda s: False, by=time.monotonic() + hold_seconds)
+                print(json.dumps({"held": hold_seconds, "reconnects": reconnects}), flush=True)
+                failures += viewer_path(family, modes, takeover, resolvers, until, commit,
+                                        lambda: (state, admission, viewer), settle_seconds)
         if broadcast:
             step("broadcast: a fresh playback token")
             before = admission
@@ -1438,20 +1600,41 @@ def minecraft_takeover(family, token, viewer, resolvers, until, commit, now):
     """Borrow a server, drive it once through its view socket, give it back."""
     p = Probe("minecraft", None, family)
     p.step = "take over"
-    if not commit("claim_minecraft", {}):
-        p.error = ("AssertionError", "the coordinator refused the take-over")
+    def current():
+        """This probe's viewer and direct token now. A /live connection that was replaced is a
+        new viewer with its own token, and a claim sent again on it is that viewer's."""
+        _, admission, viewer_now = now()
+        return viewer_now or viewer, ((admission or {}).get("direct") or {}).get("value") or token
+    claimed = commit("claim_minecraft", {})
+    reason = None if claimed else getattr(commit, "refusal", {}).get("reason")
+    why = None if claimed else claim_refusal(reason)
+    waited = None
+    if why == CLAIM_COOLDOWN:
+        # Read /live while the cooldown runs out (what the receipt says is left, at most the
+        # core's cooldown), then claim once more.
+        cooldown = minecraft_claim_cooldown_seconds()
+        left = re.search(r"borrow again in ([0-9]+) s", reason or "")
+        waited = min(int(left[1]) if left else cooldown, cooldown) + CLOCK_SKEW_SECONDS
+        until(lambda s: False, by=time.monotonic() + waited)
+        claimed = commit("claim_minecraft", {})
+        why = None if claimed else claim_refusal(getattr(commit, "refusal", {}).get("reason"))
+    if not claimed:
+        p.error = ("AssertionError", f"the coordinator refused the take-over: {why}")
         return p
     try:
         held_by = time.monotonic() + 30
         def held(s):
-            return any(mine(t, viewer) for _, t in tiles_of(s, "minecraft") or [])
+            return any(mine(t, current()[0]) for _, t in tiles_of(s, "minecraft") or [])
         until(held, by=held_by)
-        tile = next((t for _, t in tiles_of(now()[0], "minecraft") or [] if mine(t, viewer)), None)
+        holder, admit = current()
+        tile = next((t for _, t in tiles_of(now()[0], "minecraft") or [] if mine(t, holder)), None)
         if tile is None:
             p.error = ("AssertionError", "the borrowed server never showed as this viewer's")
             return p
-        p = probe_tile("minecraft", "fcvm", tile, family, token, viewer, resolvers, takeover=True)
+        p = probe_tile("minecraft", "fcvm", tile, family, admit, holder, resolvers, takeover=True)
         p.tile = (p.tile or "") + " take-over"
+        if waited is not None:
+            p.detail["claimWaitedS"] = waited
         return p
     finally:
         # Bounded, so a silent /live cannot replace the probe being returned with a TimeoutError.
@@ -1479,12 +1662,18 @@ def arguments(argv):
     parser.add_argument("--broadcast", action="store_true", help="play the broadcast over the family")
     parser.add_argument("--settle-seconds", type=int, default=SETTLE_SECONDS,
                         help=f"how long to wait for every mode's tiles to run (1 to {SETTLE_SECONDS})")
+    parser.add_argument("--hold-seconds", type=int, default=0,
+                        help=f"after the viewer path, keep the seat this long (0 to {HOLD_SECONDS}), then run it again")
     args = parser.parse_args(argv)
+    if not 0 <= args.hold_seconds <= HOLD_SECONDS:
+        parser.error(f"--hold-seconds is 0 to {HOLD_SECONDS}")
     if not 0 < args.settle_seconds <= SETTLE_SECONDS:
         parser.error(f"--settle-seconds is 1 to {SETTLE_SECONDS}")
     modes = tuple(m for m in args.modes.split(",") if m)
     if any(m not in MODES for m in modes):
         parser.error("unknown mode")
+    if args.hold_seconds and not modes:
+        parser.error("--hold-seconds needs --modes: it holds a viewer and checks it again")
     if args.agents and (modes or args.relaunch or args.takeover):
         parser.error("--agents reads the coordinator's agents and nothing else")
     if args.unverified and (args.target != "prod" or modes or args.relaunch or args.takeover
@@ -1495,7 +1684,7 @@ def arguments(argv):
     return dict(family=args.family, single=args.single_family, modes=modes,
                 relaunch=args.relaunch, takeover=args.takeover, agents=args.agents,
                 settle_seconds=args.settle_seconds, target=args.target, unverified=args.unverified,
-                broadcast=args.broadcast)
+                broadcast=args.broadcast, hold_seconds=args.hold_seconds)
 
 
 def run(argv=None):
@@ -1505,8 +1694,9 @@ def run(argv=None):
             step("viewer path")
             raise AssertionError("a tile failed the viewer path")
     except Exception as error:
+        # fixed(): describe(), plus "timed out" for a timeout and TLS's reason code.
         print(json.dumps({"status": "failed", "step": STEP, "errorType": type(error).__name__,
-                          "error": describe(error)}))
+                          "error": fixed(error)[1]}))
         raise SystemExit(1)
 
 

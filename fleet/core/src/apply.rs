@@ -4,11 +4,22 @@
 
 use crate::event::{Event, Intent};
 use crate::history;
-use crate::protocol::{AgentMsg, HealthReport, SlotReport};
+use crate::protocol::{AgentMsg, HealthReport, SlotReport, VmStats};
 use crate::scene::{drag, Keyframe, Light, Word, MAX_LIGHTS, MAX_WORDS};
 use crate::state::*;
 use crate::tiling::{bands, grid_in, sides, Half, Rect};
 use std::collections::BTreeMap;
+
+/// The slots of one backing. A macro, so it borrows only that field of the fleet.
+macro_rules! side_mut {
+    ($f:expr, $half:expr) => {
+        match $half {
+            Half::Fcvm => &mut $f.slots,
+            Half::Ec2 => &mut $f.ec2,
+            Half::Lambda => &mut $f.lambda,
+        }
+    };
+}
 
 /// How long a reclaimed host stays in the failure list after it is gone.
 pub const RECLAIMED_KEEP_MS: u64 = 60_000;
@@ -22,9 +33,10 @@ pub const SCOREBOARD_RACES: usize = 20;
 pub const EC2_RELAUNCH_COOLDOWN_MS: u64 = 90_000;
 /// The window of the viewers' EC2 launch budget.
 pub const EC2_LAUNCH_WINDOW_MS: u64 = 600_000;
-/// EC2 instance launches viewers may cause in [`EC2_LAUNCH_WINDOW_MS`], counting a `relaunch`
-/// of an EC2 tile as one and a `restart_now` race as one per EC2 tile. Each launch bills at
-/// least 60 s of an instance that, relaunched again at once, would serve nothing: at the
+/// Launches viewers may cause in [`EC2_LAUNCH_WINDOW_MS`] on the AWS half, counting a
+/// `relaunch` of an EC2 or a Lambda tile as one and a `restart_now` race as one per AWS tile,
+/// whichever its backing (a Lambda tile is a g4dn.xlarge too). Each launch bills at least
+/// 60 s of an instance that, relaunched again at once, would serve nothing: at the
 /// g4dn.xlarge on-demand price ($0.526 an hour, us-east-1) that is $0.0088, so 40 launches in
 /// 10 minutes bound the waste viewers can cause to about $2.10 an hour. 40 is five races of the default 8 EC2 tiles
 /// (`--ec2-tiles`) in 10 minutes, one every two minutes, or 40 single relaunches. The owner's
@@ -111,6 +123,23 @@ pub fn precheck_word(
     }
 }
 
+/// Why a `renders_overlay` from `client` would be refused before its text is checked, if it
+/// would be: so a text that cannot be applied costs no check.
+pub fn precheck_overlay(
+    state: &State,
+    client: &str,
+    args: &serde_json::Value,
+    at: u64,
+) -> Option<String> {
+    match Intent::parse("renders_overlay", args) {
+        Err(reason) => Some(reason),
+        Ok(_) => state
+            .fleet
+            .renders
+            .refusal(client, at, &state.config.renders),
+    }
+}
+
 /// The viewers' words in the sky now, which a new word must be checked together with. A
 /// system word is the wall's own and is not part of what is checked, so one placed while a
 /// viewer's word is being checked does not make that check stale.
@@ -135,7 +164,7 @@ fn word_rate(state: &State, client: &str, at: u64) -> Result<(), String> {
     )
 }
 
-/// Refuse `launches` more viewer-caused EC2 launches when they would pass
+/// Refuse `launches` more viewer-caused EC2 or Lambda launches when they would pass
 /// [`EC2_LAUNCH_BUDGET`] in the window ending at `at`, saying when enough of the budget frees.
 fn ec2_budget(
     recent: &std::collections::VecDeque<u64>,
@@ -209,8 +238,16 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 secret: secret.as_deref(),
                 at,
             };
-            let result = Intent::parse(name, args)
-                .and_then(|intent| intent_effect(state, &ctx, &intent, check.as_ref()));
+            let parsed = Intent::parse(name, args);
+            // What a pages intent shows of itself once committed: the parsed value, never
+            // the args as sent.
+            let pages_args = match &parsed {
+                Ok(Intent::RendersOverlay { text }) => Some(serde_json::json!({"text": text})),
+                Ok(Intent::RendersTransform { name }) => Some(serde_json::json!({"name": name})),
+                _ => None,
+            };
+            let result =
+                parsed.and_then(|intent| intent_effect(state, &ctx, &intent, check.as_ref()));
             let (outcome, reason, summary) = match result {
                 Ok(summary) => (Outcome::Committed, None, summary),
                 // The reason reaches the public actions feed and the viewer's receipt.
@@ -219,13 +256,22 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     (Outcome::Refused, Some(reason.clone()), reason)
                 }
             };
-            // A refused word's text is never shown: its args are left out and the summary
-            // is the reason only. Args that are not an object (refused, `args must be an
+            // A refused word's text is never shown: its args are left out and the summary is
+            // the reason only. Args that are not an object (refused, `args must be an
             // object`) are shown as `{}` too: an intent's args are an object on the wire, and
             // a page keeps nothing else.
             // A claim's and a resume's args are the claim's token, which only its viewer may
             // hold.
-            let shown_args = if (name == "word" && outcome == Outcome::Refused)
+            // A pages intent (`renders_*`) shows what was parsed and committed and nothing
+            // else: a refused one shows `{}`, whatever it was refused for, and a committed
+            // one its text as kept or its transform's name. Its args as sent can hold text
+            // nobody checked (a transform's name that is none, a key beside `text`).
+            let shown_args = if name.starts_with("renders_") {
+                match outcome {
+                    Outcome::Committed => pages_args.unwrap_or_else(|| serde_json::json!({})),
+                    _ => serde_json::json!({}),
+                }
+            } else if (name == "word" && outcome == Outcome::Refused)
                 || name == "resume_claim"
                 || name == "claim_gpu"
                 || !args.is_object()
@@ -296,6 +342,23 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 return None;
             }
             let f = &mut state.fleet;
+            // Pages mode's host's frame socket, for the addresses its hello gave.
+            if let Some(h) = f
+                .renders
+                .hosts
+                .iter_mut()
+                .find(|(name, _)| crate::state::renders_id(name).as_deref() == Some(slot.as_str()))
+                .map(|(_, h)| h)
+            {
+                if names.names(
+                    h.hello.ipv6.as_deref(),
+                    h.hello.ipv4.as_deref(),
+                    h.hello.v4_port,
+                ) {
+                    h.published = Some(names.clone());
+                }
+                return None;
+            }
             // A host aggregator's names, for the addresses it reports now.
             if let Some(h) = f
                 .hosts
@@ -315,6 +378,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 .slots
                 .values_mut()
                 .chain(f.ec2.values_mut())
+                .chain(f.lambda.values_mut())
                 .chain(f.phones.values_mut())
                 .chain(f.windows.values_mut())
                 .chain(f.minecraft.values_mut())
@@ -339,17 +403,23 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
         Event::Burn {
             usd_per_hour,
             instances,
+            by_backing,
             ..
         } => {
             let s = &mut state.fleet.spend;
             let rate = usd_per_hour.max(0.0);
             // Nothing running and nothing changed (an asleep fleet's reports): the state stays
             // as it is, so no snapshot or stored state is sent for it.
-            let idle = s.usd_per_hour == 0.0 && rate == 0.0 && s.instances == *instances;
+            let idle = s.usd_per_hour == 0.0
+                && rate == 0.0
+                && s.instances == *instances
+                && s.by_backing.values().all(|b| b.usd_per_hour == 0.0)
+                && by_backing.values().all(|r| *r <= 0.0);
             if !idle || s.at == 0 || s.day != at / crate::spend::DAY_MS {
                 s.bring_forward(at);
                 s.usd_per_hour = rate;
                 s.instances = *instances;
+                s.set_backing_rates(by_backing);
             }
             None
         }
@@ -423,10 +493,11 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             let awake = state.fleet.power.state != "asleep";
             let cfg = state.config.potato.clone();
             state.fleet.potato.tick(at, awake, &cfg);
+            state.fleet.renders.tick(at);
             None
         }
-        Event::Ec2Health { report, .. } => {
-            health(&mut state.fleet, None, report);
+        Event::Ec2Health { report, .. } | Event::LambdaHealth { report, .. } => {
+            health(&mut state.fleet, None, report, at);
             None
         }
         Event::Agent { host, msg, .. } => {
@@ -441,19 +512,35 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     phones,
                     phone_actions,
                     potato_players,
+                    potato_cpus,
+                    potato_confined,
                     windows,
                     windows_actions,
                     minecraft,
                     minecraft_server,
+                    renders,
                 } => {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {
                         state.fleet.registrations.registered(host, at);
+                        state.fleet.renders.agent_hello(host, renders.as_ref());
+                        if renders.is_some() {
+                            // Pages mode's host is no host of the wall: not in `hosts` (the
+                            // count the other modes' pages read), no slot, no place in the
+                            // potato ring or a wake's record. A name that was a wall host
+                            // leaves the wall.
+                            leave_wall(state, host, at);
+                            return None;
+                        }
                         let cfg = state.config.potato.clone();
-                        state
-                            .fleet
-                            .potato
-                            .agent_hello(host, *potato_players, at, &cfg);
+                        state.fleet.potato.agent_hello(
+                            host,
+                            *potato_players,
+                            *potato_cpus,
+                            *potato_confined,
+                            at,
+                            &cfg,
+                        );
                         // A hello again on the same connection keeps the image it reported.
                         let image = state
                             .fleet
@@ -502,8 +589,13 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         observe_minecraft(&mut state.fleet, n, host, r, at);
                     }
                 }
-                AgentMsg::Health(h) => health(&mut state.fleet, Some(host), h),
+                AgentMsg::Health(h) => health(&mut state.fleet, Some(host), h, at),
                 AgentMsg::Draining { .. } => {
+                    // Pages mode's host: its own state only, never the wall's reclaimed list.
+                    if let Some(h) = state.fleet.renders.hosts.get_mut(host) {
+                        h.draining = true;
+                        return None;
+                    }
                     if let Some(h) = state.fleet.hosts.get_mut(host) {
                         h.draining = true;
                     }
@@ -556,6 +648,9 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     let cfg = state.config.potato.clone();
                     state.fleet.potato.event(host, e, at, &cfg);
                 }
+                AgentMsg::Renders(report) => {
+                    state.fleet.renders.report(host, report, at);
+                }
                 AgentMsg::WindowsImage(image) => {
                     if let Some(h) = state.fleet.hosts.get_mut(host) {
                         h.windows_image = Some(image.clone());
@@ -565,8 +660,15 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             None
         }
         Event::AgentGone { host, .. } => {
+            // Pages mode's host leaves pages mode's state only: it was never a wall host, so
+            // it is not a reclaimed one.
+            if state.fleet.renders.hosts.contains_key(host) {
+                state.fleet.renders.agent_gone(host);
+                return None;
+            }
             let cfg = state.config.potato.clone();
             state.fleet.potato.agent_gone(host, at, &cfg);
+            state.fleet.renders.agent_gone(host);
             let f = &mut state.fleet;
             f.hosts.remove(host);
             f.slots.retain(|_, s| s.host.as_deref() != Some(host));
@@ -583,6 +685,12 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
         Event::Ec2 { report, .. } => {
             if let Some(n) = ec2_number(&report.id) {
                 observe_slot(&mut state.fleet, Half::Ec2, n, None, report, at);
+            }
+            None
+        }
+        Event::Lambda { report, .. } => {
+            if let Some(n) = lambda_number(&report.id) {
+                observe_slot(&mut state.fleet, Half::Lambda, n, None, report, at);
             }
             None
         }
@@ -612,18 +720,18 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
 }
 
 /// A tile on the wall with a renderer behind it: a placed fcvm slot, or a placed EC2 tile
-/// with an instance. An EC2 tile without one holds its place, dark, and is no GPU of the
-/// wall's: not counted, not waited on.
+/// with an instance (a Lambda tile with an environment). An EC2 or Lambda tile without one
+/// holds its place, dark, and is no GPU of the wall's: not counted, not waited on.
 pub fn renders_on_wall(s: &Slot) -> bool {
     s.position.is_some() && (s.half == Half::Fcvm || s.observed.vm.is_some())
 }
 
 /// A race whose halves are not all done.
 pub fn race_running(f: &Fleet) -> bool {
-    f.races.back().is_some_and(|r| {
-        r.fcvm.done_at.is_none() && !r.fcvm.tiles.is_empty()
-            || r.ec2.done_at.is_none() && !r.ec2.tiles.is_empty()
-    })
+    let running = |h: &HalfRace| h.done_at.is_none() && !h.tiles.is_empty();
+    f.races
+        .back()
+        .is_some_and(|r| running(&r.fcvm) || running(&r.ec2) || running(&r.lambda))
 }
 
 /// Whether the image shows what it will keep showing: no race is running and no placed
@@ -639,24 +747,36 @@ pub fn image_settled(f: &Fleet) -> bool {
                     "pending" | "launching" | "stopping" | "restoring" | "starting"
                 ))
     };
-    !race_running(f) && !f.slots.values().chain(f.ec2.values()).any(starting)
+    !race_running(f)
+        && !f
+            .slots
+            .values()
+            .chain(f.ec2.values())
+            .chain(f.lambda.values())
+            .any(starting)
 }
 
-/// Every placed fcvm tile runs its current generation, and every EC2 tile does too or is
-/// waiting for capacity (a wait the EC2 side shows on its own).
+/// Every placed fcvm tile runs its current generation, and every EC2 and Lambda tile does
+/// too or is waiting for capacity (a wait its side shows on its own).
 fn image_complete(f: &Fleet) -> bool {
     let running = |s: &Slot| s.observed.phase == "running" && s.observed.generation >= s.generation;
-    f.slots.values().chain(f.ec2.values()).any(renders_on_wall)
+    f.slots
+        .values()
+        .chain(f.ec2.values())
+        .chain(f.lambda.values())
+        .any(renders_on_wall)
         && f.slots.values().all(|s| s.position.is_none() || running(s))
         && f.ec2
             .values()
+            .chain(f.lambda.values())
             .all(|s| running(s) || s.observed.phase == "waiting_capacity")
 }
 
 /// Sleep after `idle_scale_down_secs` with no active viewer, or once no viewer has arrived
 /// for `sleep_without_new_viewer_secs` (never during a claim, a race or a warm window); wake
-/// on an active viewer while a viewer has arrived within that limit, and at once inside a
-/// warm window (`crate::warm`); be awake once the image is complete.
+/// on an active viewer while at least `min_wake_remaining_secs` of that limit remain
+/// (`crate::view::page_wakes`), and at once inside a warm window (`crate::warm`); be awake
+/// once the image is complete.
 fn power_step(state: &mut State, at: u64) {
     // Read from the clock and the configured windows, and false while the day's budget is
     // spent, so the warm rule stands down for the budget.
@@ -675,6 +795,7 @@ fn power_step(state: &mut State, at: u64) {
     let interval = state.config.race_interval_secs;
     let no_arrival = crate::view::no_arrival_deadline(&state.fleet.power, &state.config)
         .is_some_and(|t| at >= t);
+    let page_wakes = crate::view::page_wakes(&state.fleet.power, &state.config, at);
     let f = &mut state.fleet;
     let active = f.viewers.keys().filter(|v| !f.hidden.contains(*v)).count();
     if active > 0 {
@@ -689,8 +810,9 @@ fn power_step(state: &mut State, at: u64) {
         || f.minecraft.values().any(|s| minecraft_claim(s).is_some());
     let racing = race_running(f);
     if f.power.state == "asleep" {
-        // Connected pages do not wake it once the limit has run out: an arrival does.
-        if (active > 0 && !no_arrival) || warm {
+        // Connected pages wake it only while enough of the limit remains for the wake to be
+        // worth its hosts; with less, or none, an arrival does (a new viewer, or `wake`).
+        if (active > 0 && page_wakes) || warm {
             f.power.state = "waking".into();
             f.power.woke_at = Some(at);
             f.power.asleep_since = None;
@@ -734,6 +856,7 @@ fn power_step(state: &mut State, at: u64) {
             .slots
             .values()
             .chain(f.ec2.values())
+            .chain(f.lambda.values())
             .filter(|s| renders_on_wall(s))
             .count();
         f.power.wakes.push_back(Wake {
@@ -821,7 +944,8 @@ fn budget_step(state: &mut State, at: u64) {
     // A running race ends: tiles still to reach their first frame leave it, so each half is
     // done with the tiles that finished, or holds none.
     for race in f.races.iter_mut() {
-        for h in [&mut race.fcvm, &mut race.ec2] {
+        let started_at = race.started_at;
+        for h in race.halves_mut() {
             if h.done_at.is_some() {
                 continue;
             }
@@ -829,7 +953,7 @@ fn budget_step(state: &mut State, at: u64) {
             h.tiles.retain(|_, t| t.first_frame_at.is_some());
             h.dropped += before - h.tiles.len();
             let last = h.last.clone();
-            finish_half(h, race.started_at, last, at);
+            finish_half(h, started_at, last, at);
         }
     }
     if f.power.state != "asleep" {
@@ -955,18 +1079,18 @@ fn intent_effect(
                 "relaunch",
             )?;
             let f = &mut state.fleet;
-            let slot = match half {
-                Half::Fcvm => f.slots.get_mut(&n),
-                Half::Ec2 => f.ec2.get_mut(&n),
-            }
-            .expect("find_slot returned a live slot");
+            let slot = side_mut!(f, half)
+                .get_mut(&n)
+                .expect("find_slot returned a live slot");
             if half == Half::Fcvm && host_draining(&f.hosts, slot) {
                 return Err(format!("{} is on a draining host", slot.id));
             }
             if slot.claim.is_some() {
                 return Err(format!("{} is a viewer's own GPU right now", slot.id));
             }
-            if half == Half::Ec2 {
+            // An EC2 tile's launch is an instance and a Lambda tile's an environment on one:
+            // the same spacing and the same budget.
+            if half != Half::Fcvm {
                 // Its last launch: a relaunch, or, before the first running report fills
                 // that in, the launch that created the slot.
                 let launched = slot
@@ -986,7 +1110,7 @@ fn intent_effect(
             bump(slot, &by, at);
             let summary = format!("relaunch {}", slot.id);
             f.last_relaunch_at.insert(c.client.to_string(), at);
-            if half == Half::Ec2 {
+            if half != Half::Fcvm {
                 f.ec2_viewer_launches.push_back(at);
             }
             Ok(summary)
@@ -1011,14 +1135,14 @@ fn intent_effect(
                     (until - at).div_ceil(1000)
                 ));
             }
-            // Every EC2 tile races (`start_race`), each with a launch.
-            let ec2 = state.fleet.ec2.len();
-            if ec2 > 0 {
-                ec2_budget(&state.fleet.ec2_viewer_launches, ec2, at)?;
+            // Every EC2 and Lambda tile races (`start_race`), each with a launch.
+            let launches = state.fleet.ec2.len() + state.fleet.lambda.len();
+            if launches > 0 {
+                ec2_budget(&state.fleet.ec2_viewer_launches, launches, at)?;
                 state
                     .fleet
                     .ec2_viewer_launches
-                    .extend(std::iter::repeat_n(at, ec2));
+                    .extend(std::iter::repeat_n(at, launches));
             }
             let id = start_race(state, &by, at);
             Ok(format!("race {id}"))
@@ -1169,6 +1293,41 @@ fn intent_effect(
                 crate::potato::PotatoIntent::Done => Ok("restart".into()),
                 crate::potato::PotatoIntent::Refused(r) => Err(r),
             }
+        }
+        Intent::RendersOverlay { text } => {
+            let cfg = state.config.renders.clone();
+            // The limits first: a change that would be refused anyway needs no verdict.
+            if let Some(reason) = state.fleet.renders.refusal(c.client, at, &cfg) {
+                return Err(reason);
+            }
+            match check {
+                None => return Err("the text check did not run".into()),
+                Some(k) if k.verdict == "error" => return Err(k.reason.clone()),
+                Some(k) if !k.allowed() => {
+                    return Err(format!("the text check refused it: {}", k.reason))
+                }
+                Some(_) => {}
+            }
+            let change = crate::renders::Change::Text(text.clone());
+            state
+                .fleet
+                .renders
+                .change(c.viewer, c.client, &change, at, &cfg)
+        }
+        Intent::RendersTransform { name } => {
+            let cfg = state.config.renders.clone();
+            let change = crate::renders::Change::Transform(name.clone());
+            state
+                .fleet
+                .renders
+                .change(c.viewer, c.client, &change, at, &cfg)
+        }
+        Intent::RendersClear => {
+            let cfg = state.config.renders.clone();
+            state
+                .fleet
+                .renders
+                .change(c.viewer, c.client, &crate::renders::Change::Clear, at, &cfg)
         }
         Intent::ResumeClaim { token } => resume_claim(&mut state.fleet, c, token),
         Intent::ReleaseGpu { claim } => {
@@ -1498,6 +1657,7 @@ fn start_race(state: &mut State, by: &str, at: u64) -> u64 {
         by: by.to_string(),
         fcvm: HalfRace::default(),
         ec2: HalfRace::default(),
+        lambda: HalfRace::default(),
     };
     for slot in f.slots.values_mut() {
         if let (Some(c), Some(k)) = (&slot.claim, slot.position) {
@@ -1523,17 +1683,18 @@ fn start_race(state: &mut State, by: &str, at: u64) -> u64 {
             );
         }
     }
-    // Every EC2 tile races, also one still waiting for capacity (that wait is kept out of
-    // the half's time); a tile without an instance has no place yet and names its slot.
-    for slot in f.ec2.values_mut() {
-        bump(slot, by, at);
-        {
-            race.ec2.tiles.insert(
+    // Every EC2 and Lambda tile races, also one still waiting for capacity (that wait is
+    // kept out of the half's time); a tile without a place names its slot. A Lambda tile's
+    // new generation is a new published version, so the race times a fresh environment.
+    for (half, slots) in [(Half::Ec2, &mut f.ec2), (Half::Lambda, &mut f.lambda)] {
+        for slot in slots.values_mut() {
+            bump(slot, by, at);
+            race.half_mut(half).tiles.insert(
                 slot.id.clone(),
                 RaceTile {
                     tile: slot
                         .position
-                        .map(|k| format!("ec2:{}", k + 1))
+                        .map(|k| format!("{}:{}", half.as_str(), k + 1))
                         .unwrap_or_else(|| slot.id.clone()),
                     generation: slot.generation,
                     first_frame_at: None,
@@ -1740,6 +1901,23 @@ fn tick(state: &mut State, at: u64) {
     }
 }
 
+/// A host that said hello as pages mode's host: whatever it held of the wall as a GPU host
+/// under the same name goes (its place among the hosts, slots, phones, sandboxes, servers and
+/// potato players), as when its agent is gone, but it is not counted as reclaimed.
+fn leave_wall(state: &mut State, host: &str, at: u64) {
+    let cfg = state.config.potato.clone();
+    state.fleet.potato.agent_hello(host, 0, 0, false, at, &cfg);
+    let f = &mut state.fleet;
+    if f.hosts.remove(host).is_none() {
+        return;
+    }
+    f.slots.retain(|_, s| s.host.as_deref() != Some(host));
+    f.phones.retain(|_, s| s.host.as_deref() != Some(host));
+    forget_windows(f, |s| s.host.as_deref() == Some(host), at);
+    forget_minecraft(f, |s| s.host.as_deref() == Some(host), at);
+    drop_missing_from_races(f, at);
+}
+
 fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, at: u64) {
     // One slot per GPU address; a repeated address is ignored. At most `capacity` slots.
     let mut seen = std::collections::BTreeSet::new();
@@ -1861,7 +2039,8 @@ fn new_slot(id: String, half: Half, host: Option<String>, gpu: Option<Gpu>, at: 
     }
 }
 
-/// What a slot report says about the slot's launch, for a wall slot, an EC2 tile or a phone.
+/// What a slot report says about the slot's launch, for a wall slot, an EC2 or Lambda tile or
+/// a phone.
 fn note_report(slot: &mut Slot, r: &SlotReport, at: u64) {
     slot.observed.phase = r.phase.clone();
     slot.observed.generation = r.generation;
@@ -1884,6 +2063,7 @@ fn note_running(slot: &mut Slot, r: &SlotReport, at: u64) -> bool {
     if r.phase != "running" {
         slot.observed.fps = None;
         slot.observed.gpu_stats = None;
+        slot.observed.vm_stats = None;
         slot.observed.budget_fit = None;
         slot.observed.render_ms_max = None;
         slot.observed.budget_every_pixel = None;
@@ -1924,11 +2104,9 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
             count_restore(&mut f.counters, at);
         }
     }
-    let slot = match half {
-        Half::Fcvm => f.slots.get_mut(&n),
-        Half::Ec2 => f.ec2.get_mut(&n),
+    let Some(slot) = side_mut!(f, half).get_mut(&n) else {
+        return;
     };
-    let Some(slot) = slot else { return };
     if host.is_some() && slot.host.as_deref() != host {
         return;
     }
@@ -1942,10 +2120,7 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
         let id = slot.id.clone();
         let since = at.saturating_sub(r.timings.get("capacity_wait_ms").copied().unwrap_or(0));
         for race in f.races.iter_mut() {
-            let h = match half {
-                Half::Fcvm => &mut race.fcvm,
-                Half::Ec2 => &mut race.ec2,
-            };
+            let h = race.half_mut(half);
             if let Some(t) = h.tiles.get_mut(&id) {
                 if h.done_at.is_none() && t.first_frame_at.is_none() && r.generation >= t.generation
                 {
@@ -1954,10 +2129,7 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
             }
         }
     }
-    let Some(slot) = (match half {
-        Half::Fcvm => f.slots.get_mut(&n),
-        Half::Ec2 => f.ec2.get_mut(&n),
-    }) else {
+    let Some(slot) = side_mut!(f, half).get_mut(&n) else {
         return;
     };
     if !note_running(slot, r, at) {
@@ -1973,10 +2145,8 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
     let id = slot.id.clone();
     // The running report finishes this tile in every race still waiting for it.
     for race in f.races.iter_mut() {
-        let h = match half {
-            Half::Fcvm => &mut race.fcvm,
-            Half::Ec2 => &mut race.ec2,
-        };
+        let started_at = race.started_at;
+        let h = race.half_mut(half);
         if h.done_at.is_some() {
             continue;
         }
@@ -1989,7 +2159,7 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
         t.first_frame_at = Some(at);
         t.phases = r.timings.clone();
         t.capacity_wait_ms = r.timings.get("capacity_wait_ms").copied().unwrap_or(0);
-        finish_half(h, race.started_at, Some(id.clone()), at);
+        finish_half(h, started_at, Some(id.clone()), at);
     }
 }
 
@@ -2017,13 +2187,17 @@ fn finish_half(h: &mut HalfRace, started_at: u64, last: Option<String>, at: u64)
         .unwrap_or(0);
 }
 
-fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
+fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport, at: u64) {
     let slot = match host {
         Some(_) if h.id.starts_with("phone-") => {
             phone_number(&h.id).and_then(|n| f.phones.get_mut(&n))
         }
         Some(_) => slot_number(&h.id).and_then(|n| f.slots.get_mut(&n)),
-        None => ec2_number(&h.id).and_then(|n| f.ec2.get_mut(&n)),
+        None => match (ec2_number(&h.id), lambda_number(&h.id)) {
+            (Some(n), _) => f.ec2.get_mut(&n),
+            (None, Some(n)) => f.lambda.get_mut(&n),
+            (None, None) => None,
+        },
     };
     let Some(slot) = slot else {
         return;
@@ -2032,7 +2206,8 @@ fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
         return;
     }
     slot.observed.fps = h.fps.is_finite().then_some(h.fps);
-    // An EC2 tile has no inventory to name its GPU: the renderer says which one it drew on.
+    // An EC2 or Lambda tile has no inventory to name its GPU: the renderer says which one it
+    // drew on.
     if host.is_none() {
         if let Some(name) = h
             .gpu
@@ -2049,7 +2224,20 @@ fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
             }
         }
     }
-    slot.observed.gpu_stats = Some(h.gpu.clone());
+    let mut gpu = h.gpu.clone();
+    if let Some(o) = gpu.as_object_mut() {
+        o.insert("at".into(), at.into());
+    }
+    slot.observed.gpu_stats = Some(gpu);
+    slot.observed.vm_stats = h
+        .vm_stats
+        .as_ref()
+        .filter(|v| v.cpu_pct.is_finite() && v.cpu_pct >= 0.0 && v.vcpus > 0)
+        .map(|v| VmStats {
+            cpu_pct: v.cpu_pct.min(100.0),
+            vcpus: v.vcpus,
+            at: Some(at),
+        });
     slot.observed.budget_fit = h.budget_fit.filter(|v| v.is_finite());
     slot.observed.render_ms_max = h.render_ms_max.filter(|v| v.is_finite());
     slot.observed.budget_every_pixel = h.budget_every_pixel.filter(|v| v.is_finite() && *v > 0.0);
@@ -2069,6 +2257,7 @@ fn budget_round(f: &mut Fleet, at: u64) {
         .slots
         .values()
         .chain(f.ec2.values())
+        .chain(f.lambda.values())
         .filter(|s| renders_on_wall(s) && s.claim.is_none())
         .collect();
     let fits: Vec<Option<f64>> = tiles.iter().map(|s| s.observed.budget_fit).collect();
@@ -2129,8 +2318,10 @@ fn drop_from_races(f: &mut Fleet, leaving: impl Fn(&Slot) -> bool, at: u64) {
 fn drop_missing_from_races(f: &mut Fleet, at: u64) {
     let slots: Vec<String> = f.slots.values().map(|s| s.id.clone()).collect();
     let ec2: Vec<String> = f.ec2.values().map(|s| s.id.clone()).collect();
+    let lambda: Vec<String> = f.lambda.values().map(|s| s.id.clone()).collect();
     for race in f.races.iter_mut() {
-        for (h, live) in [(&mut race.fcvm, &slots), (&mut race.ec2, &ec2)] {
+        let started_at = race.started_at;
+        for (h, live) in race.halves_mut().into_iter().zip([&slots, &ec2, &lambda]) {
             if h.done_at.is_some() {
                 continue;
             }
@@ -2139,7 +2330,7 @@ fn drop_missing_from_races(f: &mut Fleet, at: u64) {
                 .retain(|id, t| live.contains(id) || t.first_frame_at.is_some());
             h.dropped += before - h.tiles.len();
             let last = h.last.clone();
-            finish_half(h, race.started_at, last, at);
+            finish_half(h, started_at, last, at);
         }
     }
 }
@@ -2150,8 +2341,11 @@ fn drop_missing_from_races(f: &mut Fleet, at: u64) {
 /// - fcvm GPUs: slots whose host is present and not draining, in slot-number order, at
 ///   most `max_tiles`; a GPU claimed from standby is left out, a borrowed wall tile keeps
 ///   its place. fcvm slots beyond `max_tiles` are standby.
-/// - EC2 tiles wanted: `min(ec2_max, max_tiles)`; `ec2-1..ec2-D` exist, higher ones are
-///   dropped (the driver terminates their instances). Each has a place, instance or not.
+/// - Each AWS tile has a place, with an instance (an environment) or not.
+/// - The AWS half's tiles: `min(ec2_max, max_tiles)`, of which `min(lambda_max, that)` are
+///   Lambda tiles (`lam-1..lam-L`) and the rest EC2 tiles (`ec2-1..ec2-E`); one is dropped
+///   when its count falls (the driver terminates its instance, or deletes its function). The
+///   half is one grid: the EC2 tiles' places first, then the Lambda tiles'.
 /// - fcvm places: `max(min(fcvm_tiles, max_tiles) - phone GPUs - quarantined GPUs, fcvm
 ///   GPUs)`, where phone GPUs are those connected hosts run phones on and quarantined GPUs
 ///   are wall GPUs of connected hosts out of rotation: no GPU can fill either's place. Once
@@ -2162,7 +2356,7 @@ fn drop_missing_from_races(f: &mut Fleet, at: u64) {
 ///   place. The
 ///   GPUs are grouped into one band per host and the places left over are one dark band
 ///   below them.
-/// - Asleep, neither side has a place.
+/// - Asleep, no side has a place.
 fn retile(f: &mut Fleet, c: &Config, at: u64) {
     // Asleep, nothing is placed: the fcvm side's GPUs go to standby (their VMs stop) as the
     // EC2 side's tiles go away, whether or not their hosts scale down with them.
@@ -2210,16 +2404,25 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     let was_warming = std::mem::replace(&mut f.warming, warming.into_iter().collect());
     // The EC2 side wants its configured tiles whatever the fcvm side has (each side shows
     // the GPUs it has live); asleep it has none.
-    let want_ec2 = if asleep {
+    let aws = if asleep {
         0
     } else {
-        c.ec2_max.min(c.max_tiles) as u32
+        c.ec2_max.min(c.max_tiles)
     };
+    let want_lambda = c.lambda_max.min(aws) as u32;
+    let want_ec2 = aws as u32 - want_lambda;
     f.ec2.retain(|n, _| *n <= want_ec2);
     for n in 1..=want_ec2 {
         f.ec2
             .entry(n)
             .or_insert_with(|| new_slot(ec2_name(n), Half::Ec2, None, None, at));
+    }
+    // The Lambda tiles likewise: asleep there are none, so their functions are deleted.
+    f.lambda.retain(|n, _| *n <= want_lambda);
+    for n in 1..=want_lambda {
+        f.lambda
+            .entry(n)
+            .or_insert_with(|| new_slot(lambda_name(n), Half::Lambda, None, None, at));
     }
     // Each side is as wide as its share of the configured places, so a tile going dark (a
     // race replacing the EC2 instances, a capacity wait, a host not yet connected or
@@ -2229,6 +2432,8 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     // until an operator releases them), or one per live GPU when there are more. A place
     // kept for either would stay dark for as long as its host runs.
     let ec2_places: Vec<u32> = f.ec2.keys().copied().take(c.max_tiles).collect();
+    // At most `max_tiles` with the EC2 tiles (`aws` above).
+    let lambda_places: Vec<u32> = f.lambda.keys().copied().collect();
     let quarantined = f
         .slots
         .values()
@@ -2264,7 +2469,8 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     };
     f.n = active.len();
     f.ec2_n = ec2_places.len();
-    let (fcvm_side, ec2_side) = sides(fcvm_places, f.ec2_n);
+    f.lambda_n = lambda_places.len();
+    let (fcvm_side, ec2_side) = sides(fcvm_places, f.ec2_n + f.lambda_n);
     // fcvm: one band per host, hosts ordered by their lowest placed slot.
     let mut groups: Vec<(String, Vec<u32>)> = Vec::new();
     for num in &active {
@@ -2290,7 +2496,13 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     } else {
         Vec::new()
     };
-    let ec2_rects = grid_in(ec2_side, f.ec2_n, c.image_aspect, c.tile_aspect);
+    // One grid for the AWS half: its EC2 tiles' places, then its Lambda tiles'.
+    let aws_rects = grid_in(
+        ec2_side,
+        f.ec2_n + f.lambda_n,
+        c.image_aspect,
+        c.tile_aspect,
+    );
     // The new place of every slot, then compare with the old.
     let mut placed: BTreeMap<(Half, u32), (usize, Rect)> = BTreeMap::new();
     for h in f.hosts.values_mut() {
@@ -2307,18 +2519,22 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
         }
     }
     for (i, num) in ec2_places.iter().enumerate() {
-        placed.insert((Half::Ec2, *num), (i, ec2_rects[i]));
+        placed.insert((Half::Ec2, *num), (i, aws_rects[i]));
+    }
+    for (i, num) in lambda_places.iter().enumerate() {
+        placed.insert((Half::Lambda, *num), (i, aws_rects[f.ec2_n + i]));
     }
     let changed = f
         .slots
         .iter()
         .map(|(n, s)| ((Half::Fcvm, *n), s))
         .chain(f.ec2.iter().map(|(n, s)| ((Half::Ec2, *n), s)))
+        .chain(f.lambda.iter().map(|(n, s)| ((Half::Lambda, *n), s)))
         .any(|(key, s)| placed.get(&key).map(|p| (p.0, p.1)) != s.position.zip(s.rect))
         // A slot that left moved nothing still here, but the sides changed.
         || f.fcvm_dark != fcvm_dark
         || f.layout.fcvm != (fcvm_places > 0).then_some(fcvm_side)
-        || f.layout.ec2 != (f.ec2_n > 0).then_some(ec2_side);
+        || f.layout.ec2 != (f.ec2_n + f.lambda_n > 0).then_some(ec2_side);
     f.fcvm_dark = fcvm_dark;
     let generation = if changed {
         f.layout.generation + 1
@@ -2330,10 +2546,14 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
             generation,
             from_frame: crate::state::layout_from_frame(f.scene.t_at(at)),
             fcvm: (fcvm_places > 0).then_some(fcvm_side),
-            ec2: (f.ec2_n > 0).then_some(ec2_side),
+            ec2: (f.ec2_n + f.lambda_n > 0).then_some(ec2_side),
         };
     }
-    for (half, slots) in [(Half::Fcvm, &mut f.slots), (Half::Ec2, &mut f.ec2)] {
+    for (half, slots) in [
+        (Half::Fcvm, &mut f.slots),
+        (Half::Ec2, &mut f.ec2),
+        (Half::Lambda, &mut f.lambda),
+    ] {
         for (n, s) in slots.iter_mut() {
             let new = placed.get(&(half, *n)).copied();
             let (pos, rect) = (new.map(|p| p.0), new.map(|p| p.1));
@@ -3057,6 +3277,9 @@ fn running_current(s: &Slot) -> bool {
 
 /// A server's new launch: its generation moves, timed from `at`, and any fork the old one
 /// was is over.
+/// Who a launch begun by a reset of every server is by.
+const RESET_ALL_BY: &str = "reset_all";
+
 fn bump_minecraft(slot: &mut Slot, by: &str, at: u64) {
     bump(slot, by, at);
     if let Some(m) = slot.minecraft.as_mut() {
@@ -3151,6 +3374,20 @@ fn observe_minecraft(f: &mut Fleet, n: u32, host: &str, r: &SlotReport, at: u64)
                     rl.clicked_at = chunk.saturating_sub(took);
                     rl.first_frame_at = Some(chunk);
                 }
+            }
+        }
+        // A launch the last reset of every server began is back: that reset counts it, once.
+        if let (Some(rl), Some(all)) = (
+            slot.last_relaunch.as_ref(),
+            f.last_minecraft_reset_all.as_mut(),
+        ) {
+            let own = rl.by == RESET_ALL_BY
+                && rl.clicked_at == all.clicked_at
+                && rl.generation == r.generation;
+            if let (true, Some(back), Some(first)) = (own, all.back.as_mut(), rl.first_frame_at) {
+                *back += 1;
+                let took = first.saturating_sub(all.clicked_at);
+                all.took_ms = Some(all.took_ms.map_or(took, |t| t.max(took)));
             }
         }
     }
@@ -3331,7 +3568,7 @@ fn minecraft_reset(state: &mut State, c: &Ctx, slot: Option<&str>) -> Result<Str
                 if minecraft_claim(s).is_some() || host_draining(&hosts, s) {
                     continue;
                 }
-                bump_minecraft(s, "reset_all", at);
+                bump_minecraft(s, RESET_ALL_BY, at);
                 n += 1;
             }
             if n == 0 {
@@ -3343,6 +3580,8 @@ fn minecraft_reset(state: &mut State, c: &Ctx, slot: Option<&str>) -> Result<Str
                 clicked_at: at,
                 by: format!("viewer:{}", c.viewer),
                 servers: n,
+                back: Some(0),
+                took_ms: None,
             });
             Ok(format!("reset all {n} servers"))
         }

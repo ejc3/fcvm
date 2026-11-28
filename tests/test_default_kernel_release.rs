@@ -281,7 +281,11 @@ fn apt_packages(script: &str) -> std::collections::BTreeSet<String> {
         let Some(install) = words.iter().position(|word| *word == "install") else {
             continue;
         };
-        if !words[..install].iter().any(|word| word.contains("apt-get")) {
+        // `apt_get` is the retrying wrapper in the runner image's user data (scripts/build-ami.sh).
+        if !words[..install]
+            .iter()
+            .any(|word| word.contains("apt-get") || *word == "apt_get")
+        {
             continue;
         }
         packages.extend(
@@ -299,9 +303,10 @@ fn apt_packages_reads_continuations_and_ignores_comments() {
     let script = "./scripts/ci-apt-get.sh update\n\
                   ./scripts/ci-apt-get.sh install -y flex bison \\\n    libseccomp-dev  # linked by firecracker\n\
                   ./scripts/ci-apt-get.sh install -y gh  # libelf-dev comes from the image\n\
+                  apt_get install -y unzip\n\
                   echo install nothing\n";
     let packages = apt_packages(script);
-    let expected = ["bison", "flex", "gh", "libseccomp-dev"];
+    let expected = ["bison", "flex", "gh", "libseccomp-dev", "unzip"];
     assert_eq!(
         packages.iter().map(String::as_str).collect::<Vec<_>>(),
         expected
@@ -2637,6 +2642,140 @@ fn every_host_kernel_pins_a_release_without_the_bridge_rcu_barrier() {
     );
 }
 
+/// scripts/check-bridge-teardown-kernel.sh is the one statement of which kernel releases have
+/// that fix. The runner image build runs it on the release it installed, and it passes Ubuntu's
+/// AWS 7.0 backport only when asked, because a runner boots fcvm's own host kernel.
+#[test]
+fn the_bridge_teardown_kernel_check_accepts_only_releases_with_the_fix() {
+    let root = repo_root();
+    let script = root.join("scripts/check-bridge-teardown-kernel.sh");
+    let verdict = |arguments: &[&str]| {
+        let output = Command::new("bash")
+            .arg(&script)
+            .args(arguments)
+            .output()
+            .expect("run check-bridge-teardown-kernel.sh");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    for release in [
+        "6.18.60",
+        "6.18.60+",
+        "6.18.61-fcvm-0123456789ab",
+        "7.2.0",
+        "7.3.3-fcvm-0123456789ab",
+        "8.0.1",
+    ] {
+        assert_eq!(verdict(&[release]).0, Some(0), "{release} has the fix");
+    }
+    for release in [
+        "6.14.0-1018-aws",
+        "6.18.59",
+        "6.19.9",
+        "7.0.0-1013-aws",
+        "7.0.0-1018-aws",
+        "7.1.12",
+        "unknown",
+        // not what `uname -r` prints: two components, four, leading zeros, a number that
+        // runs into its suffix
+        "6.18",
+        "7.2",
+        "6.18.60.1",
+        "06.18.060",
+        "7.3.3fcvm",
+        // an empty argument is not "no argument": it must not fall back to the running kernel
+        "",
+    ] {
+        let (status, message) = verdict(&[release]);
+        assert_eq!(status, Some(1), "'{release}' must fail");
+        assert!(
+            message.contains(&format!("kernel '{release}' lacks")),
+            "the failure must name the kernel: {message}"
+        );
+    }
+    let backport = "--accept-ubuntu-backport";
+    assert_eq!(verdict(&[backport, "7.0.0-1017-aws"]).0, Some(0));
+    assert_eq!(verdict(&[backport, "7.0.0-1016-aws"]).0, Some(1));
+    assert_eq!(verdict(&[backport, "7.0.0-1018-generic"]).0, Some(1));
+    assert_eq!(verdict(&[backport, "6.18.59"]).0, Some(1));
+    assert_eq!(verdict(&[backport, "7.0.0-01017-aws"]).0, Some(1));
+    assert_eq!(verdict(&[backport, ""]).0, Some(1));
+
+    let ami = std::fs::read_to_string(root.join("scripts/build-ami.sh")).unwrap();
+    let install = ami
+        .find("--install-host-kernel\n")
+        .expect("build-ami.sh installs the host kernel");
+    let check = ami
+        .find("./scripts/check-bridge-teardown-kernel.sh \"$BOOT_KERNEL\"\n")
+        .expect("build-ami.sh checks the kernel the image will boot");
+    assert!(
+        install < check,
+        "the image build must check the kernel after installing it"
+    );
+}
+
+/// With CONFIG_WEXT_CORE=y every netdev notifier event walks every network namespace under RTNL
+/// (wext_netdev_notifier_call -> wireless_nlevent_flush -> for_each_net): 3.3 to 3.6 ms of hold
+/// per VM namespace life with 2000 to 3000 namespaces alive (#2034). WEXT_CORE is def_bool on
+/// CFG80211_WEXT || WIRELESS_EXT. The host builds from the running kernel's config, which
+/// descends from Ubuntu's and sets CFG80211_WEXT=y, and IPW2100=m and IPW2200=m, which select
+/// WIRELESS_EXT themselves and through LIBIPW (Linux 7.3.3,
+/// drivers/net/wireless/intel/ipw2x00/Kconfig). Every host kernel therefore has to name a
+/// config fragment, list it as a build input, and set all three to n. It also sets
+/// WIRELESS_EXT and WEXT_CORE to n, which changes nothing by itself (neither has a prompt)
+/// and makes the build's check after olddefconfig fail if anything still selects them.
+#[test]
+fn every_host_kernel_leaves_wireless_extensions_off() {
+    let root = repo_root();
+    let config = rootfs_config();
+    let mut checked = Vec::new();
+    let mut wrong = Vec::new();
+    for (profile_name, arches) in config["kernel_profiles"].as_table().unwrap() {
+        for (arch, table) in arches.as_table().unwrap() {
+            let Some(host) = table.get("host_kernel") else {
+                continue;
+            };
+            let name = format!("{profile_name}.{arch}");
+            checked.push(name.clone());
+            let Some(fragment) = host.get("config_fragment").and_then(|f| f.as_str()) else {
+                wrong.push(format!("{name} has no config_fragment"));
+                continue;
+            };
+            let listed = host["build_inputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|input| input.as_str() == Some(fragment));
+            if !listed {
+                wrong.push(format!("{name}: {fragment} is not a build input"));
+            }
+            let text = std::fs::read_to_string(root.join(fragment)).unwrap();
+            for option in [
+                "CFG80211_WEXT",
+                "IPW2100",
+                "IPW2200",
+                "WIRELESS_EXT",
+                "WEXT_CORE",
+            ] {
+                let line = format!("CONFIG_{option}=n");
+                if !text.lines().any(|l| l.trim() == line) {
+                    wrong.push(format!("{name}: {fragment} lacks {line}"));
+                }
+            }
+        }
+    }
+    assert!(
+        checked.len() >= 2,
+        "expected a host kernel for both arches, found {checked:?}"
+    );
+    assert!(
+        wrong.is_empty(),
+        "host kernels must be built without wireless extensions: {wrong:?}"
+    );
+}
+
 /// For each default, nested and btrfs guest kernel table, as `("profile.arch", applies)`, whether the
 /// patches it applies contain `fix`.
 fn shipped_guest_kernels_applying(fix: &str) -> Vec<(String, bool)> {
@@ -2791,6 +2930,31 @@ fn every_kernel_table_is_published_by_a_leg_or_says_it_is_not() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Setup downloads a published kernel only as the bytes its table records
+/// (`kernel_artifact_sha256`), so every published table must record them: without
+/// the digest every fresh host builds the kernel locally.
+#[test]
+fn every_published_kernel_table_records_its_artifact_digest() {
+    let config = rootfs_config();
+    let legs = published_kernel_legs(&kernels_workflow());
+    assert!(!legs.is_empty(), "kernels.yml publishes no kernel table");
+    for (profile_name, arch) in legs {
+        let profile = kernel_profile_table(&config, &profile_name, &arch);
+        let digest = profile
+            .kernel_artifact_sha256
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "[kernel_profiles.{profile_name}.{arch}] needs kernel_artifact_sha256 = the SHA-256 \
+             of its released vmlinux (sha256sum of the asset), got {digest:?}"
+        );
+    }
+}
+
 /// #957: a binary with no source checkout beside it names a release only from
 /// `kernel_sha`, and only the default tables carried one, so an installed
 /// binary failed on nested and btrfs before it asked for the release. Every
@@ -2878,7 +3042,8 @@ fn the_release_check_outlasts_two_dropped_requests() {
 
 /// #957: Build Runner AMI ran only after a fully successful Build Kernels run,
 /// so one failed x86_64 leg skipped the arm64 image. It now starts on any run
-/// that was not cancelled and first checks the one release it takes.
+/// that was not cancelled, and each leg first checks the one release it takes:
+/// the nested kernel of its own architecture.
 #[test]
 fn the_runner_image_waits_for_its_own_kernel_not_the_whole_run() {
     let path = repo_root().join(".github/workflows/build-runner-ami.yml");
@@ -2891,14 +3056,31 @@ fn the_runner_image_waits_for_its_own_kernel_not_the_whole_run() {
             && !condition.contains("conclusion == 'success'"),
         "build-ami must start on every finished Build Kernels run: {condition}"
     );
+    let legs: Vec<(&str, &str)> = job["strategy"]["matrix"]["include"]
+        .as_sequence()
+        .expect("build-ami has one leg per image")
+        .iter()
+        .map(|leg| {
+            (
+                leg["arch"].as_str().unwrap(),
+                leg["config_arch"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(legs, [("arm64", "arm64"), ("x64", "amd64")]);
+    assert_eq!(
+        job["strategy"]["fail-fast"].as_bool(),
+        Some(false),
+        "one image's failure must not cancel the other's build"
+    );
     let steps = job["steps"].as_sequence().unwrap();
     let check = steps
         .iter()
         .position(|step| {
             run_script(step).trim()
-                == "python3 scripts/verify-kernel-releases.py --leg nested arm64"
+                == "python3 scripts/verify-kernel-releases.py --leg nested ${{ matrix.config_arch }}"
         })
-        .expect("build-ami checks the arm64 nested release it downloads");
+        .expect("build-ami checks the nested release its leg downloads");
     let build = steps
         .iter()
         .position(|step| run_script(step).contains("scripts/build-ami.sh"))
@@ -2906,6 +3088,11 @@ fn the_runner_image_waits_for_its_own_kernel_not_the_whole_run() {
     assert!(
         check < build,
         "the release check must come before the image build"
+    );
+    assert_eq!(
+        steps[build]["env"]["AMI_ARCH"].as_str(),
+        Some("${{ matrix.arch }}"),
+        "each leg must build the image of its own architecture"
     );
     let ami = std::fs::read_to_string(repo_root().join("scripts/build-ami.sh")).unwrap();
     assert!(

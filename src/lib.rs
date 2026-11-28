@@ -2,18 +2,23 @@ pub mod cgroup;
 pub mod cli;
 pub mod commands;
 pub mod companion;
+pub mod confine;
 pub mod firecracker;
 pub mod fleet;
 pub mod gpu;
 pub mod health;
 pub mod hypervisor;
 pub mod kvm_trace;
+pub mod netpool;
 pub mod network;
 pub mod paths;
 pub mod reclaim;
+pub mod runtime_dir;
 pub mod setup;
 pub mod state;
 pub mod storage;
+pub mod store_buckets;
+pub mod sweep;
 #[cfg(test)]
 mod test_child;
 #[cfg(test)]

@@ -1,0 +1,433 @@
+Attaching 20 probes...
+
+
+@cleanup_net_ms: 
+[32, 64)               1 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+@cleanup_s[74349]: 5984484098698
+@cow[coordinator]: 1
+@cow[kill]: 9
+@cow[make]: 12
+@cow[ls]: 13
+@cow[tr]: 17
+@cow[env]: 18
+@cow[expr]: 19
+@cow[egrep]: 20
+@cow[91-contract-ua-]: 21
+@cow[98-reboot-requi]: 22
+@cow[85-fwupd]: 22
+@cow[update-motd-reb]: 22
+@cow[92-unattended-u]: 22
+@cow[10-help-text]: 22
+@cow[update-motd-una]: 22
+@cow[98-fsck-at-rebo]: 22
+@cow[cut]: 35
+@cow[pkill]: 40
+@cow[50-landscape-sy]: 44
+@cow[95-hwe-eol]: 44
+@cow[head]: 45
+@cow[stat]: 48
+@cow[sort]: 50
+@cow[id]: 60
+@cow[90-updates-avai]: 60
+@cow[uname]: 62
+@cow[systemd-run]: 71
+@cow[find]: 77
+@cow[97-overlayroot]: 80
+@cow[00-header]: 82
+@cow[awk]: 84
+@cow[release-upgrade]: 87
+@cow[date]: 90
+@cow[91-release-upgr]: 105
+@cow[50-motd-news]: 106
+@cow[grep]: 108
+@cow[update-motd-fsc]: 116
+@cow[cargo]: 122
+@cow[cat]: 124
+@cow[sudo]: 197
+@cow[run-parts]: 227
+@cow[podman]: 437
+@cow[bash]: 718
+@cow[sshd]: 961
+@cow[opt cgu.0]: 1434
+@cow[tokio-rt-worker]: 14966
+@cow[unshare]: 17618
+@cow[true]: 17678
+@cow[sleep]: 17712
+@cow[sh]: 19719
+@cow[newuidmap]: 29670
+@cow[newgidmap]: 29673
+@cow[rustc]: 60975
+@cow[ip]: 102806
+@cow[nsenter]: 108352
+@cow[start-pieces]: 166116
+@cow[curl]: 517765
+@exec[/usr/bin/pkill]: 1
+@exec[$CHECKOUT/target/release/start-pieces]: 1
+@exec[/usr/bin/make]: 1
+@exec[/usr/bin/kill]: 1
+@exec[$HOME/.rustup/toolchains/$TOOLCHAIN]: 1
+@exec[/usr/bin/systemd-run]: 1
+@exec[/usr/bin/ls]: 1
+@exec[/usr/bin/podman]: 1
+@exec[/usr/lib/ubuntu-release-upgrader/release-upgrade-motd]: 2
+@exec[/etc/update-motd.d/92-unattended-upgrades]: 2
+@exec[/etc/update-motd.d/98-fsck-at-reboot]: 2
+@exec[/usr/local/sbin/run-parts]: 2
+@exec[/etc/update-motd.d/97-overlayroot]: 2
+@exec[/usr/lib/update-notifier/update-motd-fsck-at-reboot]: 2
+@exec[/usr/bin/run-parts]: 2
+@exec[/usr/sbin/run-parts]: 2
+@exec[/bin/sh]: 2
+@exec[/etc/update-motd.d/90-updates-available]: 2
+@exec[/usr/local/bin/run-parts]: 2
+@exec[/etc/update-motd.d/85-fwupd]: 2
+@exec[/usr/local/sbin/grep]: 2
+@exec[/etc/update-motd.d/91-release-upgrade]: 2
+@exec[/usr/sbin/grep]: 2
+@exec[/etc/update-motd.d/98-reboot-required]: 2
+@exec[/usr/bin/egrep]: 2
+@exec[/etc/update-motd.d/91-contract-ua-esm-status]: 2
+@exec[/etc/update-motd.d/50-motd-news]: 2
+@exec[/usr/sbin/sshd]: 2
+@exec[/usr/bin/expr]: 2
+@exec[/etc/update-motd.d/00-header]: 2
+@exec[/usr/bin/env]: 2
+@exec[/usr/share/unattended-upgrades/update-motd-unattended-upgrades]: 2
+@exec[/usr/local/bin/grep]: 2
+@exec[/etc/update-motd.d/10-help-text]: 2
+@exec[/etc/update-motd.d/95-hwe-eol]: 2
+@exec[/usr/bin/tr]: 2
+@exec[/usr/lib/update-notifier/update-motd-reboot-required]: 2
+@exec[/etc/update-motd.d/50-landscape-sysinfo]: 2
+@exec[/usr/bin/sort]: 2
+@exec[/usr/bin/sudo]: 2
+@exec[/usr/bin/awk]: 3
+@exec[/usr/bin/stat]: 4
+@exec[/usr/bin/cut]: 4
+@exec[/usr/bin/id]: 5
+@exec[/usr/bin/head]: 5
+@exec[/usr/bin/find]: 6
+@exec[/usr/bin/uname]: 7
+@exec[/usr/bin/date]: 9
+@exec[/usr/bin/grep]: 10
+@exec[/bin/bash]: 12
+@exec[/usr/bin/cat]: 14
+@exec[/usr/bin/true]: 1999
+@exec[/usr/local/bin/true]: 1999
+@exec[/usr/sbin/true]: 1999
+@exec[/usr/local/sbin/newuidmap]: 2000
+@exec[/usr/sbin/sh]: 2000
+@exec[/usr/bin/newuidmap]: 2000
+@exec[$HOME/.cargo/bin/unshare]: 2000
+@exec[/usr/bin/sh]: 2000
+@exec[/usr/bin/newgidmap]: 2000
+@exec[/usr/bin/sleep]: 2000
+@exec[$HOME/.cargo/bin/true]: 2000
+@exec[/usr/local/bin/sleep]: 2000
+@exec[/usr/bin/unshare]: 2000
+@exec[/usr/sbin/sleep]: 2000
+@exec[$HOME/.cargo/bin/sleep]: 2000
+@exec[/usr/local/sbin/unshare]: 2000
+@exec[$HOME/.cargo/bin/newgidmap]: 2000
+@exec[/usr/local/sbin/sleep]: 2000
+@exec[/usr/local/sbin/sh]: 2000
+@exec[/usr/sbin/newuidmap]: 2000
+@exec[/usr/local/bin/unshare]: 2000
+@exec[/usr/local/sbin/newgidmap]: 2000
+@exec[/usr/local/bin/newuidmap]: 2000
+@exec[/usr/sbin/newgidmap]: 2000
+@exec[/usr/local/sbin/true]: 2000
+@exec[/usr/local/bin/sh]: 2000
+@exec[/usr/sbin/unshare]: 2000
+@exec[$HOME/.cargo/bin/sh]: 2000
+@exec[/usr/local/bin/newgidmap]: 2000
+@exec[$HOME/.cargo/bin/newuidmap]: 2000
+@exec[$CARGO_TARGET/release/start-pieces]: 3998
+@exec[/usr/bin/curl]: 4000
+@exec[/usr/local/sbin/curl]: 4000
+@exec[/usr/sbin/curl]: 4000
+@exec[/usr/local/bin/curl]: 4000
+@exec[$HOME/.cargo/bin/curl]: 4000
+@exec[/usr/sbin/ip]: 4001
+@exec[/usr/bin/nsenter]: 9999
+@exec[/usr/sbin/nsenter]: 9999
+@exec[$HOME/.cargo/bin/nsenter]: 10000
+@exec[/usr/local/sbin/nsenter]: 10000
+@exec[/usr/local/bin/nsenter]: 10000
+
+
+
+
+
+@kvm_guest_fault: 0
+
+@netns_new: 32002
+@rcu_exp[podman]: 1
+@rcu_exp[kworker/u768:2]: 12
+@rcu_exp[kworker/20:3]: 60
+@rcu_exp_s[74349]: 5984647861770
+@rcu_exp_s[821320]: 5985154500254
+@rcu_exp_stack[podman, 
+    synchronize_rcu_expedited+0
+    do_umount+344
+    path_umount+148
+    __arm64_sys_umount+176
+    invoke_syscall+100
+    el0_svc_common.constprop.0+276
+    do_el0_svc+40
+    el0_svc+64
+    el0t_64_sync_handler+192
+    el0t_64_sync+440
+]: 1
+@rcu_exp_stack[kworker/u768:2, 
+    synchronize_rcu_expedited+0
+    nf_conntrack_pernet_exit+192
+    ops_undo_list+280
+    cleanup_net+556
+    process_one_work+404
+    worker_thread+412
+    kthread+276
+    ret_from_fork+16
+]: 3
+@rcu_exp_stack[kworker/u768:2, 
+    synchronize_rcu_expedited+0
+    cleanup_net+556
+    process_one_work+404
+    worker_thread+412
+    kthread+276
+    ret_from_fork+16
+]: 3
+@rcu_exp_stack[kworker/u768:2, 
+    synchronize_rcu_expedited+0
+    default_device_exit_batch+260
+    ops_undo_list+280
+    cleanup_net+556
+    process_one_work+404
+    worker_thread+412
+    kthread+276
+    ret_from_fork+16
+]: 6
+@rcu_exp_stack[kworker/20:3, 
+    synchronize_rcu_expedited+0
+    srcu_advance_state+288
+    process_srcu+48
+    process_one_work+404
+    worker_thread+412
+    kthread+276
+    ret_from_fork+16
+]: 30
+@rcu_exp_stack[kworker/20:3, 
+    synchronize_rcu_expedited+0
+    srcu_advance_state+420
+    process_srcu+48
+    process_one_work+404
+    worker_thread+412
+    kthread+276
+    ret_from_fork+16
+]: 30
+@rcu_exp_us: 
+[16, 32)               3 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                     |
+[32, 64)               5 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[64, 128)              0 |                                                    |
+[128, 256)             0 |                                                    |
+[256, 512)             0 |                                                    |
+[512, 1K)              0 |                                                    |
+[1K, 2K)               4 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@           |
+[2K, 4K)               1 |@@@@@@@@@@                                          |
+
+@rcu_sync[kworker/57:0]: 1
+@rcu_sync[kworker/56:5]: 1
+@rcu_sync[kworker/18:4]: 2
+@rcu_sync[systemd]: 3
+@rcu_sync[tokio-rt-worker]: 7
+@rcu_sync[kworker/18:0]: 8
+@rcu_sync[bpftrace]: 12
+@rcu_sync[kworker/20:3]: 72
+@rcu_sync_stack[kworker/56:5, 
+    synchronize_rcu+0
+    process_one_work+404
+    worker_thread+412
+    kthread+276
+    ret_from_fork+16
+]: 1
+@rcu_sync_stack[kworker/57:0, 
+    synchronize_rcu+0
+    process_one_work+404
+    worker_thread+412
+    kthread+276
+    ret_from_fork+16
+]: 1
+@rcu_sync_stack[kworker/18:4, 
+    synchronize_rcu+0
+    srcu_advance_state+420
+    process_srcu+48
+    process_one_work+404
+    worker_thread+412
+    kthread+276
+    ret_from_fork+16
+]: 1
+@rcu_sync_stack[kworker/18:4, 
+    synchronize_rcu+0
+    srcu_advance_state+288
+    process_srcu+48
+    process_one_work+404
+    worker_thread+412
+    kthread+276
+    ret_from_fork+16
+]: 1
+@rcu_sync_stack[tokio-rt-worker, 
+    synchronize_rcu+0
+    alloc_fd+484
+    get_unused_fd_flags+48
+    __do_pipe_flags.part.0+52
+    do_pipe2+192
+    __arm64_sys_pipe2+40
+    invoke_syscall+100
+    el0_svc_common.constprop.0+276
+    do_el0_svc+40
+    el0_svc+64
+    el0t_64_sync_handler+192
+    el0t_64_sync+440
+]: 3
+@rcu_sync_stack[systemd, 
+    synchronize_rcu+0
+    percpu_down_write+52
+    cgroup_procs_write_start+636
+    __cgroup_procs_write+120
+    cgroup_procs_write+40
+    cgroup_file_write+176
+    kernfs_fop_write_iter+368
+    vfs_write+624
+    ksys_write+124
+    __arm64_sys_write+40
+    invoke_syscall+100
+    el0_svc_common.constprop.0+276
+]: 3
+@rcu_sync_stack[kworker/18:0, 
+    synchronize_rcu+0
+    srcu_advance_state+420
+    process_srcu+48
+    process_one_work+404
+    worker_thread+412
+    kthread+276
+    ret_from_fork+16
+]: 4
+@rcu_sync_stack[kworker/18:0, 
+    synchronize_rcu+0
+    srcu_advance_state+288
+    process_srcu+48
+    process_one_work+404
+    worker_thread+412
+    kthread+276
+    ret_from_fork+16
+]: 4
+@rcu_sync_stack[tokio-rt-worker, 
+    synchronize_rcu+0
+    alloc_fd+484
+    get_unused_fd_flags+48
+    __do_pipe_flags.part.0+68
+    do_pipe2+192
+    __arm64_sys_pipe2+40
+    invoke_syscall+100
+    el0_svc_common.constprop.0+276
+    do_el0_svc+40
+    el0_svc+64
+    el0t_64_sync_handler+192
+    el0t_64_sync+440
+]: 4
+@rcu_sync_stack[bpftrace, 
+    synchronize_rcu+0
+    unregister_kretprobe+40
+    __unregister_trace_kprobe+64
+    destroy_local_trace_kprobe+104
+    perf_kprobe_destroy+104
+    __free_event+108
+    _free_event+188
+    put_event+128
+    perf_event_release_kernel+320
+    perf_release+32
+    __fput+216
+    fput_close_sync+76
+]: 5
+@rcu_sync_stack[bpftrace, 
+    synchronize_rcu+0
+    __unregister_trace_kprobe+128
+    destroy_local_trace_kprobe+104
+    perf_kprobe_destroy+104
+    __free_event+108
+    _free_event+188
+    put_event+128
+    perf_event_release_kernel+320
+    perf_release+32
+    __fput+216
+    fput_close_sync+76
+    __arm64_sys_close+68
+]: 7
+@rcu_sync_stack[kworker/20:3, 
+    synchronize_rcu+0
+    srcu_advance_state+420
+    process_srcu+48
+    process_one_work+404
+    worker_thread+412
+    kthread+276
+    ret_from_fork+16
+]: 36
+@rcu_sync_stack[kworker/20:3, 
+    synchronize_rcu+0
+    srcu_advance_state+288
+    process_srcu+48
+    process_one_work+404
+    worker_thread+412
+    kthread+276
+    ret_from_fork+16
+]: 36
+
+@rtnl_hold_us: 
+[0]                 1253 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                 |
+[1]                    0 |                                                    |
+[2, 4)                 0 |                                                    |
+[4, 8)                 1 |                                                    |
+[8, 16)               70 |@                                                   |
+[16, 32)            1857 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[32, 64)              27 |                                                    |
+[64, 128)             22 |                                                    |
+[128, 256)            27 |                                                    |
+[256, 512)             1 |                                                    |
+[512, 1K)              1 |                                                    |
+[1K, 2K)               0 |                                                    |
+[2K, 4K)               0 |                                                    |
+[4K, 8K)               1 |                                                    |
+[8K, 16K)              0 |                                                    |
+[16K, 32K)             0 |                                                    |
+[32K, 64K)             0 |                                                    |
+[64K, 128K)            0 |                                                    |
+[128K, 256K)           0 |                                                    |
+[256K, 512K)           1 |                                                    |
+
+@rtnl_hold_us_by_comm[ip]: 47747
+@rtnl_hold_us_by_comm[kworker/u768:2]: 286817
+@rtnl_hold_us_total: 333447
+@rtnl_holds[kworker/u768:2]: 1261
+@rtnl_holds[ip]: 2000
+@rtnl_req[74349]: 5984747848313
+@rtnl_wait_us: 
+[0]                 1256 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[1]                    0 |                                                    |
+[2, 4)               357 |@@@@@@@@@@@@@@                                      |
+[4, 8)                51 |@@                                                  |
+[8, 16)               25 |@                                                   |
+[16, 32)              31 |@                                                   |
+[32, 64)              38 |@                                                   |
+[64, 128)             40 |@                                                   |
+[128, 256)            66 |@@                                                  |
+[256, 512)           168 |@@@@@@                                              |
+[512, 1K)            303 |@@@@@@@@@@@@                                        |
+[1K, 2K)             253 |@@@@@@@@@@                                          |
+[2K, 4K)             342 |@@@@@@@@@@@@@@                                      |
+[4K, 8K)             261 |@@@@@@@@@@                                          |
+[8K, 16K)             70 |@@                                                  |
+
+@rtnl_wait_us_total: 3936856
+
+

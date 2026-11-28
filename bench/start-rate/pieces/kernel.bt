@@ -1,0 +1,104 @@
+// Kernel costs a piece run causes that perf samples attribute poorly: how long rtnl_mutex is
+// held and waited for, synchronous RCU grace periods, network namespace cleanup, copy-on-write
+// and userfaultfd faults, and KVM exits by exception class (arm64 esr_ec).
+// sudo bpftrace bench/start-rate/pieces/kernel.bt > kernel.txt   (Ctrl-C/SIGINT prints maps)
+
+// rtnl_mutex is traced as a mutex, not through rtnl_lock(): inside rtnetlink.c the compiler
+// inlines rtnl_lock() into its callers (RTM_NEWLINK, RTM_SETLINK, RTM_DELLINK), and a probe on
+// the symbol never fires there. The acquisition is traced with fentry and fexit (kfunc and
+// kretfunc), not a return probe: the kernel keeps 2 x CPUs return-probe instances per probe
+// and drops the rest without a word, so with more threads than that asleep in mutex_lock the
+// holds of the others would go unsummed. @rtnl_requests and @rtnl_acquired count both ends;
+// rtnl.py refuses a dump in which they differ by over 0.5% (the kernel skips an fentry or
+// fexit run that would nest on one CPU, about 1 in 7000 here). The return programs check
+// the lock too: after a skipped return, the thread's next return from mutex_lock on any
+// other mutex would otherwise be taken for the acquisition of this one. Holds are split by the work function for
+// kernel workers (cleanup_net, linkwatch_event, addrconf_dad_work) and by comm otherwise.
+tracepoint:workqueue:workqueue_execute_start { @wq_fn[tid] = (uint64)args->function; }
+tracepoint:workqueue:workqueue_execute_end { delete(@wq_fn[tid]); }
+
+kfunc:vmlinux:mutex_lock, kfunc:vmlinux:mutex_lock_killable, kfunc:vmlinux:mutex_lock_interruptible
+/(uint64)args.lock == kaddr("rtnl_mutex")/ { @rtnl_req[tid] = nsecs; @rtnl_requests = count(); }
+kretfunc:vmlinux:mutex_lock /(uint64)args.lock == kaddr("rtnl_mutex") && @rtnl_req[tid]/ {
+  @rtnl_wait_us = hist((nsecs - @rtnl_req[tid]) / 1000);
+  @rtnl_wait_us_total = sum((nsecs - @rtnl_req[tid]) / 1000);
+  delete(@rtnl_req[tid]);
+  @rtnl_held[tid] = nsecs;
+  @rtnl_acquired = count();
+}
+kretfunc:vmlinux:mutex_lock_killable, kretfunc:vmlinux:mutex_lock_interruptible
+/(uint64)args.lock == kaddr("rtnl_mutex") && @rtnl_req[tid]/ {
+  if (retval == 0) {
+    @rtnl_wait_us = hist((nsecs - @rtnl_req[tid]) / 1000);
+    @rtnl_wait_us_total = sum((nsecs - @rtnl_req[tid]) / 1000);
+    @rtnl_held[tid] = nsecs;
+    @rtnl_acquired = count();
+  } else {
+    @rtnl_interrupted = count();
+  }
+  delete(@rtnl_req[tid]);
+}
+kretfunc:vmlinux:mutex_trylock /(uint64)args.lock == kaddr("rtnl_mutex") && retval == 1/ {
+  @rtnl_held[tid] = nsecs;
+}
+kfunc:vmlinux:mutex_unlock /(uint64)args.lock == kaddr("rtnl_mutex") && @rtnl_held[tid]/ {
+  $us = (nsecs - @rtnl_held[tid]) / 1000;
+  @rtnl_hold_us = hist($us);
+  @rtnl_hold_us_total = sum($us);
+  if (@wq_fn[tid]) {
+    @rtnl_hold_us_by_work[ksym(@wq_fn[tid])] = sum($us);
+    @rtnl_holds_by_work[ksym(@wq_fn[tid])] = count();
+  } else {
+    @rtnl_hold_us_by_comm[comm] = sum($us);
+    @rtnl_holds[comm] = count();
+    @rtnl_hold_us_by_site[comm, kstack(7)] = sum($us);
+  }
+  delete(@rtnl_held[tid]);
+}
+// What the holder is doing on CPU: stacks sampled only while the sampled thread holds the mutex.
+profile:hz:1999 /@rtnl_held[tid]/ { @rtnl_oncpu[kstack(9)] = count(); }
+// rcu_barrier() under the mutex: one per bridge destroyed (br_multicast_dev_del) on kernels
+// without Linux 25ae123db10b, about 13 ms each on 192 CPUs.
+kprobe:rcu_barrier /@rtnl_held[tid]/ { @rcu_barrier_s[tid] = nsecs; }
+kretprobe:rcu_barrier /@rcu_barrier_s[tid]/ {
+  @rcu_barrier_us_under_rtnl = sum((nsecs - @rcu_barrier_s[tid]) / 1000);
+  @rcu_barriers_under_rtnl = count();
+  delete(@rcu_barrier_s[tid]);
+}
+
+kprobe:synchronize_rcu_expedited {
+  @rcu_exp[comm] = count(); @rcu_exp_s[tid] = nsecs; @rcu_exp_stack[comm, kstack(12)] = count();
+}
+kretprobe:synchronize_rcu_expedited /@rcu_exp_s[tid]/ {
+  @rcu_exp_us = hist((nsecs - @rcu_exp_s[tid]) / 1000); delete(@rcu_exp_s[tid]);
+}
+kprobe:synchronize_rcu { @rcu_sync[comm] = count(); @rcu_sync_stack[comm, kstack(12)] = count(); }
+kprobe:synchronize_net { @sync_net[comm] = count(); }
+
+// copy_net_ns(flags, ...) returns the old namespace unless CLONE_NEWNET (0x40000000) is set.
+kprobe:copy_net_ns /arg0 & 0x40000000/ { @netns_new_requests = count(); }
+kprobe:kvm_create_vm { @kvm_create_s[tid] = nsecs; }
+kretprobe:kvm_create_vm /@kvm_create_s[tid]/ {
+  @kvm_create_vm_us = hist((nsecs - @kvm_create_s[tid]) / 1000); delete(@kvm_create_s[tid]);
+}
+kprobe:kvm_destroy_vm { @kvm_destroy_s[tid] = nsecs; }
+kretprobe:kvm_destroy_vm /@kvm_destroy_s[tid]/ {
+  @kvm_destroy_vm_us = hist((nsecs - @kvm_destroy_s[tid]) / 1000); delete(@kvm_destroy_s[tid]);
+}
+kprobe:cleanup_net { @cleanup_s[tid] = nsecs; }
+kretprobe:cleanup_net /@cleanup_s[tid]/ {
+  @cleanup_net_ms = hist((nsecs - @cleanup_s[tid]) / 1000000); delete(@cleanup_s[tid]);
+}
+
+kprobe:wp_page_copy { @cow[comm] = count(); }
+kprobe:handle_userfault { @uffd_fault[comm] = count(); }
+
+tracepoint:kvm:kvm_exit { @kvm_exit_ec[args->esr_ec] = count(); }
+tracepoint:kvm:kvm_userspace_exit { @kvm_uexit[args->reason] = count(); }
+tracepoint:kvm:kvm_guest_fault { @kvm_guest_fault = count(); }
+
+tracepoint:syscalls:sys_enter_execve { @exec[str(args->filename)] = count(); }
+
+END { clear(@wq_fn); clear(@rtnl_req); clear(@rtnl_held); clear(@rcu_barrier_s); clear(@rcu_exp_s);
+      clear(@kvm_create_s); clear(@kvm_destroy_s); clear(@cleanup_s); }
+

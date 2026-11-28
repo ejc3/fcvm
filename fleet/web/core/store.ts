@@ -20,6 +20,7 @@ import {
   type FleetState,
   type IntentMsg,
   type IntentName,
+  type MinecraftStatusMsg,
   type ReceiptMsg,
 } from "./protocol.ts";
 import type { Family, FamilyVia } from "./net.ts";
@@ -226,6 +227,8 @@ export interface ClientState {
   lastInputLatencyMs: number | null;
   protocolErrors: number;
   lastProtocolError: string | null;
+  /** Minecraft mode: each host's last status rows (by the host's key), with when they arrived (local ms). */
+  minecraftStatus: Record<string, MinecraftStatusMsg & { at: number }>;
   /** The last message the coordinator sent as {type:"error"}. */
   serverError: string | null;
   /** This connection's viewer id, once the coordinator says it. */
@@ -306,6 +309,7 @@ export function initialState(): ClientState {
     cameraWatches: [],
     lastInputLatencyMs: null,
     protocolErrors: 0,
+    minecraftStatus: {},
     lastProtocolError: null,
     serverError: null,
     you: null,
@@ -484,6 +488,8 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
       switch (msg.type) {
         case "clock":
           return { ...s, clock: clockReceived(s.clock, msg.server_unix_ms, e.at, msg.client_unix_ms) };
+        case "minecraft_status":
+          return { ...s, minecraftStatus: { ...s.minecraftStatus, [msg.host]: { ...msg, at: e.at } } };
         case "error":
           return { ...s, serverError: msg.reason };
         case "hello": {

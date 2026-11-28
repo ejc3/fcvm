@@ -17,6 +17,7 @@
   --fcvm-soft: #cfe8ff;
   --ec2: #f5a524;
   --ec2-soft: #ffe2b0;
+  --lambda: #c9a2ff;
   --refused: #ff9a8c;
   --hatch: repeating-linear-gradient(135deg, rgba(245, 165, 36, 0.55) 0 5px, rgba(245, 165, 36, 0.12) 5px 10px);
   --sans: "IBM Plex Sans", system-ui, sans-serif;
@@ -121,6 +122,7 @@ a.icon-btn { text-decoration: none; }
 .relit.fresh { animation: relit 250ms ease-out both; }
 .relit.fcvm { --accent: var(--fcvm); }
 .relit.ec2 { --accent: var(--ec2); }
+.relit.lambda { --accent: var(--lambda); }
 @keyframes relit { from { box-shadow: inset 0 0 0 4px var(--accent), 0 0 24px var(--accent); } to { box-shadow: inset 0 0 0 0 transparent, 0 0 0 transparent; } }
 .relit .chip { position: absolute; right: 6px; top: 6px; padding: 1px 7px; border-radius: 4px; background: rgba(6, 8, 11, 0.86); color: var(--accent); font: 600 14px/1.3 var(--mono); font-variant-numeric: tabular-nums; transition: right 400ms ease-out, top 400ms ease-out, transform 400ms ease-out, font-size 400ms ease-out; }
 .relit.fresh .chip { right: 50%; top: 50%; transform: translate(50%, -50%); font-size: clamp(16px, 2.2vw, 30px); padding: 2px 10px; }
@@ -130,6 +132,7 @@ a.icon-btn { text-decoration: none; }
 .half-clock.done .value { font-weight: 600; }
 .half-clock.fcvm .value { color: var(--fcvm); }
 .half-clock.ec2 .value { color: var(--ec2); }
+.half-clock.lambda .value { color: var(--lambda); }
 .half-clock.done.fcvm .value::after { content: " ✓"; font-size: 0.5em; }
 .half-clock .sub { font-size: 18px; color: var(--text); }
 .half-clock .hatch-line { padding: 2px 10px; border-radius: 4px; background-image: var(--hatch); background-color: rgba(6, 8, 11, 0.6); font-size: 15px; color: var(--ec2-soft); }

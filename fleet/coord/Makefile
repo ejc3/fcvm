@@ -13,4 +13,4 @@ image:
 	trap 'rm -rf "$$context"' EXIT; \
 	cp "$(FCVM)" "$$context/fcvm"; \
 	cp Containerfile "$$context/Containerfile"; \
-	$(ENGINE) build --label "org.opencontainers.image.revision=$(TAG)" -t "$(IMAGE)" -f "$$context/Containerfile" "$$context"
+	$(ENGINE) build --label "org.opencontainers.image.revision=$(TAG)" --build-arg "COMMIT=$(TAG)" -t "$(IMAGE)" -f "$$context/Containerfile" "$$context"

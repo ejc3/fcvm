@@ -62,6 +62,12 @@ pub enum Event {
         at: u64,
         report: SlotReport,
     },
+    /// The Lambda driver's report about one Lambda tile (`lam-<n>`). `vm` names the
+    /// execution environment the tile runs in (none while it has none).
+    Lambda {
+        at: u64,
+        report: SlotReport,
+    },
     /// A coordinator component degraded (`reason`) or recovered (`None`).
     Degraded {
         at: u64,
@@ -86,6 +92,11 @@ pub enum Event {
         at: u64,
         report: crate::protocol::HealthReport,
     },
+    /// A Lambda tile's renderer health, read by the coordinator over the tile's tunnel.
+    LambdaHealth {
+        at: u64,
+        report: crate::protocol::HealthReport,
+    },
     /// The GPU hosts' instances, listed while the fleet wakes.
     ScaleInstances {
         at: u64,
@@ -97,6 +108,10 @@ pub enum Event {
         at: u64,
         usd_per_hour: f64,
         instances: u32,
+        /// The same rate split by backing (`hosts`, `ec2`, `lambda`), when the meter splits
+        /// it; the parts add up to `usd_per_hour`.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        by_backing: std::collections::BTreeMap<String, f64>,
     },
     /// UTC epoch day requested by the production budget drill, or `None` to restore the configured ceiling.
     BudgetDrill {
@@ -115,7 +130,7 @@ pub enum Event {
     /// answers them from the state this event is applied to.
     Published {
         at: u64,
-        /// The slot or tile id (`slot-<n>`, `ec2-<n>`).
+        /// The slot or tile id (`slot-<n>`, `ec2-<n>`, `lam-<n>`).
         slot: String,
         names: crate::state::Published,
     },
@@ -139,10 +154,12 @@ impl Event {
             | Event::Agent { at, .. }
             | Event::AgentGone { at, .. }
             | Event::Ec2 { at, .. }
+            | Event::Lambda { at, .. }
             | Event::Degraded { at, .. }
             | Event::ReleaseQuarantine { at, .. }
             | Event::Visibility { at, .. }
             | Event::Ec2Health { at, .. }
+            | Event::LambdaHealth { at, .. }
             | Event::ScaleInstances { at, .. }
             | Event::Burn { at, .. }
             | Event::BudgetDrill { at, .. }
@@ -252,6 +269,16 @@ pub enum Intent {
     PotatoFaster,
     /// Potato mode: start the current size again.
     PotatoRestart,
+    /// Pages mode: put a short text on every page. Needs the text check's verdict.
+    RendersOverlay {
+        text: String,
+    },
+    /// Pages mode: apply one of the named transforms to every page.
+    RendersTransform {
+        name: String,
+    },
+    /// Pages mode: take the text and the transform away.
+    RendersClear,
 }
 
 fn opt_str(args: &serde_json::Value, key: &str, what: &str) -> Result<Option<String>, String> {
@@ -445,6 +472,34 @@ impl Intent {
             }),
             "potato_faster" => Ok(Intent::PotatoFaster),
             "potato_restart" => Ok(Intent::PotatoRestart),
+            "renders_overlay" => Ok(Intent::RendersOverlay {
+                text: crate::renders::normalise_overlay(
+                    args.get("text")
+                        .and_then(|v| v.as_str())
+                        .ok_or("args.text must be a string")?,
+                )?,
+            }),
+            "renders_transform" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or("args.name must be a string")?;
+                if crate::renders::chromium_only(name).is_none() {
+                    return Err(format!(
+                        "args.name must be one of {}",
+                        crate::renders::TRANSFORMS_BOTH
+                            .iter()
+                            .chain(crate::renders::TRANSFORMS_CHROMIUM_ONLY.iter())
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                Ok(Intent::RendersTransform {
+                    name: name.to_string(),
+                })
+            }
+            "renders_clear" => Ok(Intent::RendersClear),
             "phones_zoom" => Ok(Intent::PhonesZoom {
                 out: args
                     .get("out")

@@ -181,6 +181,9 @@ test("opening a phone shows its restore time and details beside it, other phones
   await expect(panel.getByRole("heading", { name: "Phone 2" })).toBeVisible();
   await expect(page.getByTestId("phone-state")).toHaveText(/^Phone restored in \d+\.\d s$/);
   await expect(page.getByTestId("phone-rows")).toContainText("fleet-phone-2");
+  await expect(page.getByTestId("phone-rows")).toContainText("648");
+  await expect(page.getByRole("meter", { name: "GPU utilisation" })).toBeVisible();
+  await expect(page.getByRole("meter", { name: "CPU" })).toBeVisible();
   await expect(page.getByTestId("timeline")).toContainText("snapshot restored");
   await expect(bezels(page)).toHaveCount(1);
   const v = await view(page);
@@ -322,23 +325,70 @@ async function takeOver(page: Page, n: number): Promise<void> {
   await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "yours");
 }
 const tapTarget = async (page: Page, name: "video" | "mirror") => (await view(page)).taps?.targets.find((t) => t.name === name) ?? null;
+/** The tap target once its box has stopped changing: the same box on three reads 100 ms apart.
+ *  The phone is fitted again whenever the panel beside it, the sheet under it or the window changes
+ *  size, and the page maps a click through the box it draws at click time, so a box read before an
+ *  earlier step is not where to aim (#2177). */
+async function settledTarget(page: Page, name: "video" | "mirror") {
+  type Target = NonNullable<Awaited<ReturnType<typeof tapTarget>>>;
+  let last: Target | null = null;
+  let equal = 0;
+  await expect
+    .poll(async () => {
+      const now = await tapTarget(page, name);
+      equal = now !== null && last !== null && JSON.stringify(now.box) === JSON.stringify(last.box) ? equal + 1 : 0;
+      last = now;
+      return equal;
+    }, { intervals: [100] })
+    .toBeGreaterThanOrEqual(2);
+  return last!;
+}
+/** Click near the fraction (fx, fy) of the tap target as it is drawn now, on a whole pixel: a mouse
+ *  event carries whole CSS pixels, and one pixel of the phone-sized layout's screen (about 150 px
+ *  wide) is 0.0066 of its width. Returns the target and the fractions of the pixel clicked, which
+ *  is what the phone must be sent (#2177: aiming at 0.75 and expecting 0.75 failed on a layout
+ *  whose box put that point 0.9 px from a whole pixel). */
+async function clickTarget(page: Page, name: "video" | "mirror", fx: number, fy: number) {
+  const t = await settledTarget(page, name);
+  const px = Math.round(t.box.x + fx * t.box.w);
+  const py = Math.round(t.box.y + fy * t.box.h);
+  await page.mouse.click(px, py);
+  // a fit during the click would make the fractions below those of another box
+  expect((await tapTarget(page, name))?.box, "the phone was fitted again during the click").toEqual(t.box);
+  return { ...t, fx: (px - t.box.x) / t.box.w, fy: (py - t.box.y) / t.box.h };
+}
 
-test("a click on the held phone's screen is a tap there, in the video and in the GPU mirror; a click on the bezel sends nothing", async ({ page }) => {
+// Two layouts: the panel beside the phone, and a phone-sized screen, where the panel is a sheet
+// under it and the phone's screen is small.
+const SCREENS = [
+  { name: "", narrow: false },
+  { name: " (phone-sized screen)", narrow: true },
+];
+/** The test's page, or one in a 390 x 780 viewport of its own context (the test closes it): the phones page, open. */
+async function onScreen(narrow: boolean, page: Page, browser: Browser): Promise<Page> {
+  if (narrow) return viewer(browser, 390, 780);
   await openPhones(page);
+  return page;
+}
+
+for (const screen of SCREENS)
+  test(`a click on the held phone's screen is a tap there, in the video and in the GPU mirror; a click on the bezel sends nothing${screen.name}`, async ({ page: wide, browser }) => {
+  const page = await onScreen(screen.narrow, wide, browser);
+  if (screen.narrow) await expect(page.getByTestId("phone-panel")).toHaveCount(0);
   await takeOver(page, 3);
+  if (screen.narrow) await expect(page.getByTestId("phone-panel")).toHaveClass(/narrow/);
   const session = (await mockPhones()).tiles[2]!.borrowed!.session;
   await expect(page.getByTestId("phone-tap-video")).toBeVisible();
   expect(await page.getByTestId("phone-tap-video").evaluate((el) => getComputedStyle(el).cursor)).toBe("pointer");
-  const t = (await tapTarget(page, "video"))!;
-  const card = (await view(page)).cards.find((c) => c.id === "phone:3")!;
+  const t = await clickTarget(page, "video", 0.25, 0.6);
   // the target is the drawn screen, inside the bezel
+  const card = (await view(page)).cards.find((c) => c.id === "phone:3")!;
   expect(t.box).toEqual(card.box);
-  await page.mouse.click(t.box.x + 0.25 * t.box.w, t.box.y + 0.6 * t.box.h);
   await expect.poll(async () => (await taps()).length).toBe(1);
   const [first] = await taps();
   expect([first!.phone, first!.session]).toEqual(["phone-3", session]);
-  expect(first!.x).toBeCloseTo(0.25, 2);
-  expect(first!.y).toBeCloseTo(0.6 * t.yScale, 2);
+  expect(first!.x).toBeCloseTo(t.fx, 3);
+  expect(first!.y).toBeCloseTo(t.fy * t.yScale, 3);
   // the bezel: inside the body, outside the screen
   const b = card.bezel!;
   await page.mouse.click(b.x + card.pad.left / 2, b.y + b.h / 2);
@@ -346,19 +396,79 @@ test("a click on the held phone's screen is a tap there, in the video and in the
   await page.waitForTimeout(400);
   expect(await taps()).toHaveLength(1);
   await expect(page.getByTestId("phone-notice")).toHaveCount(0);
+  // where Robot Park draws its Info tab: the right half of the bar along the screen's bottom
+  const bar = await clickTarget(page, "video", 0.75, 0.95);
+  await expect.poll(async () => (await taps()).length).toBe(2);
+  const info = (await taps())[1]!;
+  expect(info.x).toBeCloseTo(bar.fx, 3);
+  expect(info.y).toBeCloseTo(bar.fy * bar.yScale, 3);
+  // the page drops a click sooner than 210 ms after the last tap it sent
+  await page.waitForTimeout(300);
+  // a smaller window fits the phone again: a click lands on the fraction of the screen as drawn now
+  const size = page.viewportSize()!;
+  await page.setViewportSize({ width: size.width - 40, height: size.height - 120 });
+  await expect.poll(async () => (await tapTarget(page, "video"))?.box).not.toEqual(bar.box);
+  const refit = await clickTarget(page, "video", 0.25, 0.9);
+  expect(refit.box).not.toEqual(bar.box);
+  await expect.poll(async () => (await taps()).length).toBe(3);
+  const after = (await taps())[2]!;
+  expect(after.x).toBeCloseTo(refit.fx, 3);
+  expect(after.y).toBeCloseTo(refit.fy * refit.yScale, 3);
+  await page.setViewportSize(size);
+  await page.waitForTimeout(300);
   // the GPU mirror beside the video takes taps the same way
   await page.getByTestId("phone-view-both").click();
   await expect(page.getByTestId("phone-tap-mirror")).toBeVisible();
-  const m = (await tapTarget(page, "mirror"))!;
+  const m = await clickTarget(page, "mirror", 0.75, 0.1);
   expect(m.box).toEqual((await view(page)).mirror!.box);
-  await page.mouse.click(m.box.x + 0.75 * m.box.w, m.box.y + 0.1 * m.box.h);
-  await expect.poll(async () => (await taps()).length).toBe(2);
-  const second = (await taps())[1]!;
-  expect(second.x).toBeCloseTo(0.75, 2);
-  expect(second.y).toBeCloseTo(0.1 * m.yScale, 2);
+  await expect.poll(async () => (await taps()).length).toBe(4);
+  const second = (await taps())[3]!;
+  expect(second.x).toBeCloseTo(m.fx, 3);
+  expect(second.y).toBeCloseTo(m.fy * m.yScale, 3);
   await expect(page.getByTestId("phone-notice")).toHaveCount(0);
   await page.getByTestId("phone-give-back").click();
   await expect(page.getByTestId("phone-tap-video")).toHaveCount(0);
+  if (screen.narrow) await page.context().close();
+});
+
+for (const screen of SCREENS)
+  test(`a click on the screen of an opened phone that is not held sends nothing: the line under it says to take the phone over, and the Take over button takes focus${screen.name}`, async ({ page: wide, browser }) => {
+  const page = await onScreen(screen.narrow, wide, browser);
+  // in the overview a phone is one button that opens it, and says so
+  const hit = page.getByTestId("phone-hit-phone:2");
+  await expect(hit).toHaveAttribute("title", "Open Phone 2");
+  await expect(hit).toHaveAccessibleName(/^Open Phone 2: /);
+  await hit.click();
+  const note = page.getByTestId("phone-tap-note");
+  await expect(note).toHaveText("Take over this phone to tap its screen.");
+  await expect(note).not.toHaveClass(/asked/);
+  const take = page.getByTestId("phone-take");
+  await expect(take).not.toBeFocused();
+  const lock = (await view(page)).taps!.locked!;
+  expect(lock.box).toEqual((await view(page)).cards.find((c) => c.id === "phone:2")!.box);
+  // where Robot Park draws its Info tab
+  await page.mouse.click(lock.box.x + 0.75 * lock.box.w, lock.box.y + 0.95 * lock.box.h);
+  await expect(note).toHaveClass(/asked/);
+  await expect(take).toBeFocused();
+  await expect(take).toHaveAttribute("data-asked", "true");
+  await page.waitForTimeout(400);
+  expect(await phoneActions()).toEqual([]);
+  await expect(page.getByTestId("phone-notice")).toHaveCount(0);
+  // the button's outline goes when focus leaves it; the line under the screen stays marked
+  await take.blur();
+  await expect(take).not.toHaveAttribute("data-asked");
+  await expect(note).toHaveClass(/asked/);
+  // taken over, the same click is a tap on the phone
+  await take.click();
+  await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "yours");
+  await expect(page.getByTestId("phone-tap-locked")).toHaveCount(0);
+  await expect(page.getByTestId("phone-tap-note")).toHaveCount(0);
+  const t = (await tapTarget(page, "video"))!;
+  await page.mouse.click(t.box.x + 0.75 * t.box.w, t.box.y + 0.95 * t.box.h);
+  await expect.poll(async () => (await taps()).map((a) => a.phone)).toEqual(["phone-2"]);
+  await page.getByTestId("phone-give-back").click();
+  await expect(page.getByTestId("phone-borrow")).not.toHaveAttribute("data-kind", "yours");
+  if (screen.narrow) await page.context().close();
 });
 
 test("on a host that does not list tap the screen takes no taps: a click sends nothing and shows no refusal", async ({ page }) => {

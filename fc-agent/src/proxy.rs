@@ -592,6 +592,13 @@ async fn relay_connection(
     dest_port: u16,
     state: Arc<ProxyState>,
 ) -> anyhow::Result<()> {
+    // DATA frames from the host are written to the application as they arrive.
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    crate::relay_socket::set_relay_nodelay(
+        &client,
+        &WARNED,
+        format_args!("egress proxy, application socket"),
+    );
     // Assign stream ID
     let stream_id = state.next_stream_id.fetch_add(1, Ordering::Relaxed);
     let open_stream = OpenStream::register(stream_id, SocketAddr::new(dest_addr, dest_port));
@@ -673,9 +680,15 @@ async fn relay_connection(
         while let Some((frame_type, payload)) = stream_rx.recv().await {
             match frame_type {
                 FRAME_DATA => {
+                    let (payload, end) = crate::relay_socket::take_queued_data(
+                        payload,
+                        &mut stream_rx,
+                        FRAME_DATA,
+                        &[FRAME_CLOSE, FRAME_RST],
+                    );
                     // Recorded on arrival from the host, before the client takes it.
                     activity.record(RECEIVED, payload.len());
-                    if client_wr.write_all(&payload).await.is_err() {
+                    if client_wr.write_all(&payload).await.is_err() || end.is_some() {
                         break;
                     }
                 }
@@ -1008,6 +1021,103 @@ mod tests {
         assert!(line.contains("awaiting a reply"), "{line}");
         stream.record(RECEIVED, 5);
         assert!(stream.describe(stamp - 1).contains("relaying"));
+    }
+
+    /// A reply the destination sends in two parts reaches the application without
+    /// waiting for the application to acknowledge the first part: each DATA frame is
+    /// written to the application's socket as it arrives.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reply_in_two_frames_reaches_the_application_without_waiting_for_an_ack() {
+        use crate::relay_socket::two_part::*;
+        let (writer_tx, mut writer_rx) = mpsc::channel(16);
+        let state = Arc::new(ProxyState {
+            streams: DashMap::new(),
+            writer_tx,
+            next_stream_id: AtomicU32::new(1),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut app = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        app.set_nodelay(true).unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        let relay = tokio::spawn(relay_connection(
+            accepted,
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 78)),
+            4432,
+            state.clone(),
+        ));
+        let open = writer_rx.recv().await.unwrap();
+        assert_eq!(open[4], FRAME_OPEN);
+        let stream_id = u32::from_le_bytes(open[0..4].try_into().unwrap());
+        let send = |frame_type: u8, payload: &[u8]| {
+            state
+                .streams
+                .get(&stream_id)
+                .unwrap()
+                .send((frame_type, payload.to_vec()))
+                .unwrap();
+        };
+        send(FRAME_OPEN_OK, &[]);
+        let mut took = Vec::with_capacity(ROUNDS);
+        let mut buf = vec![0u8; SECOND];
+        for _ in 0..ROUNDS {
+            quickack_off(&app);
+            let started = std::time::Instant::now();
+            send(FRAME_DATA, &[1u8; FIRST]);
+            app.read_exact(&mut buf[..FIRST]).await.unwrap();
+            send(FRAME_DATA, &[2u8; SECOND]);
+            app.read_exact(&mut buf[..SECOND]).await.unwrap();
+            took.push(started.elapsed());
+            tokio::time::sleep(BETWEEN_ROUNDS).await;
+        }
+        send(FRAME_CLOSE, &[]);
+        drop(app);
+        relay.await.unwrap().unwrap();
+        let median = median(took);
+        assert!(
+            median < LIMIT,
+            "median {median:?} for a reply in two frames"
+        );
+    }
+
+    /// DATA frames and a CLOSE queued together reach the application as every byte and
+    /// then end of stream: the CLOSE the writer gathers behind the DATA is acted on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn data_and_close_queued_together_deliver_every_byte_then_end_of_stream() {
+        let (writer_tx, mut writer_rx) = mpsc::channel(16);
+        let state = Arc::new(ProxyState {
+            streams: DashMap::new(),
+            writer_tx,
+            next_stream_id: AtomicU32::new(1),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut app = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        let relay = tokio::spawn(relay_connection(
+            accepted,
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 79)),
+            4433,
+            state.clone(),
+        ));
+        let open = writer_rx.recv().await.unwrap();
+        let stream_id = u32::from_le_bytes(open[0..4].try_into().unwrap());
+        let tx = state.streams.get(&stream_id).unwrap().clone();
+        tx.send((FRAME_OPEN_OK, Vec::new())).unwrap();
+        // All queued before the relay's writer runs, on this one-thread runtime.
+        tx.send((FRAME_DATA, b"one ".to_vec())).unwrap();
+        tx.send((FRAME_DATA, b"two".to_vec())).unwrap();
+        tx.send((FRAME_CLOSE, Vec::new())).unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), app.read_to_end(&mut got))
+            .await
+            .expect("the application saw no end of stream after the CLOSE")
+            .unwrap();
+        assert_eq!(got, b"one two");
+        drop(app);
+        relay.await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

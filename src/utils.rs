@@ -104,6 +104,23 @@ impl DirEventSource for Option<DirWatch> {
     }
 }
 
+/// Open the lock file `path`, which many starts share (a snapshot's locks and reflink
+/// slots), for writing: an existing one without O_CREAT, and create it only when it is
+/// missing. An open with O_CREAT takes the directory's inode lock for writing even when the
+/// file exists (`lookup_open`), and on btrfs the holder of that lock can wait out a
+/// transaction commit, so every clone of a snapshot opening its locks that way took turns on
+/// the snapshot's directory (tests/test_start_dir_reads.rs). Never truncates.
+pub fn open_shared_lock_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    match std::fs::OpenOptions::new().write(true).open(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path),
+        opened => opened,
+    }
+}
+
 /// The host clock as time since the Unix epoch.
 pub fn host_clock_now() -> Duration {
     std::time::SystemTime::now()
@@ -585,6 +602,38 @@ pub fn log_console_line_under_fcvm(clean: &str) -> bool {
     true
 }
 
+/// The target of fc-agent's lines that reached fcvm on the output vsock connection and not
+/// on the serial console: a restore's progress lines. Apart from [`CONSOLE_TARGET`], so a
+/// line under that target is still proof that the guest's serial console works.
+pub const AGENT_TARGET: &str = "fcvm::agent";
+
+/// One `agent` line of the output connection, `<when> <line>`: when the guest logged the
+/// line, by its own clock in microseconds since the Unix epoch, and fc-agent's line. The
+/// time is returned in the form of fcvm's log timestamps (UTC, microseconds). None when
+/// the content has no such stamp.
+pub fn parse_agent_line(content: &str) -> Option<(String, &str)> {
+    let (when, line) = content.split_once(' ')?;
+    let when = jiff::Timestamp::from_microsecond(when.parse().ok()?).ok()?;
+    Some((when.strftime("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(), line))
+}
+
+/// Log one `agent` line of the output connection at the level its console form has: an
+/// agent error at WARN, anything else at INFO, under [`AGENT_TARGET`]. `logged` is when the
+/// guest logged it, which is before fcvm received it: the agent holds a restore's progress
+/// lines until the host has acknowledged the restore. A line without a stamp is logged
+/// whole, with no `logged`.
+pub fn log_agent_line(content: &str) {
+    let Some((logged, line)) = parse_agent_line(content) else {
+        tracing::info!(target: "fcvm::agent", "{}", content);
+        return;
+    };
+    if console_line_is_an_agent_error(line) {
+        tracing::warn!(target: "fcvm::agent", %logged, "{}", line);
+    } else {
+        tracing::info!(target: "fcvm::agent", %logged, "{}", line);
+    }
+}
+
 /// Log `clean` at WARN under `fcvm::guest` when it is a guest kernel crash
 /// headline, and say whether it was. The console's own targets (`firecracker`,
 /// `cloud-hypervisor`) are outside `fcvm`, so a log filtered to fcvm's targets
@@ -751,154 +800,12 @@ pub async fn run_streaming(
     Ok(spawned.child.wait().await?)
 }
 
-/// Result of waiting for namespace readiness.
-#[derive(Debug, PartialEq)]
-pub enum NamespaceReadyResult {
-    /// Namespace is ready (uid_map/gid_map written, nsenter probe succeeded)
-    Ready,
-    /// Holder process died while waiting
-    HolderDied,
-    /// Deadline expired while holder was still alive
-    TimedOut,
-}
-
-/// Wait for a user namespace to be ready by checking uid_map.
-///
-/// When `unshare --user` creates a namespace, the uid_map initially has
-/// an identity mapping "0 0 4294967295" before the actual mapping is written
-/// (externally by `setup_namespace_mappings()`).
-/// setns() fails with EINVAL until the real mapping (e.g., "0 1000 1") is written.
-///
-/// This function polls uid_map until it no longer contains the identity mapping,
-/// then verifies nsenter works. It checks holder liveness on each iteration to
-/// short-circuit if the holder dies.
-///
-/// # Arguments
-/// * `holder_pid` - PID of the namespace holder process
-/// * `deadline` - Absolute deadline for readiness
-///
-/// # Returns
-/// `NamespaceReadyResult` indicating ready, holder died, or timed out
-pub async fn wait_for_namespace_ready(
-    holder_pid: u32,
-    deadline: std::time::Instant,
-) -> NamespaceReadyResult {
-    use tracing::{debug, info, warn};
-
-    let uid_map_path = format!("/proc/{}/uid_map", holder_pid);
-    let mut iterations = 0u32;
-
-    loop {
-        iterations += 1;
-
-        // Check if uid_map exists and has been properly written
-        match tokio::fs::read_to_string(&uid_map_path).await {
-            Ok(content) => {
-                let trimmed = content.trim();
-                // Namespace is ready when:
-                // 1. uid_map is not empty (has been written)
-                // 2. Does not contain identity mapping (4294967295)
-                //
-                // On host: initial mapping is "0 0 4294967295", replaced with "0 1000 1"
-                // In container: initial mapping is empty, replaced with "0 0 1"
-                //
-                // ALSO check gid_map - both must be written for setns() to succeed
-                let gid_map_path = format!("/proc/{}/gid_map", holder_pid);
-                let gid_map = tokio::fs::read_to_string(&gid_map_path)
-                    .await
-                    .unwrap_or_default();
-                let gid_trimmed = gid_map.trim();
-
-                if !trimmed.is_empty() && !gid_trimmed.is_empty() && !content.contains("4294967295")
-                {
-                    // Maps are written - now verify nsenter actually works
-                    // Some kernel states require additional settling time
-                    let probe = tokio::process::Command::new("nsenter")
-                        .args([
-                            "-t",
-                            &holder_pid.to_string(),
-                            "-U",
-                            "-n",
-                            "--preserve-credentials",
-                            "--",
-                            "true",
-                        ])
-                        .output()
-                        .await;
-
-                    match probe {
-                        Ok(output) if output.status.success() => {
-                            info!(
-                                holder_pid = holder_pid,
-                                iterations = iterations,
-                                uid_map = %trimmed,
-                                gid_map = %gid_trimmed,
-                                "namespace ready (nsenter probe succeeded)"
-                            );
-                            return NamespaceReadyResult::Ready;
-                        }
-                        Ok(output) => {
-                            // nsenter failed even though maps are written - continue waiting
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            debug!(
-                                holder_pid = holder_pid,
-                                iterations = iterations,
-                                stderr = %stderr.trim(),
-                                "nsenter probe failed, continuing to wait"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(holder_pid = holder_pid, error = %e, "nsenter probe spawn failed");
-                            return NamespaceReadyResult::HolderDied;
-                        }
-                    }
-                }
-
-                // Log what we're waiting for
-                if iterations == 1 || iterations.is_multiple_of(50) {
-                    debug!(
-                        holder_pid = holder_pid,
-                        iterations = iterations,
-                        uid_map_empty = trimmed.is_empty(),
-                        gid_map_empty = gid_trimmed.is_empty(),
-                        has_identity = content.contains("4294967295"),
-                        "waiting for namespace to be ready"
-                    );
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Process died — /proc/{pid} gone
-                if !is_process_alive(holder_pid) {
-                    debug!(
-                        holder_pid = holder_pid,
-                        "holder process died while waiting for uid_map"
-                    );
-                    return NamespaceReadyResult::HolderDied;
-                }
-            }
-            Err(e) => {
-                warn!(holder_pid = holder_pid, error = %e, "failed to read uid_map");
-                return NamespaceReadyResult::HolderDied;
-            }
-        }
-
-        if std::time::Instant::now() >= deadline {
-            warn!(
-                holder_pid = holder_pid,
-                iterations = iterations,
-                "namespace not ready, deadline expired"
-            );
-            return NamespaceReadyResult::TimedOut;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-}
-
 /// Network/user/mount-namespace isolation to apply to a spawned VMM process before exec.
 ///
 /// VMM-neutral: both Firecracker and Cloud Hypervisor run as a child process inside the
 /// same namespaces with the same parent-death signal. See [`install_namespace_pre_exec`].
-#[derive(Debug, Clone, Default)]
+/// No `Default`: every spawn site names its [`Self::decision`].
+#[derive(Debug, Clone)]
 pub struct NamespaceParams {
     /// VM id, for log context only.
     pub vm_id: String,
@@ -911,6 +818,43 @@ pub struct NamespaceParams {
     pub net_namespace_path: Option<std::path::PathBuf>,
     /// The mount namespace a restored clone's VMM runs in. See [`MountRedirects`].
     pub mount_redirects: Option<MountRedirects>,
+    /// Descriptors the VMM keeps open across its exec, and so until it exits. A VM in a
+    /// pooled namespace passes its lease here ([`crate::netpool`]): the pool takes the
+    /// namespace back only when every holder of the lease is gone, and the VMM is the
+    /// process that must be gone before another VM gets its TAP. Each stays close-on-exec in
+    /// this process, so no other child inherits it.
+    ///
+    /// These are descriptor numbers, not owned descriptors, as are the `/proc/self/fd/N`
+    /// paths a lease gives for its namespaces. A number means what it meant only while
+    /// the lease that owns the descriptor is alive and unmoved: a clone spawns its VMM
+    /// while it holds the lease (and again from the same lease after a guest reboot), and
+    /// drops the lease only after the VMM has exited.
+    pub keep_fds: Vec<std::os::fd::RawFd>,
+    /// Whether the VMM is confined, from [`crate::confine::resolve`]. Confined, the
+    /// process layer runs after the namespaces are entered; it needs
+    /// `user_namespace_path`, because it drops capabilities held in that namespace.
+    pub decision: crate::confine::Decision,
+    /// When confined: the namespace's persistent TAP, made owned by the VMM's uid before
+    /// its capabilities are dropped ([`crate::confine::own_tap`]), so the VMM can attach
+    /// to it without CAP_NET_ADMIN. Only an unpooled namespace, which is this VM's alone.
+    pub tap_owner: Option<String>,
+}
+
+impl NamespaceParams {
+    /// No namespace, no redirect, no kept descriptor: what a site adds to with struct update
+    /// syntax. The decision cannot be left out.
+    pub fn new(vm_id: impl Into<String>, decision: crate::confine::Decision) -> Self {
+        Self {
+            vm_id: vm_id.into(),
+            namespace_id: None,
+            user_namespace_path: None,
+            net_namespace_path: None,
+            mount_redirects: None,
+            keep_fds: Vec::new(),
+            decision,
+            tap_owner: None,
+        }
+    }
 }
 
 /// The mount namespace that gives a restored clone's VMM its own directories at the
@@ -971,9 +915,18 @@ impl MountRedirects {
                 }
             }
         }
+        // A kept directory inside the view gets its parents as well: one in a bucket the
+        // view holds a mountpoint in (`vm-disks/<bucket>/<vm_id>`) is two levels down.
         for dir in &self.keep {
-            if dir.parent() == Some(self.view.as_path()) && !dirs.contains(dir) {
-                dirs.push(dir.clone());
+            let Ok(relative) = dir.strip_prefix(&self.view) else {
+                continue;
+            };
+            let mut at = self.view.clone();
+            for component in relative.components() {
+                at.push(component);
+                if !dirs.contains(&at) {
+                    dirs.push(at.clone());
+                }
             }
         }
         dirs
@@ -1059,7 +1012,7 @@ fn create_mount_targets(redirects: &MountRedirects) -> anyhow::Result<()> {
             continue;
         }
         if !mountpoint.exists() {
-            std::fs::create_dir_all(mountpoint)
+            crate::paths::ensure_dir(mountpoint)
                 .context("creating mountpoint directory for mount redirect")?;
         }
     }
@@ -1094,6 +1047,42 @@ pub fn install_namespace_pre_exec(
     ns: &NamespaceParams,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
+
+    // Confinement is checked before anything is created or registered: a confined spawn
+    // that cannot be set up fails before its mount targets exist.
+    let confined_tap = if let Some(confinement) = ns.decision.confinement() {
+        anyhow::ensure!(
+            ns.user_namespace_path.is_some(),
+            "confining the VMM of {} needs it to enter a user namespace (rootless mode)",
+            ns.vm_id
+        );
+        Some((
+            ns.tap_owner
+                .as_deref()
+                .map(crate::confine::TapName::new)
+                .transpose()?,
+            // The limit the preflight validated; installing it fails the spawn if the hard
+            // limit has since dropped below it.
+            confinement.core_limit,
+        ))
+    } else {
+        None
+    };
+
+    if !ns.keep_fds.is_empty() {
+        let keep_fds = ns.keep_fds.clone();
+        // SAFETY: fcntl is async-signal-safe and the closure owns its list, allocated here.
+        unsafe {
+            cmd.pre_exec(move || {
+                for fd in &keep_fds {
+                    if libc::fcntl(*fd, libc::F_SETFD, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
 
     let ns_id_clone = ns.namespace_id.clone();
     let mount_redirects_clone = ns.mount_redirects.clone();
@@ -1215,7 +1204,7 @@ pub fn install_namespace_pre_exec(
 
                 // Step 0: Enter user namespace if specified (rootless clones). MUST be first
                 // to get CAP_SYS_ADMIN for mount operations. The user namespace was created
-                // by the holder (unshare --user --net) with external UID/GID mappings, so
+                // by the holder (`fcvm __netns-agent`) with external UID/GID mappings, so
                 // entering it gives UID 0 with full capabilities inside the namespace.
                 if let Some(ref user_ns_path) = user_ns_cstr {
                     let ns_fd = open(user_ns_path.as_c_str(), OFlag::O_RDONLY, Mode::empty())
@@ -1358,20 +1347,58 @@ pub fn install_namespace_pre_exec(
         }
     }
 
+    if let Some((tap, core_limit)) = confined_tap {
+        // After the namespace step, which needs the capabilities this drops, and before
+        // PR_SET_PDEATHSIG, which stays last. The TAP is owned while CAP_NET_ADMIN is held.
+        // SAFETY: own_tap and apply_process_layer make raw syscalls only and do not
+        // allocate; the name was built before the fork.
+        unsafe {
+            cmd.pre_exec(move || {
+                if let Some(tap) = &tap {
+                    crate::confine::own_tap(tap)?;
+                }
+                crate::confine::apply_process_layer(core_limit)
+            });
+        }
+    }
+
     own_process_group(cmd);
 
     // Kill the VMM if the parent (fcvm) dies, even from SIGKILL. Unconditional; must be the
     // LAST pre_exec so it runs AFTER setns(CLONE_NEWUSER), which clears pdeath_signal.
+    // A parent that exited before the signal was armed sends none, so the child checks that
+    // fcvm is still its parent and exits rather than exec an orphaned VMM.
+    let parent = std::process::id() as libc::pid_t;
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                libc::_exit(1);
             }
             Ok(())
         });
     }
 
     Ok(())
+}
+
+/// Writes `line` and its newline to `out` with one `write_all`.
+///
+/// A caller that sends stdout and stderr to the same file (`> log 2>&1`) reads
+/// whatever order the two streams' write calls landed in. `writeln!` on stderr,
+/// which is unbuffered, writes the text and the newline as two calls, and on
+/// stdout a line longer than its 1 KiB buffer is flushed in pieces. Either way a
+/// line from the other stream can land inside this one: a restored record that
+/// a harness reads from the start of a line ended up after a container stderr
+/// line that was still waiting for its newline, and the harness never saw it.
+pub fn write_whole_line(out: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
+    let mut whole = Vec::with_capacity(line.len() + 1);
+    whole.extend_from_slice(line.as_bytes());
+    whole.push(b'\n');
+    out.write_all(&whole)?;
+    out.flush()
 }
 
 /// Ctrl+C as a terminal sends it, SIGINT to this test process's whole process group, for
@@ -1443,7 +1470,147 @@ impl TerminalInterrupt {
 }
 
 #[cfg(test)]
+mod shared_lock_file_tests {
+    use super::open_shared_lock_file;
+    use std::io::{Read, Write};
+
+    /// A missing lock file is made; an existing one is opened as it is, never truncated.
+    #[test]
+    fn a_shared_lock_file_is_made_when_missing_and_never_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slot.lock");
+        open_shared_lock_file(&path)
+            .unwrap()
+            .write_all(b"held")
+            .unwrap();
+        drop(open_shared_lock_file(&path).unwrap());
+        let mut text = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "held");
+    }
+}
+
+#[cfg(test)]
 mod tests {
+
+    /// A writer that records each `write` call, as an unbuffered stderr would
+    /// turn each into its own syscall.
+    struct CallRecorder(Vec<Vec<u8>>);
+
+    impl std::io::Write for CallRecorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn forwarded_lines_and_records_are_written_whole() {
+        // The whole file: it has production code after its first test module.
+        let listeners = include_str!("commands/podman/listeners.rs");
+        for split in ["writeln!(std::io::stdout()", "writeln!(std::io::stderr()"] {
+            assert!(
+                !listeners.contains(split),
+                "listeners.rs forwards a line with {split}"
+            );
+        }
+        let snapshot = include_str!("commands/snapshot.rs");
+        let snapshot = snapshot.split("#[cfg(test)]").next().unwrap();
+        for record in ["serve_ready_record(", "restored_record("] {
+            let calls: Vec<usize> = snapshot
+                .match_indices(record)
+                .map(|(i, _)| i)
+                .filter(|&i| !snapshot[..i].ends_with("fn "))
+                .collect();
+            assert!(!calls.is_empty(), "no call to {record}");
+            for i in calls {
+                let mut start = i.saturating_sub(120);
+                while !snapshot.is_char_boundary(start) {
+                    start -= 1;
+                }
+                let before = &snapshot[start..i];
+                assert!(
+                    before.contains("write_whole_line("),
+                    "{record} is printed some other way"
+                );
+                // A record a caller waits for: a failed write is reported, not dropped.
+                assert!(
+                    !before.contains("let _ ="),
+                    "the result of writing {record} is discarded"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_whole_line_is_one_write() {
+        // Longer than stdout's 1 KiB line buffer, as a restored record with its
+        // guest phases is.
+        let line = format!(
+            "{{\"status\":\"restored\",\"pad\":\"{}\"}}",
+            "x".repeat(3000)
+        );
+        let mut out = CallRecorder(Vec::new());
+
+        super::write_whole_line(&mut out, &line).unwrap();
+
+        // Sizes first, so a split prints as two lengths rather than 3 KB of bytes.
+        let sizes: Vec<usize> = out.0.iter().map(Vec::len).collect();
+        assert_eq!(
+            sizes,
+            vec![line.len() + 1],
+            "one write of the line and its newline"
+        );
+        assert_eq!(out.0[0], format!("{line}\n").into_bytes());
+    }
+
+    /// A confined spawn that cannot be set up (no user namespace) fails before it creates
+    /// its mount targets.
+    #[test]
+    fn a_confined_spawn_is_checked_before_its_mount_targets_are_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = dir.path().join("view");
+        // Outside the view: create_mount_targets makes such a mountpoint on the host.
+        let target = dir.path().join("outside").join("vm");
+        let mut cmd = tokio::process::Command::new("true");
+        let error = install_namespace_pre_exec(
+            &mut cmd,
+            &NamespaceParams {
+                mount_redirects: Some(MountRedirects {
+                    view: view.clone(),
+                    pairs: vec![(target.clone(), dir.path().to_path_buf())],
+                    keep: Vec::new(),
+                    keep_files: Vec::new(),
+                }),
+                ..NamespaceParams::new(
+                    "confined-no-userns",
+                    crate::confine::Decision::for_test(Some(crate::confine::Confinement {
+                        landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
+                        layers: vec![crate::confine::Layer::Process],
+                        core_limit: 1,
+                        seccomp: None,
+                    })),
+                )
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("needs it to enter a user namespace"),
+            "{error}"
+        );
+        assert!(
+            !dir.path().join("outside").exists(),
+            "the mount targets were made before the check"
+        );
+    }
+
     use super::thread_sample;
 
     /// Every thread of a process is named with its state and where it sleeps.
@@ -1732,7 +1899,11 @@ mod tests {
         let interrupt = TerminalInterrupt::arm();
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("60").stdin(Stdio::null()).kill_on_drop(true);
-        install_namespace_pre_exec(&mut cmd, &NamespaceParams::default()).unwrap();
+        install_namespace_pre_exec(
+            &mut cmd,
+            &NamespaceParams::new("vm-test", crate::confine::Decision::for_test(None)),
+        )
+        .unwrap();
         let mut vmm = cmd.spawn().expect("spawning the stand-in VMM");
         interrupt.assert_misses(&mut vmm, "the VMM").await;
     }
@@ -1812,7 +1983,7 @@ mod tests {
                     keep: vec![other.clone(), view.join("gone")],
                     keep_files: vec![disk.clone(), view.join("gone.raw")],
                 }),
-                ..Default::default()
+                ..NamespaceParams::new("vm-test", crate::confine::Decision::for_test(None))
             },
         )
         .unwrap();
@@ -2199,6 +2370,49 @@ mod tests {
                 "taken for a warning: {line}: {log:?}"
             );
         }
+    }
+
+    /// A restore's progress line that fc-agent sent on the output connection is in fcvm's
+    /// log at INFO with its text unchanged, under a target of its own (a line under the
+    /// console's target has crossed the serial console, which tests rely on), and with
+    /// the time the guest logged it, in the form of the log's own timestamps.
+    #[test]
+    fn an_agent_line_from_the_output_connection_is_logged_under_its_own_target() {
+        let log = log_capture::logged("fcvm=info", || {
+            log_agent_line("1795332623625264 [fc-agent] handling restore (epoch=e)");
+        });
+        assert!(
+            log.trim_end().ends_with(
+                " INFO fcvm::agent: [fc-agent] handling restore (epoch=e) \
+                 logged=2026-11-22T07:30:23.625264Z"
+            ),
+            "{log:?}"
+        );
+        assert!(
+            log.contains(AGENT_TARGET) && !log.contains(CONSOLE_TARGET),
+            "{log:?}"
+        );
+        assert_eq!(
+            parse_agent_line("1795332623000000 [fc-agent] x y"),
+            Some(("2026-11-22T07:30:23.000000Z".to_string(), "[fc-agent] x y"))
+        );
+        // An error keeps its level, and a line with no stamp is logged whole.
+        let log = log_capture::logged("warn", || {
+            log_agent_line("1795332623625264 [fc-agent] WARNING: journald restart failed");
+        });
+        assert!(
+            log.contains(" WARN fcvm::agent: [fc-agent] WARNING: journald"),
+            "{log:?}"
+        );
+        let log = log_capture::logged("fcvm=info", || {
+            log_agent_line("[fc-agent] no stamp here");
+        });
+        assert!(
+            log.trim_end()
+                .ends_with(" INFO fcvm::agent: [fc-agent] no stamp here"),
+            "{log:?}"
+        );
+        assert_eq!(parse_agent_line("soon [fc-agent] x"), None);
     }
 
     /// The container's marker survives the Firecracker prefix strip, so container output that

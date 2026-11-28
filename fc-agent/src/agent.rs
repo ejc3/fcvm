@@ -11,6 +11,28 @@ use crate::{
 /// indefinite stall into a diagnosable failure.
 const WARM_START_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Start the exec server and wait, up to 5 s, for it to listen.
+async fn start_exec_server(
+    rebind: &std::sync::Arc<tokio::sync::Notify>,
+    rebind_needed: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    rebind_done: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    rebind_done_notify: &std::sync::Arc<tokio::sync::Notify>,
+) {
+    let (exec_ready_tx, exec_ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(exec::run_server(
+        exec_ready_tx,
+        rebind.clone(),
+        rebind_needed.clone(),
+        rebind_done.clone(),
+        rebind_done_notify.clone(),
+    ));
+    match tokio::time::timeout(Duration::from_secs(5), exec_ready_rx).await {
+        Ok(Ok(())) => eprintln!("[fc-agent] exec server is ready"),
+        Ok(Err(_)) => eprintln!("[fc-agent] WARNING: exec server ready signal dropped"),
+        Err(_) => eprintln!("[fc-agent] WARNING: exec server did not become ready within 5s"),
+    }
+}
+
 /// Main agent logic — fetches plan, runs container, triggers shutdown.
 pub async fn run() -> Result<()> {
     // Route fd 1/2 through the wedge-proof console pipe (writer thread →
@@ -65,6 +87,46 @@ pub async fn run() -> Result<()> {
     system::create_kvm_device();
     network::configure_dns_from_cmdline();
     network::configure_ipv6_from_cmdline();
+
+    // Exec server rebind signal — shared by restore-epoch watcher.
+    // After vsock transport reset, the listener's AsyncFd epoll becomes stale.
+    // We use BOTH Notify (to wake the select loop) and AtomicBool (to persist the signal).
+    // tokio::select! can lose Notify permits when accept() and notified() are both Ready
+    // simultaneously — the AtomicBool flag catches this race.
+    let exec_rebind = std::sync::Arc::new(tokio::sync::Notify::new());
+    let exec_rebind_needed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Exec rebind confirmation — exec server signals after re_register() completes.
+    // handle_clone_restore waits on this before reconnecting output, ensuring exec is
+    // ready before the host starts health-checking via exec.
+    let exec_rebind_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exec_rebind_done_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    // An fc-agent that starts while a snapshot's boundary is owed: the agent before it died
+    // between a prepare and its resume, and systemd started this one. The gate the prepare
+    // closed is still closed, and behind its egress half the boot plan below cannot be
+    // fetched over MMDS, so without this the source stayed gated for good. The host's
+    // resume one-shot is what opens the gate (only the host knows this guest is a source
+    // and not a clone that has not been told of its restore yet), it arrives over exec,
+    // and the host runs it again until it lands. So exec opens now, for that command
+    // alone (`exec::serve_only_the_boundary_resume`), and for every command at its usual
+    // place below.
+    let exec_opened_for_an_owed_boundary = crate::snapshot_network::source_boundary_is_owed();
+    if exec_opened_for_an_owed_boundary {
+        eprintln!(
+            "[fc-agent] WARNING: a snapshot's boundary is owed its resume and the agent that \
+             served it is gone; serving the host's resume before the boot plan"
+        );
+        crate::snapshot_network::note_the_agent_restarted_in_a_boundary().await;
+        exec::serve_only_the_boundary_resume();
+        start_exec_server(
+            &exec_rebind,
+            &exec_rebind_needed,
+            &exec_rebind_done,
+            &exec_rebind_done_notify,
+        )
+        .await;
+    }
 
     // Select the boot-plan transport (MMDS for Firecracker, vsock for VMMs without a
     // metadata service like Cloud Hypervisor) from the kernel command line.
@@ -150,8 +212,17 @@ pub async fn run() -> Result<()> {
     // Create output channel — the writer task handles all vsock writes. The
     // reset watch surfaces EPOLLERR on the output connection (vsock transport
     // reset = snapshot restore) to the restore-epoch watcher.
-    let (output, output_writer, vsock_reset_rx) = output::create();
+    let (output, output_writer, vsock_reset) = output::create();
     tokio::spawn(output_writer);
+    // A restore's progress lines travel on this connection instead of the serial console
+    // (`console` module doc). A TTY VM's host has no output listener, so its lines stay
+    // on the console.
+    if !plan.tty {
+        crate::console::set_progress_sink(std::sync::Arc::new(output::ProgressOverOutput::new(
+            output.clone(),
+            &vsock_reset,
+        )));
+    }
     // How the host's resume of a snapshotted source asks for the output to reconnect.
     output::spawn_reconnect_listener(output.clone())
         .context("starting the output reconnect listener")?;
@@ -169,20 +240,6 @@ pub async fn run() -> Result<()> {
     // Breaks the 30s poll loop when POLLHUP is not delivered after snapshot restore.
     let restore_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Exec server rebind signal — shared by restore-epoch watcher.
-    // After vsock transport reset, the listener's AsyncFd epoll becomes stale.
-    // We use BOTH Notify (to wake the select loop) and AtomicBool (to persist the signal).
-    // tokio::select! can lose Notify permits when accept() and notified() are both Ready
-    // simultaneously — the AtomicBool flag catches this race.
-    let exec_rebind = std::sync::Arc::new(tokio::sync::Notify::new());
-    let exec_rebind_needed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Exec rebind confirmation — exec server signals after re_register() completes.
-    // handle_clone_restore waits on this before reconnecting output, ensuring exec is
-    // ready before the host starts health-checking via exec.
-    let exec_rebind_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let exec_rebind_done_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-
     // The NFS shares the boot mounts, with their mount IDs, for the restore to remount.
     let nfs_mounts = mounts::NfsMountRecords::default();
 
@@ -198,7 +255,7 @@ pub async fn run() -> Result<()> {
             exec_rebind_done: exec_rebind_done.clone(),
             exec_rebind_done_notify: exec_rebind_done_notify.clone(),
             egress_gen_rx: egress_gen_rx.clone(),
-            vsock_reset_rx,
+            vsock_reset,
             nfs_mounts: nfs_mounts.clone(),
         };
         tokio::spawn(async move {
@@ -425,26 +482,17 @@ pub async fn run() -> Result<()> {
     // image mode rewrites storage.conf after this point, in mount_overlay_image(),
     // with the driver write_early_storage_conf() already named. The host's exec
     // client retries until the server listens.
-    let (exec_ready_tx, exec_ready_rx) = tokio::sync::oneshot::channel();
-    let exec_rebind_clone = exec_rebind.clone();
-    let exec_rebind_needed_clone = exec_rebind_needed.clone();
-    let exec_rebind_done_clone = exec_rebind_done.clone();
-    let exec_rebind_done_notify_clone = exec_rebind_done_notify.clone();
-    tokio::spawn(async move {
-        exec::run_server(
-            exec_ready_tx,
-            exec_rebind_clone,
-            exec_rebind_needed_clone,
-            exec_rebind_done_clone,
-            exec_rebind_done_notify_clone,
+    if exec_opened_for_an_owed_boundary {
+        // Already listening, for the boundary's resume alone until here.
+        exec::serve_everything();
+    } else {
+        start_exec_server(
+            &exec_rebind,
+            &exec_rebind_needed,
+            &exec_rebind_done,
+            &exec_rebind_done_notify,
         )
         .await;
-    });
-
-    match tokio::time::timeout(Duration::from_secs(5), exec_ready_rx).await {
-        Ok(Ok(())) => eprintln!("[fc-agent] exec server is ready"),
-        Ok(Err(_)) => eprintln!("[fc-agent] WARNING: exec server ready signal dropped"),
-        Err(_) => eprintln!("[fc-agent] WARNING: exec server did not become ready within 5s"),
     }
 
     // Prepare image based on delivery mode. A clone already has the image in
@@ -504,7 +552,7 @@ pub async fn run() -> Result<()> {
         // disk-only snapshot of this VM cold-boots clones without redoing it.
         // The marker deliberately does NOT assert the container exists — a capture
         // taken before `podman run` creates it is still valid (the clone's
-        // container_exists probe falls back to a fresh `podman run` from the
+        // existing_container_id probe falls back to a fresh `podman run` from the
         // preserved image, which is the correct degradation).
         container::write_provisioned_marker();
         image_ref
@@ -532,9 +580,13 @@ pub async fn run() -> Result<()> {
     // start. Unknown counts as yes: the host then asks podman, which is what it did for
     // every container before the start notification carried this.
     let mut image_healthcheck = true;
+    // The image's user and environment, for the restore hook's process. Unknown when
+    // the inspect fails.
+    let mut exec_session = container::ExecSession::of(&plan, user_info.is_some(), None);
     match container::get_image_facts(&image_ref, &cmd_prefix).await {
         Ok(facts) => {
             image_healthcheck = facts.healthcheck;
+            exec_session = container::ExecSession::of(&plan, user_info.is_some(), Some(&facts));
             let cache_result = container::notify_cache_ready_and_wait(&facts.digest, &restore_flag);
             match cache_result {
                 container::CacheResult::ColdStart => {
@@ -646,6 +698,9 @@ pub async fn run() -> Result<()> {
         container::regenerate_identity();
     }
 
+    // Nothing of the workload starts in the middle of a snapshot boundary.
+    crate::snapshot_network::hold_the_container_start_through_a_boundary().await;
+
     eprintln!("[fc-agent] launching container: {}", image_ref);
     system::wait_for_cgroup_controllers().await;
 
@@ -658,8 +713,22 @@ pub async fn run() -> Result<()> {
     // Taken before the args: an attach still loading the driver finishes first, and
     // from here a GPU attached by a later restore cannot reach this container.
     let gpu_devices = crate::gpu::launch_devices().await;
-    let podman_args = if provisioned && container::container_exists(&cmd_prefix) {
+    container::begin_container_launch(container::ContainerRuntime {
+        session: exec_session,
+        ..container::ContainerRuntime::new(
+            user_ref.map(|(_, runtime_dir)| runtime_dir),
+            container::podman_user_ids(plan.user.as_deref()),
+        )
+    });
+    let captured = if provisioned {
+        container::existing_container_id(&cmd_prefix)
+    } else {
+        None
+    };
+    let podman_args = if let Some(id) = captured {
         eprintln!("[fc-agent] starting captured fcvm-container (clone cold boot)");
+        // `podman run` leaves the id in the id file; `podman start` writes none.
+        container::record_captured_container(id);
         container::build_start_args(&plan, user_ref)
     } else {
         container::build_podman_args(&plan, &image_ref, user_ref, &gpu_devices)
@@ -950,6 +1019,15 @@ pub(crate) struct RetiredChronyd {
     state: tokio::sync::OwnedMutexGuard<LifecycleState>,
     /// This restore's number in [`LifecycleState::restores`].
     restore: u64,
+}
+
+/// A retired chronyd of a lifecycle of its own, for tests of what holds one.
+#[cfg(test)]
+pub(crate) async fn retired_chronyd_for_test() -> RetiredChronyd {
+    RetiredChronyd {
+        state: ChronydLifecycle::new().state.lock_owned().await,
+        restore: 1,
+    }
 }
 
 impl ChronydLifecycle {
@@ -1430,9 +1508,46 @@ mod tests {
         let body = &source[..source
             .find("\n#[cfg(test)]\nmod tests {")
             .expect("agent.rs has no test module")];
-        let exec_opens = body
-            .find("exec::run_server(")
-            .expect("fc-agent no longer starts the exec server");
+        // Where exec opens for every command: the server's start, or, when it was opened
+        // early for a snapshot boundary's resume alone, the end of that restriction.
+        let run = &body[body.find("pub async fn run() -> Result<()> {").unwrap()..];
+        let early = run
+            .find("exec::serve_only_the_boundary_resume();")
+            .expect("no early exec for an owed boundary");
+        let early_start = run.find("start_exec_server(").unwrap();
+        assert!(
+            early < early_start && run[early..early_start].len() < 60,
+            "the early exec server starts without its restriction"
+        );
+        let open = run
+            .find("exec::serve_everything();")
+            .expect("the early exec server is never opened for every command");
+        let usual_start = open + run[open..].find("start_exec_server(").unwrap();
+        assert_eq!(
+            run.matches("start_exec_server(").count(),
+            2,
+            "a third place starts the exec server"
+        );
+        // An agent that starts in the middle of a snapshot boundary serves the host's
+        // resume before anything that can wait behind the closed gate (the boot plan,
+        // over MMDS), and starts no container until the boundary is over.
+        let plan = run.find("bootplan::fetch_plan(transport)").unwrap();
+        let hold = run
+            .find("crate::snapshot_network::hold_the_container_start_through_a_boundary().await;")
+            .expect("the container's start does not wait for a boundary");
+        let launch = run.find("container::begin_container_launch(").unwrap();
+        assert!(
+            early_start < plan && plan < hold && hold < launch,
+            "exec={early_start} plan={plan} hold={hold} launch={launch}"
+        );
+        assert!(
+            run.find("crate::snapshot_network::source_boundary_is_owed()")
+                .unwrap()
+                < early,
+            "the early exec server does not depend on an owed boundary"
+        );
+        let body = run;
+        let exec_opens = open.min(usual_start);
         for step in [
             "container::write_early_storage_conf()",
             "container::setup_btrfs_storage_if_available(",
@@ -1992,6 +2107,67 @@ fn guest_sysctls(cmdline: &str) -> Vec<&'static str> {
         sysctls.push("net.ipv4.tcp_min_tso_segs=44");
     }
     sysctls
+}
+
+#[cfg(test)]
+mod proactive_compaction_tests {
+    /// The boot records the kernel's huge page mode, and with it turns proactive
+    /// compaction off for a guest without transparent huge pages, before it offers its
+    /// pre-start snapshot: that snapshot's clones carry no compaction pass either.
+    ///
+    /// RED BEFORE THE FIX: `record_boot_default` did not touch the compaction knob
+    /// (`thp::tests::a_guest_without_huge_pages_does_not_compact_ahead_of_demand`).
+    #[test]
+    fn the_boot_mode_is_recorded_before_any_snapshot_of_the_guest() {
+        let source = include_str!("agent.rs");
+        assert_eq!(record_precedes_snapshot(source), Ok(()));
+        // The check reads `run` alone. It read on to the end of the file before, where
+        // this module's own text holds both needles: a `run` that no longer offered the
+        // snapshot, or no longer recorded the mode ahead of it, still passed.
+        let offer = "container::notify_cache_ready_and_wait(&facts.digest, &restore_flag)";
+        let code = &source[..source.find("\n#[cfg(test)]").unwrap()];
+        assert!(
+            code.contains(offer),
+            "run no longer offers the snapshot this way"
+        );
+        let without_offer = source.replacen(offer, "Ok::<(), anyhow::Error>(())", 1);
+        assert_eq!(
+            record_precedes_snapshot(&without_offer),
+            Err("the boot no longer offers the pre-start snapshot".to_string())
+        );
+        let record = "    thp::record_boot_default();\n";
+        let unrecorded = source.replacen(record, "", 1);
+        assert_eq!(
+            record_precedes_snapshot(&unrecorded),
+            Err("the boot no longer records the huge page mode".to_string())
+        );
+        let late = unrecorded.replacen(offer, &format!("{offer};\n{record}"), 1);
+        assert!(record_precedes_snapshot(&late)
+            .unwrap_err()
+            .starts_with("the huge page mode is recorded after the snapshot is offered"));
+    }
+
+    /// Whether `run` in `source` records the boot mode before it offers the pre-start
+    /// snapshot.
+    fn record_precedes_snapshot(source: &str) -> Result<(), String> {
+        let run = &source[source
+            .find("pub async fn run() -> Result<()> {")
+            .ok_or("no run")?..];
+        let run = &run[..run.find("\n}\n").ok_or("run does not end")?];
+        let record = run
+            .find("thp::record_boot_default();")
+            .ok_or("the boot no longer records the huge page mode")?;
+        let snapshot = run
+            .find("container::notify_cache_ready_and_wait(")
+            .ok_or("the boot no longer offers the pre-start snapshot")?;
+        if record < snapshot {
+            Ok(())
+        } else {
+            Err(format!(
+                "the huge page mode is recorded after the snapshot is offered: record={record} snapshot={snapshot}"
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

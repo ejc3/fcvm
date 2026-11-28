@@ -1,0 +1,49 @@
+{
+ "ops": 2000.0,
+ "hold_ms_per_op": 24.072,
+ "hold_ms_per_op_without_rcu_barrier": 9.937,
+ "rcu_barrier_ms_per_op": 14.136,
+ "rcu_barriers_per_op": 1.0,
+ "wait_ms_per_op": 1984.7,
+ "by_holder": {
+  "worker cleanup_net": {
+   "hold_ms_per_op": 15.241,
+   "holds_per_op": 1.01
+  },
+  "ip": {
+   "hold_ms_per_op": 5.677,
+   "holds_per_op": 34.31
+  },
+  "pasta": {
+   "hold_ms_per_op": 2.144,
+   "holds_per_op": 4.0
+  },
+  "fcvm-netns": {
+   "hold_ms_per_op": 0.442,
+   "holds_per_op": 1.0
+  },
+  "worker addrconf_dad_work": {
+   "hold_ms_per_op": 0.368,
+   "holds_per_op": 6.0
+  },
+  "worker linkwatch_event": {
+   "hold_ms_per_op": 0.193,
+   "holds_per_op": 0.28
+  },
+  "worker switchdev_deferred_process_work": {
+   "hold_ms_per_op": 0.006,
+   "holds_per_op": 0.69
+  }
+ },
+ "on_cpu_ms_per_op": {
+  "all": 6.458,
+  "wireless_nlevent_flush": 2.273,
+  "do_one_broadcast": 1.558,
+  "rcu_barrier": 0.0
+ },
+ "expedited_grace_periods_per_op": {
+  "pasta": 9.0,
+  "worker": 4.05,
+  "ip": 1.0
+ }
+}

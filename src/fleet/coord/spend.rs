@@ -1,16 +1,19 @@
 //! The spend meter (`--daily-spend-usd`): what the fleet's EC2 instances cost per hour, reported
 //! to the state as `Event::Burn`; the ledger and the forced sleep are `fleet_core::spend`.
 //!
-//! Every [`MeterConfig::every`] the meter lists this fleet's GPU hosts and EC2 tiles in every
-//! region it launches in (`DescribeInstances`, `tag:Fleet=<fleet>`, `tag:Purpose` host or
-//! tile, pending to shutting-down) and prices each one: a spot instance at the current spot
-//! price of its type in its availability zone (`DescribeSpotPriceHistory`, cached for
+//! Every [`MeterConfig::every`] the meter lists this fleet's GPU hosts, pages mode's host and
+//! EC2 tiles in every region it launches in (`DescribeInstances`, `tag:Fleet=<fleet>`,
+//! `tag:Purpose` host, tile or renders, pending to shutting-down) and prices each one: a spot
+//! instance at the current spot price of its type in its availability zone
+//! (`DescribeSpotPriceHistory`, cached for
 //! [`MeterConfig::spot_ttl`]), an on-demand one at its type's on-demand rate
 //! (`--spend-rates`, over [`DEFAULT_ON_DEMAND`]). It errs high where it cannot know: a spot
 //! instance whose price is not available is priced on demand, an instance whose type has no
 //! on-demand rate at the highest rate known, and a region it cannot list keeps its last
 //! listed instances. Each of those marks the `spend` component degraded. The day's spend
-//! reaches CloudWatch as `SpendUsdToday` (`super::metrics`).
+//! reaches CloudWatch as `SpendUsdToday` (`super::metrics`). A host group launches only types
+//! the same table prices (`super::hosts::unpriced_launch`), so the ceiling bounds what it
+//! launches; an instance of an unpriced type that is already running is still metered high.
 
 use super::aws::{set_items, signed, xml_tag, CredentialChain};
 use super::sigv4::uri_encode;
@@ -25,11 +28,17 @@ use tokio::time::Instant;
 
 /// US East (N. Virginia) Linux on-demand list prices, USD per hour, of the instance types the
 /// fleet launches (AWS Price List API, 2026-11-19; the same in us-east-2 and us-west-2).
+/// m8gd.metal-24xl is pages mode's host: 5.53536 (AWS Price List API, US East (N. Virginia),
+/// Linux on demand, shared tenancy, read 2026-11-25). It has 384 GiB because the mode's 2 MiB
+/// pool and its engines do not fit in the 192 GiB of c8gd.metal-24xl, which pages mode's
+/// measurements ran on first (2026-11-24) and which stays priced here.
 pub const DEFAULT_ON_DEMAND: &[(&str, f64)] = &[
+    ("c8gd.metal-24xl", 4.70304),
     ("g4dn.metal", 7.824),
     ("g4dn.xlarge", 0.526),
     ("g5g.metal", 2.744),
     ("g5g.xlarge", 0.42),
+    ("m8gd.metal-24xl", 5.53536),
 ];
 
 /// The instance states the meter charges for: from launch until the instance is gone or
@@ -44,6 +53,35 @@ pub struct Billed {
     pub instance_type: String,
     pub spot: bool,
     pub zone: String,
+    /// An EC2 tile (`Purpose=fcvm-fleet-tile`); otherwise a host (a GPU host, or pages
+    /// mode's host).
+    pub tile: bool,
+}
+
+/// The Lambda Managed Instances management fee for a g4dn.xlarge, USD per hour: the AWS Price
+/// List's usage type `Lambda-Managed-Instances-g4dn.xlarge-Management-Hours` in us-east-1
+/// (9.75% of the type's $0.526 on-demand rate), charged on top of the instance itself.
+pub const LAMBDA_FEE_USD_PER_HOUR: f64 = 0.051285;
+/// The instance type a Lambda tile runs on.
+pub const LAMBDA_INSTANCE_TYPE: &str = "g4dn.xlarge";
+/// Instances a Lambda tile keeps while it is assigned: Lambda keeps the instance the previous
+/// version ran on beside the current one, and a function's scaling cannot be held to one
+/// environment (measured 2026-11-22: every PutFunctionScalingConfig answered
+/// ResourceConflict). The instances themselves are not visible to the fleet's role, so the
+/// meter charges this many per assigned tile.
+pub const LAMBDA_INSTANCES_PER_TILE: f64 = 2.0;
+/// A tile that left the assignment is charged this long after: its function's delete took
+/// 37 to 66 s (2026-11-22).
+pub const LAMBDA_DELETE_TAIL: Duration = Duration::from_secs(120);
+
+/// USD per hour of one Lambda instance: the type's on-demand rate (the highest rate known
+/// when the type has none) plus the management fee.
+pub fn lambda_instance_rate(on_demand: &BTreeMap<String, f64>) -> f64 {
+    let od = on_demand
+        .get(LAMBDA_INSTANCE_TYPE)
+        .copied()
+        .unwrap_or_else(|| on_demand.values().copied().fold(0.0, f64::max));
+    od + LAMBDA_FEE_USD_PER_HOUR
 }
 
 /// A spot price: instance type, availability zone, USD per hour.
@@ -70,6 +108,26 @@ pub struct MeterConfig {
     /// The most the fleet can be spending: every host and tile it may run, at the highest
     /// on-demand rate (`launch_cap_usd_per_hour`).
     pub cap_usd_per_hour: f64,
+    /// With Lambda tiles: USD per hour of one Lambda instance ([`lambda_instance_rate`]).
+    /// The meter then charges [`LAMBDA_INSTANCES_PER_TILE`] of them per tile assigned (or
+    /// assigned within [`LAMBDA_DELETE_TAIL`]) and reports the rate split by backing.
+    pub lambda_usd_per_instance_hour: Option<f64>,
+}
+
+/// What the meter charges the Lambda tiles: per tile assigned now or within the delete
+/// tail, [`LAMBDA_INSTANCES_PER_TILE`] instances at `rate`. `last_seen` is updated with the
+/// tiles assigned `now`.
+pub fn lambda_burn(
+    assigned: &[String],
+    last_seen: &mut HashMap<String, Instant>,
+    now: Instant,
+    rate: f64,
+) -> f64 {
+    for t in assigned {
+        last_seen.insert(t.clone(), now);
+    }
+    last_seen.retain(|_, at| now.duration_since(*at) < LAMBDA_DELETE_TAIL);
+    last_seen.len() as f64 * LAMBDA_INSTANCES_PER_TILE * rate
 }
 
 /// How long a region's instance list is trusted without a fresh listing: ten passes of the
@@ -77,8 +135,9 @@ pub struct MeterConfig {
 pub const STALE_AFTER: Duration = Duration::from_secs(300);
 
 /// The most the fleet can be running: in each host region its awake hosts and the
-/// replacement a spot interruption notice launches, and with EC2 tiles each tile plus a
-/// relaunch in flight, all at the highest on-demand rate known.
+/// replacement a spot interruption notice launches, pages mode's host and a replacement
+/// beside one still shutting down, and with EC2 tiles each tile plus a relaunch in flight,
+/// all at the highest on-demand rate known.
 pub fn launch_cap_usd_per_hour(
     args: &crate::cli::FleetCoordArgs,
     on_demand: &BTreeMap<String, f64>,
@@ -90,13 +149,26 @@ pub fn launch_cap_usd_per_hour(
         .collect();
     host_regions.sort();
     host_regions.dedup();
-    let hosts = host_regions.len() as f64 * (args.awake_hosts as f64 + 1.0);
+    let renders = if args.renders_templates.is_empty() {
+        0.0
+    } else {
+        2.0
+    };
+    let hosts = host_regions.len() as f64 * (args.awake_hosts as f64 + 1.0) + renders;
+    let lambda_tiles = if args.lambda == crate::cli::FleetLambda::Aws {
+        args.lambda_tiles.min(args.ec2_tiles)
+    } else {
+        0
+    };
     let tiles = if args.ec2 == crate::cli::FleetEc2::Aws {
-        2.0 * args.ec2_tiles as f64
+        2.0 * (args.ec2_tiles - lambda_tiles) as f64
     } else {
         0.0
     };
-    (hosts + tiles) * on_demand.values().copied().fold(0.0, f64::max)
+    // A Lambda tile: its two instances and one more while a race's version comes up.
+    let lambda =
+        (LAMBDA_INSTANCES_PER_TILE + 1.0) * lambda_tiles as f64 * lambda_instance_rate(on_demand);
+    (hosts + tiles) * on_demand.values().copied().fold(0.0, f64::max) + lambda
 }
 
 /// The regions whose last successful listing (or, never listed, the meter's start) is at
@@ -122,8 +194,11 @@ pub fn on_demand_rates(args: &[String]) -> Result<BTreeMap<String, f64>> {
         .map(|(t, r)| (t.to_string(), *r))
         .collect();
     for a in args {
+        // A list written with spaces (`a=1, b=2`) names the same types: a key kept with its
+        // space would price nothing, and a host group launches no type without a rate.
         let (t, r) = a
             .split_once('=')
+            .map(|(t, r)| (t.trim(), r.trim()))
             .filter(|(t, _)| !t.is_empty())
             .with_context(|| {
                 format!("--spend-rates {a:?} is not <instance type>=<USD per hour>")
@@ -150,9 +225,19 @@ pub fn parse_instances(xml: &str) -> Vec<Billed> {
                 zone: xml_tag(seg, "placement")
                     .and_then(|p| xml_tag(&p, "availabilityZone"))
                     .unwrap_or_default(),
+                tile: tag_value(seg, "Purpose").as_deref() == Some("fcvm-fleet-tile"),
             })
         })
         .collect()
+}
+
+/// The value of an instance's tag `key` (its `tagSet`).
+fn tag_value(instance: &str, key: &str) -> Option<String> {
+    let tags = xml_tag(instance, "tagSet")?;
+    set_items(&format!("<tagSet>{tags}</tagSet>"), "tagSet")
+        .into_iter()
+        .find(|item| xml_tag(item, "key").as_deref() == Some(key))
+        .and_then(|item| xml_tag(item, "value"))
 }
 
 /// The prices of a DescribeSpotPriceHistory answer.
@@ -180,8 +265,19 @@ pub fn burn_rate(
     spot: &HashMap<(String, String), BTreeMap<String, f64>>,
     on_demand: &BTreeMap<String, f64>,
 ) -> (f64, Option<String>) {
+    let (hosts, tiles, why) = burn_rates(instances, spot, on_demand);
+    (hosts + tiles, why)
+}
+
+/// [`burn_rate`] split into the GPU hosts' and the EC2 tiles' parts.
+pub fn burn_rates(
+    instances: &BTreeMap<String, Vec<Billed>>,
+    spot: &HashMap<(String, String), BTreeMap<String, f64>>,
+    on_demand: &BTreeMap<String, f64>,
+) -> (f64, f64, Option<String>) {
     let highest = on_demand.values().copied().fold(0.0, f64::max);
-    let mut total = 0.0;
+    let mut hosts = 0.0;
+    let mut tiles = 0.0;
     let mut unpriced: Vec<String> = Vec::new();
     for (region, list) in instances {
         for b in list {
@@ -197,7 +293,7 @@ pub fn burn_rate(
             } else {
                 od
             };
-            total += match price {
+            let p = match price {
                 Some(p) => p,
                 None => {
                     let market = if b.spot { "spot" } else { "on-demand" };
@@ -205,6 +301,11 @@ pub fn burn_rate(
                     od.unwrap_or(highest)
                 }
             };
+            if b.tile {
+                tiles += p;
+            } else {
+                hosts += p;
+            }
         }
     }
     unpriced.sort();
@@ -215,7 +316,7 @@ pub fn burn_rate(
             unpriced.join(", ")
         )
     });
-    (total, why)
+    (hosts, tiles, why)
 }
 
 /// One pass's report: the burn rate, the instances it prices and why any could not be
@@ -233,9 +334,13 @@ pub fn burn_report(
     spot: &HashMap<(String, String), BTreeMap<String, f64>>,
     on_demand: &BTreeMap<String, f64>,
     cap: f64,
+    // What the listings do not show (the Lambda tiles): added to the listed rate, and so
+    // inside the launch cap, which already counts it.
+    extra: f64,
 ) -> std::result::Result<(f64, u32, Option<String>), String> {
     if !stale.is_empty() {
         let (rate, why) = burn_rate(listed, spot, on_demand);
+        let rate = rate + extra;
         let instances = listed.values().map(|l| l.len() as u32).sum();
         let mut reason = format!(
             "no listing of {} for {} s; charged at the fleet's launch cap",
@@ -260,7 +365,7 @@ pub fn burn_report(
     }
     let (rate, why) = burn_rate(listed, spot, on_demand);
     let instances = listed.values().map(|l| l.len() as u32).sum();
-    Ok((rate, instances, why))
+    Ok((rate + extra, instances, why))
 }
 
 /// The meter `--daily-spend-usd` asks for, or `None` without it. A ceiling needs a fleet that
@@ -275,11 +380,12 @@ pub fn meter(args: &crate::cli::FleetCoordArgs) -> Result<Option<MeterConfig>> {
     );
     anyhow::ensure!(
         super::power_managed(args),
-        "--daily-spend-usd sleeps the fleet at the ceiling, so it needs --host-template or --sleep-when-idle"
+        "--daily-spend-usd sleeps the fleet at the ceiling, so it needs --host-template, --renders-template or --sleep-when-idle"
     );
     let mut regions: Vec<String> = args
         .host_templates
         .iter()
+        .chain(&args.renders_templates)
         .map(|t| t.region.clone())
         .collect();
     if args.ec2 == crate::cli::FleetEc2::Aws {
@@ -289,13 +395,15 @@ pub fn meter(args: &crate::cli::FleetCoordArgs) -> Result<Option<MeterConfig>> {
     regions.dedup();
     anyhow::ensure!(
         !regions.is_empty(),
-        "--daily-spend-usd meters the instances the coordinator launches: it needs --host-template or --ec2 aws"
+        "--daily-spend-usd meters the instances the coordinator launches: it needs --host-template, --renders-template or --ec2 aws"
     );
     let on_demand = on_demand_rates(&args.spend_rates)?;
     Ok(Some(MeterConfig {
         driver: Arc::new(AwsMeter::new(args.fleet_name.clone())?),
         regions,
         cap_usd_per_hour: launch_cap_usd_per_hour(args, &on_demand),
+        lambda_usd_per_instance_hour: (args.lambda == crate::cli::FleetLambda::Aws)
+            .then(|| lambda_instance_rate(&on_demand)),
         on_demand,
         every: Duration::from_secs(30),
         spot_ttl: Duration::from_secs(1800),
@@ -311,6 +419,7 @@ pub async fn run(cfg: MeterConfig, handle: Handle) {
     let mut spot: HashMap<(String, String), BTreeMap<String, f64>> = HashMap::new();
     let mut spot_read: HashMap<(String, String), Instant> = HashMap::new();
     let mut degraded_now = false;
+    let mut lambda_seen: HashMap<String, Instant> = HashMap::new();
     let mut every = tokio::time::interval(cfg.every);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -375,6 +484,17 @@ pub async fn run(cfg: MeterConfig, handle: Handle) {
             Instant::now(),
             cfg.stale_after,
         );
+        // The Lambda tiles' instances are not listed: their charge is added to the listed
+        // rate before the launch cap is applied, never on top of the cap.
+        let lambda = cfg.lambda_usd_per_instance_hour.map(|rate| {
+            let assigned: Vec<String> = handle
+                .lambda
+                .borrow()
+                .iter()
+                .map(|a| a.id.clone())
+                .collect();
+            lambda_burn(&assigned, &mut lambda_seen, Instant::now(), rate)
+        });
         let burn = burn_report(
             &cfg.regions,
             &listed,
@@ -382,6 +502,7 @@ pub async fn run(cfg: MeterConfig, handle: Handle) {
             &spot,
             &cfg.on_demand,
             cfg.cap_usd_per_hour,
+            lambda.unwrap_or(0.0),
         );
         if handle.cmds.is_closed() {
             return;
@@ -389,12 +510,25 @@ pub async fn run(cfg: MeterConfig, handle: Handle) {
         match burn {
             Ok((usd_per_hour, instances, why)) => {
                 problems.extend(why);
+                let by_backing = match lambda {
+                    // At the launch cap (an unknown inventory) the parts are not known.
+                    Some(lambda) if stale.is_empty() => {
+                        let (hosts, tiles, _) = burn_rates(&listed, &spot, &cfg.on_demand);
+                        BTreeMap::from([
+                            ("hosts".to_string(), hosts),
+                            ("ec2".to_string(), tiles),
+                            ("lambda".to_string(), lambda),
+                        ])
+                    }
+                    _ => BTreeMap::new(),
+                };
                 tracing::debug!(usd_per_hour, instances, "spend meter");
                 handle
                     .send(Event::Burn {
                         at: 0,
                         usd_per_hour,
                         instances,
+                        by_backing,
                     })
                     .await;
             }
@@ -568,6 +702,10 @@ impl MeterDriver for AwsMeter {
             p("Filter.2.Name", "tag:Purpose"),
             p("Filter.2.Value.1", "fcvm-fleet-host"),
             p("Filter.2.Value.2", "fcvm-fleet-tile"),
+            p(
+                "Filter.2.Value.3",
+                super::hosts::HostClass::Renders.purpose(),
+            ),
             p("Filter.3.Name", "instance-state-name"),
         ];
         for (i, s) in BILLED_STATES.iter().enumerate() {
@@ -626,7 +764,7 @@ mod tests {
 
     const INSTANCES: &str = r#"<DescribeInstancesResponse><reservationSet><item><instancesSet>
 <item><instanceId>i-host1</instanceId><instanceType>g4dn.metal</instanceType><placement><availabilityZone>us-east-1b</availabilityZone><tenancy>default</tenancy></placement><instanceState><code>16</code><name>running</name></instanceState><instanceLifecycle>spot</instanceLifecycle><tagSet><item><key>Fleet</key><value>stage</value></item></tagSet></item>
-<item><availabilityZone>ignored</availabilityZone><instanceId>i-tile1</instanceId><placement><availabilityZone>us-east-1c</availabilityZone></placement><instanceType>g4dn.xlarge</instanceType><instanceState><name>pending</name></instanceState></item>
+<item><availabilityZone>ignored</availabilityZone><instanceId>i-tile1</instanceId><placement><availabilityZone>us-east-1c</availabilityZone></placement><instanceType>g4dn.xlarge</instanceType><tagSet><item><key>Fleet</key><value>stage</value></item><item><key>Purpose</key><value>fcvm-fleet-tile</value></item></tagSet><instanceState><name>pending</name></instanceState></item>
 </instancesSet></item></reservationSet></DescribeInstancesResponse>"#;
 
     const PRICES: &str = r#"<DescribeSpotPriceHistoryResponse><spotPriceHistorySet>
@@ -640,6 +778,7 @@ mod tests {
             instance_type: ty.into(),
             spot,
             zone: zone.into(),
+            tile: false,
         }
     }
 
@@ -649,9 +788,53 @@ mod tests {
             parse_instances(INSTANCES),
             vec![
                 host("i-host1", "g4dn.metal", true, "us-east-1b"),
-                host("i-tile1", "g4dn.xlarge", false, "us-east-1c"),
+                Billed {
+                    tile: true,
+                    ..host("i-tile1", "g4dn.xlarge", false, "us-east-1c")
+                },
             ]
         );
+    }
+
+    #[test]
+    fn a_lambda_tile_is_charged_two_instances_until_its_delete_tail_ends() {
+        let rate = lambda_instance_rate(&on_demand_rates(&[]).unwrap());
+        assert!((rate - (0.526 + 0.051285)).abs() < 1e-9, "{rate}");
+        // One tile: two g4dn.xlarge with the management fee each.
+        let mut one_tile = HashMap::new();
+        let charge = lambda_burn(&["lam-1".to_string()], &mut one_tile, Instant::now(), rate);
+        assert!((charge - 1.15457).abs() < 1e-9, "{charge}");
+        let mut seen = HashMap::new();
+        let t0 = Instant::now();
+        let both = vec!["lam-1".to_string(), "lam-2".to_string()];
+        assert!((lambda_burn(&both, &mut seen, t0, rate) - 4.0 * rate).abs() < 1e-9);
+        // lam-2 left the assignment: still charged within the tail, not after it.
+        let one = vec!["lam-1".to_string()];
+        let within = t0 + LAMBDA_DELETE_TAIL - Duration::from_secs(1);
+        assert!((lambda_burn(&one, &mut seen, within, rate) - 4.0 * rate).abs() < 1e-9);
+        let after = within + Duration::from_secs(2);
+        assert!((lambda_burn(&one, &mut seen, after, rate) - 2.0 * rate).abs() < 1e-9);
+        assert_eq!(
+            lambda_burn(&[], &mut seen, after + LAMBDA_DELETE_TAIL, rate),
+            0.0
+        );
+    }
+
+    #[test]
+    fn the_burn_splits_into_hosts_and_tiles() {
+        let listed = BTreeMap::from([(
+            "us-east-1".to_string(),
+            vec![
+                host("i-h", "g4dn.metal", false, "us-east-1a"),
+                Billed {
+                    tile: true,
+                    ..host("i-t", "g4dn.xlarge", false, "us-east-1a")
+                },
+            ],
+        )]);
+        let (hosts, tiles, why) =
+            burn_rates(&listed, &HashMap::new(), &on_demand_rates(&[]).unwrap());
+        assert_eq!((hosts, tiles, why), (7.824, 0.526, None));
     }
 
     #[test]
@@ -738,7 +921,7 @@ mod tests {
         // A restart whose first listings failed: reporting 0 would overwrite the stored rate.
         let none = BTreeMap::new();
         assert_eq!(
-            burn_report(&regions, &none, &[], &spot, &on_demand, 0.0),
+            burn_report(&regions, &none, &[], &spot, &on_demand, 0.0, 0.0),
             Err(
                 "no listing yet of us-east-1, us-east-2; the last reported burn stays in use"
                     .into()
@@ -749,10 +932,10 @@ mod tests {
             "us-east-1".to_string(),
             vec![host("i-1", "g4dn.xlarge", false, "us-east-1a")],
         )]);
-        assert!(burn_report(&regions, &listed, &[], &spot, &on_demand, 0.0).is_err());
+        assert!(burn_report(&regions, &listed, &[], &spot, &on_demand, 0.0, 0.0).is_err());
         listed.insert("us-east-2".to_string(), Vec::new());
         assert_eq!(
-            burn_report(&regions, &listed, &[], &spot, &on_demand, 0.0),
+            burn_report(&regions, &listed, &[], &spot, &on_demand, 0.0, 0.0),
             Ok((0.526, 1, None))
         );
     }
@@ -773,15 +956,28 @@ mod tests {
         ]);
         let stale = vec!["us-east-1".to_string()];
         let (rate, instances, why) =
-            burn_report(&regions, &listed, &stale, &spot, &on_demand, cap).unwrap();
+            burn_report(&regions, &listed, &stale, &spot, &on_demand, cap, 0.0).unwrap();
         assert_eq!((rate, instances), (cap, 1));
         assert!(why.unwrap().contains("us-east-1"));
         // Never listed at all, past the bound: no longer "keep the last rate", which on a first
         // start is none.
         let stale = regions.clone();
         let none = BTreeMap::new();
-        let (rate, _, _) = burn_report(&regions, &none, &stale, &spot, &on_demand, cap).unwrap();
+        let (rate, _, _) =
+            burn_report(&regions, &none, &stale, &spot, &on_demand, cap, 0.0).unwrap();
         assert_eq!(rate, cap);
+        // The Lambda tiles' charge is inside the cap, which already counts them: an unknown
+        // inventory is charged the cap, not the cap and the Lambda tiles again.
+        let (rate, _, _) =
+            burn_report(&regions, &none, &stale, &spot, &on_demand, cap, 2.0).unwrap();
+        assert_eq!(rate, cap);
+        // A known inventory adds them to what it lists.
+        let fresh = BTreeMap::from([
+            ("us-east-1".to_string(), Vec::new()),
+            ("us-east-2".to_string(), Vec::new()),
+        ]);
+        let (rate, _, _) = burn_report(&regions, &fresh, &[], &spot, &on_demand, cap, 2.0).unwrap();
+        assert_eq!(rate, 2.0);
         // A known rate above the cap is kept.
         let big = BTreeMap::from([
             (
@@ -791,7 +987,8 @@ mod tests {
             ("us-east-2".to_string(), Vec::new()),
         ]);
         let stale = vec!["us-east-2".to_string()];
-        let (rate, _, _) = burn_report(&regions, &big, &stale, &spot, &on_demand, cap).unwrap();
+        let (rate, _, _) =
+            burn_report(&regions, &big, &stale, &spot, &on_demand, cap, 0.0).unwrap();
         assert!(rate > cap);
     }
 
@@ -849,6 +1046,127 @@ mod tests {
         // in flight.
         assert_eq!(m.cap_usd_per_hour, highest * (3 + 16) as f64);
         assert_eq!(m.stale_after, STALE_AFTER);
+    }
+
+    #[test]
+    fn lambda_tiles_come_out_of_the_ec2_tiles_in_the_launch_cap() {
+        let args = coord(&[
+            "--host-template",
+            "us-east-1:fcvm-fleet-host-x86_64",
+            "--host-subnet",
+            "us-east-1:subnet-0123456789abcdef0",
+            "--awake-hosts",
+            "2",
+            "--ec2",
+            "aws",
+            "--ec2-regions",
+            "us-east-1",
+            "--ec2-tiles",
+            "8",
+            "--lambda",
+            "aws",
+            "--lambda-tiles",
+            "4",
+            "--daily-spend-usd",
+            "750",
+            "--fleet-name",
+            "prod",
+        ]);
+        let m = meter(&args).unwrap().unwrap();
+        let rates = on_demand_rates(&[]).unwrap();
+        let highest = rates.values().copied().fold(0.0, f64::max);
+        let lane = lambda_instance_rate(&rates);
+        // Hosts as before; 4 EC2 tiles with a relaunch each; 4 Lambda tiles with their two
+        // instances and a third while a race's version comes up.
+        let want = highest * (3 + 8) as f64 + 4.0 * 3.0 * lane;
+        assert!(
+            (m.cap_usd_per_hour - want).abs() < 1e-9,
+            "{} != {want}",
+            m.cap_usd_per_hour
+        );
+        assert_eq!(m.lambda_usd_per_instance_hour, Some(lane));
+    }
+
+    /// Pages mode's host type has a built-in on-demand rate, which `--spend-rates` replaces
+    /// like any other.
+    #[test]
+    fn the_renders_host_type_has_a_built_in_on_demand_rate() {
+        let r = on_demand_rates(&[]).unwrap();
+        assert_eq!(r["c8gd.metal-24xl"], 4.70304);
+        let r = on_demand_rates(&["c8gd.metal-24xl=5.1".into()]).unwrap();
+        assert_eq!(r["c8gd.metal-24xl"], 5.1);
+        // a list written with spaces names the same types
+        let r = on_demand_rates(&[" x9z.metal = 3.5 ".into()]).unwrap();
+        assert_eq!(r.get("x9z.metal"), Some(&3.5), "{r:?}");
+        assert!(on_demand_rates(&[" =3.5".into()]).is_err());
+        // An on-demand renders host is a host in the burn, at that rate.
+        let listed = BTreeMap::from([(
+            "us-east-2".to_string(),
+            vec![host("i-r", "c8gd.metal-24xl", false, "us-east-2c")],
+        )]);
+        let (hosts, tiles, why) =
+            burn_rates(&listed, &HashMap::new(), &on_demand_rates(&[]).unwrap());
+        assert_eq!((hosts, tiles, why), (4.70304, 0.0, None));
+        // The host the class launches is an m8gd.metal-24xl: charged at its own rate, not at
+        // the highest rate known with the component degraded.
+        assert_eq!(on_demand_rates(&[]).unwrap()["m8gd.metal-24xl"], 5.53536);
+        let listed = BTreeMap::from([(
+            "us-east-1".to_string(),
+            vec![host("i-m", "m8gd.metal-24xl", false, "us-east-1a")],
+        )]);
+        let (hosts, tiles, why) =
+            burn_rates(&listed, &HashMap::new(), &on_demand_rates(&[]).unwrap());
+        assert_eq!((hosts, tiles, why), (5.53536, 0.0, None));
+    }
+
+    /// With pages mode's host, the meter lists its region too, and the launch cap counts it
+    /// and the replacement that can overlap a reclaimed one shutting down.
+    #[test]
+    fn the_meter_counts_the_renders_host_in_its_regions_and_launch_cap() {
+        let base = [
+            "--host-template",
+            "us-east-1:fcvm-fleet-host-x86_64",
+            "--host-subnet",
+            "us-east-1:subnet-0123456789abcdef0",
+            "--daily-spend-usd",
+            "750",
+            "--fleet-name",
+            "prod",
+        ];
+        let without = meter(&coord(&base)).unwrap().unwrap();
+        let mut args = base.to_vec();
+        args.extend([
+            "--renders-template",
+            "us-east-2:fcvm-fleet-renders-arm64",
+            "--renders-subnet",
+            "us-east-2:subnet-0123456789abcdef1",
+        ]);
+        let with = meter(&coord(&args)).unwrap().unwrap();
+        assert_eq!(with.regions, ["us-east-1", "us-east-2"]);
+        let highest = on_demand_rates(&[])
+            .unwrap()
+            .values()
+            .copied()
+            .fold(0.0, f64::max);
+        assert!(
+            (with.cap_usd_per_hour - (without.cap_usd_per_hour + 2.0 * highest)).abs() < 1e-9,
+            "{} {}",
+            with.cap_usd_per_hour,
+            without.cap_usd_per_hour
+        );
+        // The renders host alone is something to meter, in a fleet that sleeps.
+        let alone = [
+            "--renders-template",
+            "us-east-2:fcvm-fleet-renders-arm64",
+            "--renders-subnet",
+            "us-east-2:subnet-0123456789abcdef1",
+            "--daily-spend-usd",
+            "750",
+        ];
+        assert_eq!(
+            meter(&coord(&alone)).unwrap().unwrap().regions,
+            ["us-east-2"]
+        );
     }
 
     fn coord(extra: &[&str]) -> crate::cli::FleetCoordArgs {

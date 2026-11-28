@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -940,11 +939,18 @@ async fn accept_unless_drained(
     }
 }
 
+/// The stream name of fc-agent's own lines on the output connection (`AGENT_STREAM` in
+/// fc-agent/src/output.rs).
+const AGENT_STREAM: &str = "agent";
+
 /// Bidirectional I/O listener for container stdin/stdout/stderr.
 ///
 /// Listens on port 4997 for raw output from fc-agent.
 /// Protocol (all lines are newline-terminated):
 ///   Guest -> Host: "stdout:content" or "stderr:content"
+///   Guest -> Host: "agent:<when> <line>", fc-agent's own log line (a restore's progress
+///     lines, which it keeps off the serial console) and when it logged it. Logged under
+///     `fcvm::agent` (`utils::log_agent_line`); never container output.
 ///   Host -> Guest: "stdin:content" (written to container stdin)
 ///
 /// Lines are forwarded (to stdout/stderr and to `log_tx`) as they arrive and are
@@ -980,9 +986,9 @@ pub(crate) async fn run_output_listener(
             .spawn(move || {
                 for (is_stdout, content) in rx {
                     if is_stdout {
-                        let _ = writeln!(std::io::stdout(), "{}", content);
+                        let _ = crate::utils::write_whole_line(&mut std::io::stdout(), &content);
                     } else {
-                        let _ = writeln!(std::io::stderr(), "{}", content);
+                        let _ = crate::utils::write_whole_line(&mut std::io::stderr(), &content);
                     }
                 }
             })
@@ -1077,11 +1083,17 @@ pub(crate) async fn run_output_listener(
                         if let Some((stream, content)) = line.split_once(':') {
                             if stream == "heartbeat" {
                                 info!(vm_id = %vm_id, phase = %content, "VM heartbeat");
+                            } else if stream == AGENT_STREAM {
+                                // fc-agent's own line: fcvm's log, not the container's
+                                // output and not its log stream.
+                                crate::utils::log_agent_line(content);
+                                continue;
                             } else {
-                                // Use writeln! instead of println!/eprintln! to avoid
-                                // panicking on broken pipe. println! panics on write
-                                // error, which kills the listener task and stops
-                                // draining the vsock — deadlocking the container.
+                                // write_whole_line instead of println!/eprintln!: println!
+                                // panics on a write error, which kills the listener task
+                                // and stops draining the vsock, deadlocking the container.
+                                // It also writes the line in one call, so a record on the
+                                // other stream cannot land inside it.
                                 let is_stdout = stream == "stdout";
                                 // `podman prepare` reserves stdout for its single JSON result
                                 // and stderr for host diagnostics, so it forwards nothing here.
@@ -1093,9 +1105,9 @@ pub(crate) async fn run_output_listener(
                                         // Writer thread handles the blocking stdout write.
                                         let _ = tx.try_send((is_stdout, content.to_string()));
                                     } else if is_stdout {
-                                        let _ = writeln!(std::io::stdout(), "{}", content);
+                                        let _ = crate::utils::write_whole_line(&mut std::io::stdout(), content);
                                     } else {
-                                        let _ = writeln!(std::io::stderr(), "{}", content);
+                                        let _ = crate::utils::write_whole_line(&mut std::io::stderr(), content);
                                     }
                                 }
                                 lines_forwarded += 1;
@@ -1808,11 +1820,10 @@ mod tests {
         );
     }
 
-    /// Verify that writeln! to a broken pipe doesn't panic (returns Err),
+    /// Verify that write_whole_line to a broken pipe doesn't panic (returns Err),
     /// while println! would panic with "failed printing to stdout".
     #[test]
     fn test_writeln_survives_broken_pipe() {
-        use std::io::Write;
         use std::os::unix::io::FromRawFd;
 
         // O_CLOEXEC, and a bounded retry below: a sibling test thread can
@@ -1824,14 +1835,17 @@ mod tests {
         let mut writer = unsafe {
             std::fs::File::from_raw_fd(std::os::unix::io::IntoRawFd::into_raw_fd(write_fd))
         };
-        let mut result = writeln!(writer, "test output");
+        let mut result = crate::utils::write_whole_line(&mut writer, "test output");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while result.is_ok() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
-            result = writeln!(writer, "test output");
+            result = crate::utils::write_whole_line(&mut writer, "test output");
         }
 
-        assert!(result.is_err(), "writeln! should return Err on broken pipe");
+        assert!(
+            result.is_err(),
+            "write_whole_line should return Err on broken pipe"
+        );
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
     }
 
@@ -1895,6 +1909,59 @@ mod tests {
         }
         assert!(socket_path.exists(), "output socket not created");
         handle
+    }
+
+    /// fc-agent's own lines on the output connection (`agent:<when> <line>`, a restore's
+    /// progress lines) are fcvm's log, not container output: they reach neither the
+    /// container's log stream nor its stdout or stderr.
+    ///
+    /// RED WITHOUT THE `agent` STREAM: the first line on the log stream was the agent's,
+    /// as stream "agent".
+    #[tokio::test]
+    async fn the_agents_own_lines_are_not_container_output() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("output-agent.sock");
+        let socket_str = socket_path.to_string_lossy().to_string();
+        let (log_tx, mut log_rx) = tokio::sync::broadcast::channel::<LogLine>(16);
+        let reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::spawn(async move {
+            run_output_listener(
+                &socket_str,
+                "test-vm",
+                Some(log_tx),
+                reconnect,
+                false,
+                false,
+                None,
+                None,
+            )
+            .await
+        });
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        stream
+            .write_all(
+                b"agent:1795332623625264 [fc-agent] handling restore (epoch=e)\n\
+                  agent:1795332623625300 [fc-agent] restore phases complete (epoch=e)\n\
+                  stdout:hello from the container\n",
+            )
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), log_rx.recv())
+            .await
+            .expect("the listener forwarded nothing")
+            .unwrap();
+        assert_eq!(
+            (first.stream.as_str(), first.content.as_str()),
+            ("stdout", "hello from the container")
+        );
+        drop(stream);
+        listener.abort();
     }
 
     /// Resident set size of this process, in bytes.

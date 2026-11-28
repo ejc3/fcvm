@@ -1,0 +1,37 @@
+# Pages mode's host agent: `fcvm fleet agent --renders`, which runs the mode's host module while
+# the coordinator orders it to (docs/fleet/ARCHITECTURE.md, "Pages mode"). Enabled, and started
+# only where a host's boot (the launch template's user data in ejc3/aws) wrote the host's own
+# arguments to /etc/fcvm-fleet/agent.env (FLEET_AGENT_ARGS: the coordinator, the access token).
+# /etc/fcvm-fleet/renders.env, written at build by host-check.py from renders.conf, holds the
+# mode's (RENDERS_AGENT_ARGS) and a place for the frame server's (RENDERS_FRAME_ARGS).
+#
+# The unit's properties are bench/chromium/renders_bench.sh's (unit_props), the unit the
+# recorded campaign's module ran in, and test_pipeline.py compares the two: the module puts each
+# side in a cpuset of its own, so it runs in a subgroup of a delegated unit; the default
+# KillMode (control-group), because with mixed systemd kills the module's reaper with the agent
+# and the clones' state and the run directory stay until the next start's sweep. It runs as the
+# build user, as that module did; the user's runtime directory exists from boot (lingering).
+[Unit]
+Description=fcvm fleet agent: pages mode's host module
+Requires=cve-2026-98432-mitigation.service fcvm-fleet-hugepages.service fcvm-fleet-store.service
+After=cve-2026-98432-mitigation.service fcvm-fleet-hugepages.service fcvm-fleet-store.service user@1000.service network-online.target
+Wants=network-online.target user@1000.service
+ConditionPathExists=/etc/fcvm-fleet/agent.env
+
+[Service]
+User=ubuntu
+EnvironmentFile=/etc/fcvm-fleet/agent.env
+EnvironmentFile=/etc/fcvm-fleet/renders.env
+Environment=HOME=/home/ubuntu XDG_RUNTIME_DIR=/run/user/1000 RUST_LOG=info
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/fcvm fleet agent $FLEET_AGENT_ARGS $RENDERS_AGENT_ARGS $RENDERS_FRAME_ARGS
+Delegate=yes
+DelegateSubgroup=agent
+LimitNOFILE=1048576
+TasksMax=infinity
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

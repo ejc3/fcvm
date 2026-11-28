@@ -1,0 +1,91 @@
+conf: --no-neigh-notify, to run without the neighbour listener
+
+passt subscribes to the host's neighbour table (nl_neigh_notify_init(): a
+NETLINK_ROUTE socket bound to RTMGRP_NEIGH) and mirrors the MAC addresses
+it learns into the frames it sends the guest. The kernel visits every
+NETLINK_ROUTE multicast socket on the host for each link and neighbour
+notification of any network namespace, under rtnl_mutex
+(netlink_broadcast_filtered() -> do_one_broadcast()), so a host with
+thousands of pasta instances pays for thousands of listeners on every link
+change of every one of them: with 2000 instances do_one_broadcast() was
+8% of all samples under a TAP's attach and detach.
+
+With the option passt does not open that socket. fwd_neigh_mac_get() finds
+no entry and falls back to passt's own MAC address, which is what passt
+sent before it had the table.
+
+Carried by fcvm for its pooled namespaces. Not submitted upstream yet.
+
+diff --git a/conf.c b/conf.c
+index 8205dbf..ecb50d7 100644
+--- a/conf.c
++++ b/conf.c
+@@ -662,6 +662,7 @@ static void usage(const char *name, FILE *f, int status)
+ 		"  --no-icmp		Disable ICMP/ICMPv6 protocol handler\n"
+ 		"  --no-dhcp		Disable DHCP server\n"
+ 		"  --no-ndp		Disable NDP responses\n"
++		"  --no-neigh-notify	Don't follow the host's neighbour table\n"
+ 		"  --no-dhcpv6		Disable DHCPv6 server\n"
+ 		"  --no-ra		Disable router advertisements\n"
+ 		"  --freebind		Bind to any address for forwarding\n"
+@@ -1297,6 +1298,7 @@ void conf(struct ctx *c, int argc, char **argv)
+ 		{"no-dhcp",	no_argument,		&c->no_dhcp,	1 },
+ 		{"no-dhcpv6",	no_argument,		&c->no_dhcpv6,	1 },
+ 		{"no-ndp",	no_argument,		&c->no_ndp,	1 },
++		{"no-neigh-notify", no_argument,	&c->no_neigh,	1 },
+ 		{"no-ra",	no_argument,		&c->no_ra,	1 },
+ 		{"no-splice",	no_argument,		&c->no_splice,	1 },
+ 		{"splice-only",	no_argument,		&c->splice_only, 1 },
+diff --git a/passt.1 b/passt.1
+index 995590a..e72516a 100644
+--- a/passt.1
++++ b/passt.1
+@@ -352,6 +352,14 @@ selected IPv4 default route.
+ Disable Neighbor Discovery. NDP messages coming from guest or target
+ namespace will be ignored. No initial NDP message will be sent.
+ 
++.TP
++.BR \-\-no-neigh-notify
++Do not subscribe to the host's neighbour table. Frames for the guest then carry
++passt's own MAC address as their source, whichever host sent them. Every
++listener of this kind is visited, under the host's rtnl lock, by each link and
++neighbour notification of any network namespace, so a host that runs thousands
++of instances can turn it off.
++
+ .TP
+ .BR \-\-no-dhcpv6
+ Disable the DHCPv6 server. DHCPv6 client requests coming from guest or target
+diff --git a/passt.c b/passt.c
+index 5054551..ad8703f 100644
+--- a/passt.c
++++ b/passt.c
+@@ -421,7 +421,8 @@ int main(int argc, char **argv)
+ 	pcap_init(c);
+ 
+ 	fwd_neigh_table_init(c);
+-	nl_neigh_notify_init(c);
++	if (!c->no_neigh)
++		nl_neigh_notify_init(c);
+ 
+ 	if (isolate_prefork(c))
+ 		die("Failed to sandbox process, exiting");
+diff --git a/passt.h b/passt.h
+index a61baca..a6de22f 100644
+--- a/passt.h
++++ b/passt.h
+@@ -208,6 +208,7 @@ struct ip6_ctx {
+  * @no_dhcp:		Disable DHCP server
+  * @no_dhcpv6:		Disable DHCPv6 server
+  * @no_ndp:		Disable NDP handler altogether
++ * @no_neigh:		Don't listen for the host's neighbour events
+  * @no_ra:		Disable router advertisements
+  * @no_splice:		Disable socket splicing for inbound traffic
+  * @splice_only:	Only enable loopback forwarding
+@@ -293,6 +294,7 @@ struct ctx {
+ 	int no_dhcp;
+ 	int no_dhcpv6;
+ 	int no_ndp;
++	int no_neigh;
+ 	int no_ra;
+ 	int no_splice;
+ 	int splice_only;

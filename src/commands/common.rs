@@ -107,12 +107,6 @@ const MIN_FIRECRACKER_VERSION: (u32, u32, u32) = (1, 14, 0);
 /// Timeout for namespace holder creation retries
 pub const HOLDER_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Maximum wait time for namespace setup via nsenter
-pub const NSENTER_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(1000);
-
-/// Poll interval for namespace setup retries
-pub const NSENTER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
-
 /// Retry interval between holder creation attempts (only used when holder dies)
 pub const HOLDER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -233,6 +227,47 @@ fn subordinate_range_granted_to_root(text: &str) -> bool {
     })
 }
 
+/// What decides the id maps of a holder this process would start, as text: its own uid and
+/// gid, for a root run started with sudo the invoker's, and the subordinate id files, which
+/// decide between the extended and the single layout (`setup_namespace_mappings`: a root
+/// run reads them itself, any other run through newuidmap and newgidmap). Two processes
+/// with the same text start holders whose user namespaces map the same ids. The files are
+/// read at each call: a pool lives for days, and a clone that starts after an edit to
+/// either file would build a namespace the pool's are not.
+pub(crate) fn holder_id_inputs() -> String {
+    let invoker = crate::setup::sudo_invoker().map(|user| (user.uid.as_raw(), user.gid.as_raw()));
+    holder_id_inputs_of(
+        nix::unistd::getuid().as_raw(),
+        nix::unistd::getgid().as_raw(),
+        invoker,
+        std::fs::read("/etc/subuid").as_deref().ok(),
+        std::fs::read("/etc/subgid").as_deref().ok(),
+    )
+}
+
+/// [`holder_id_inputs`] of the ids and of the two files' contents (`None`: unreadable).
+fn holder_id_inputs_of(
+    uid: u32,
+    gid: u32,
+    invoker: Option<(u32, u32)>,
+    subuid: Option<&[u8]>,
+    subgid: Option<&[u8]>,
+) -> String {
+    use sha2::Digest;
+    let invoker = invoker
+        .map(|(uid, gid)| format!("{uid}:{gid}"))
+        .unwrap_or_else(|| "none".to_string());
+    let digest = |file: Option<&[u8]>| match file {
+        Some(text) => hex::encode(&sha2::Sha256::digest(text)[..8]),
+        None => "unreadable".to_string(),
+    };
+    format!(
+        "uid={uid} gid={gid} invoker={invoker} subuid={} subgid={}",
+        digest(subuid),
+        digest(subgid)
+    )
+}
+
 /// The layout `write_id_map_with_invoker` wrote, and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InvokerIdMap {
@@ -309,30 +344,9 @@ fn write_id_map_with_invoker(
 /// Without that check, a file the container creates as one of its ids 1-65535 would be
 /// owned on the host by whichever user those files give 100000-165534.
 async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
     let uid = nix::unistd::getuid().as_raw();
     let gid = nix::unistd::getgid().as_raw();
     let pid_s = pid.to_string();
-
-    // Wait for unshare(2) to create the new user namespace.
-    // The namespace exists once /proc/PID/ns/user has a different inode than ours.
-    let self_ino = std::fs::metadata("/proc/self/ns/user")
-        .context("reading own user namespace inode")?
-        .ino();
-    let ns_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        if std::fs::metadata(format!("/proc/{pid}/ns/user"))
-            .map(|m| m.ino() != self_ino)
-            .unwrap_or(false)
-        {
-            break;
-        }
-        if std::time::Instant::now() >= ns_deadline {
-            anyhow::bail!("timed out waiting for user namespace (PID {pid})");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
 
     // Only a root run has a sudo invoker (`sudo_invoker` is None otherwise).
     let invoker = crate::setup::sudo_invoker().map(|user| (user.uid.as_raw(), user.gid.as_raw()));
@@ -411,125 +425,199 @@ async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What a namespace holder's start is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HolderStep {
+    /// The agent to exec, unshare its user and network namespaces and say so.
+    Unsharing,
+    /// This process to write the agent's UID and GID maps.
+    Mapping,
+    /// The agent to see its maps and say it is ready.
+    Confirming,
+}
+
+/// What is known of a holder whose start missed its deadline: the step it was in, the
+/// host's load, and the holder process's own state, read before it is killed. A deadline
+/// miss says only that the answer did not arrive; this is what says where it was.
+///
+/// `stack` is readable by root alone and `wchan` by a process allowed to trace the holder,
+/// which after its unshare is in a user namespace of its own; a field that cannot be read
+/// says so.
+fn holder_wait_diagnosis(holder_pid: u32, step: HolderStep, waited: std::time::Duration) -> String {
+    let waiting_for = match step {
+        HolderStep::Unsharing => {
+            "the agent to exec and unshare (it has not said `unshared`: it is before or \
+             inside unshare(CLONE_NEWUSER | CLONE_NEWNET))"
+        }
+        HolderStep::Mapping => "its UID and GID maps to be written (the agent has unshared)",
+        HolderStep::Confirming => {
+            "the agent to confirm its maps (it has unshared and the maps are written)"
+        }
+    };
+    let read = |path: String| {
+        std::fs::read_to_string(&path)
+            .map(|text| text.trim().to_string())
+            .unwrap_or_else(|error| format!("unreadable ({})", error.kind()))
+    };
+    let stat = read(format!("/proc/{holder_pid}/stat"));
+    // Fields after the last ')': the state letter, then from field 14 the CPU times in
+    // clock ticks.
+    // A holder that is gone has no stat: the text then is why it could not be read.
+    let (state, cpu_ticks) = match stat.rsplit_once(')') {
+        Some((_, rest)) if !stat.starts_with("unreadable") => {
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            (
+                fields.first().copied().unwrap_or("?").to_string(),
+                format!(
+                    "utime={} stime={}",
+                    fields.get(11).copied().unwrap_or("?"),
+                    fields.get(12).copied().unwrap_or("?")
+                ),
+            )
+        }
+        _ => (stat.clone(), "?".to_string()),
+    };
+    let stack = read(format!("/proc/{holder_pid}/stack"));
+    let stack = stack.lines().take(8).collect::<Vec<_>>().join(" < ");
+    format!(
+        "holder PID {holder_pid}, {} ms after its spawn, waiting for {waiting_for}; \
+         loadavg [{}]; holder state {state} ({cpu_ticks} ticks), wchan [{}], stack [{stack}]",
+        waited.as_millis(),
+        read("/proc/loadavg".to_string()),
+        read(format!("/proc/{holder_pid}/wchan")),
+    )
+}
+
+/// One attempt at a namespace holder: the agent process, its PID, and this process's end of
+/// its channel once the agent has said it is ready.
+async fn start_namespace_agent(
+    executable: &Path,
+    deadline: tokio::time::Instant,
+    attempt: u32,
+) -> anyhow::Result<(tokio::process::Child, u32)> {
+    use crate::network::netns_agent;
+    use std::os::fd::AsRawFd;
+
+    let (owner_end, agent_end) = netns_agent::channel().context("creating the agent channel")?;
+    let agent_fd = agent_end.as_raw_fd();
+    let mut cmd = tokio::process::Command::new(executable);
+    cmd.arg(netns_agent::SUBCOMMAND)
+        .arg(agent_fd.to_string())
+        .arg(std::process::id().to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    // Out of fcvm's process group, so a terminal's Ctrl+C reaches only fcvm.
+    crate::utils::own_process_group(&mut cmd);
+    // The agent's end of the channel stays open across the exec, in the child alone: the
+    // flag is cleared after the fork, so no other child this process starts inherits it.
+    // The agent arms its own parent-death signal once it has unshared (`netns_agent::run`).
+    // SAFETY: fcntl is async-signal-safe and the closure captures one integer.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::fcntl(agent_fd, libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawning the namespace agent (attempt {attempt})"))?;
+    // Only the agent holds its end now, so its exit reads as end-of-file on ours.
+    drop(agent_end);
+    let holder_pid = child.id().context("getting holder process PID")?;
+    // Its stderr from the first instant: a holder that dies later is
+    // reported with what it printed (#852).
+    crate::companion::register(
+        &mut child,
+        |line| tracing::warn!(target: "fcvm::holder", "{}", line),
+    );
+    if attempt > 1 {
+        info!(holder_pid, attempt, "namespace holder started (retry)");
+    } else {
+        info!(holder_pid, "namespace holder started");
+    }
+
+    // Which step the start has reached, and when each ended: a start that misses its
+    // deadline says where it was, and one that makes it logs how long each step took.
+    let spawned = std::time::Instant::now();
+    let step = std::cell::Cell::new(HolderStep::Unsharing);
+    let (unshared_ms, mapped_ms) = (std::cell::Cell::new(0u64), std::cell::Cell::new(0u64));
+    let start = async {
+        let client =
+            netns_agent::Client::new(owner_end).context("registering the agent channel")?;
+        client.unshared().await?;
+        unshared_ms.set(spawned.elapsed().as_millis() as u64);
+        step.set(HolderStep::Mapping);
+        // The agent is in its new user namespace and waits: the maps can be written.
+        setup_namespace_mappings(holder_pid)
+            .await
+            .context("setting up namespace mappings")?;
+        mapped_ms.set(spawned.elapsed().as_millis() as u64);
+        step.set(HolderStep::Confirming);
+        client.mapped().await?;
+        Ok::<_, anyhow::Error>(client)
+    };
+    let started = match tokio::time::timeout_at(deadline, start).await {
+        Ok(Ok(client)) => {
+            netns_agent::register(holder_pid, std::sync::Arc::new(client));
+            info!(
+                holder_pid,
+                holder_ready_ms = spawned.elapsed().as_millis() as u64,
+                unshared_ms = unshared_ms.get(),
+                mapped_ms = mapped_ms.get(),
+                "namespace holder ready"
+            );
+            return Ok((child, holder_pid));
+        }
+        Ok(Err(error)) => error,
+        // Before the kill below, which would leave nothing of the holder to read.
+        Err(_) => anyhow::anyhow!(
+            "namespace not ready within {HOLDER_RETRY_TIMEOUT:?}: {}",
+            holder_wait_diagnosis(holder_pid, step.get(), spawned.elapsed())
+        ),
+    };
+    // The channel is closed by now (`start` owned it), which is the agent's order to exit;
+    // the kill covers an agent that is not reading it.
+    let _ = child.start_kill();
+    let status = child.wait().await;
+    let report =
+        crate::companion::describe_registered("namespace holder", Some(holder_pid), status).await;
+    Err(started.context(report))
+}
+
 /// Spawn a namespace holder process and wait for it to be ready.
 ///
-/// Spawns `unshare --user --net -- sleep infinity`, writes UID/GID mappings
-/// (extended if possible, single otherwise), and waits for nsenter to work.
+/// The holder is `fcvm __netns-agent` ([`crate::network::netns_agent`]): it unshares its
+/// user and network namespaces and says so, this process writes the UID/GID mappings
+/// (extended if possible, single otherwise), and the agent confirms it is ready. Nothing is
+/// polled. This process's end of the agent's channel is registered under the holder's PID
+/// (`netns_agent::client`).
 ///
-/// Key design: gives the first holder the FULL retry deadline. Only spawns a new
-/// holder if the current one dies. Under heavy load, mapping setup may be slow
-/// due to CPU scheduling pressure — killing and respawning wastes time since
-/// the new holder faces the same pressure.
-pub async fn spawn_namespace_holder(
-    holder_cmd: &[String],
-) -> anyhow::Result<(tokio::process::Child, u32)> {
-    let deadline = std::time::Instant::now() + HOLDER_RETRY_TIMEOUT;
+/// A holder that fails before it is ready is replaced, every [`HOLDER_RETRY_INTERVAL`],
+/// until [`HOLDER_RETRY_TIMEOUT`] has passed since the first attempt.
+pub async fn spawn_namespace_holder() -> anyhow::Result<(tokio::process::Child, u32)> {
+    let executable = crate::network::netns_agent::executable()?;
+    let deadline = tokio::time::Instant::now() + HOLDER_RETRY_TIMEOUT;
     let mut attempt = 0u32;
-
     loop {
         attempt += 1;
-
-        let mut cmd = tokio::process::Command::new(&holder_cmd[0]);
-        cmd.args(&holder_cmd[1..])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped());
-        // Out of fcvm's process group, so a terminal's Ctrl+C reaches only fcvm.
-        crate::utils::own_process_group(&mut cmd);
-
-        // Kill holder if parent (fcvm) dies. Without this, holders orphan to init
-        // and accumulate when fcvm is SIGKILL'd or crashes.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+        let error = match start_namespace_agent(&executable, deadline, attempt).await {
+            Ok(holder) => return Ok(holder),
+            Err(error) => error,
+        };
+        if tokio::time::Instant::now() + HOLDER_RETRY_INTERVAL >= deadline {
+            let max_user_ns = std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
+                .unwrap_or_else(|_| "unknown".to_string());
+            return Err(error.context(format!(
+                "no namespace holder after {attempt} attempt(s) \
+                 (max_user_namespaces={})",
+                max_user_ns.trim()
+            )));
         }
-
-        let mut child = cmd.spawn().with_context(|| {
-            format!(
-                "spawning namespace holder (attempt {}): {:?}",
-                attempt, holder_cmd
-            )
-        })?;
-
-        let holder_pid = child.id().context("getting holder process PID")?;
-        // Its stderr from the first instant: a holder that dies later is
-        // reported with what it printed (#852).
-        crate::companion::register(
-            &mut child,
-            |line| tracing::warn!(target: "fcvm::holder", "{}", line),
-        );
-        if attempt > 1 {
-            info!(holder_pid, attempt, "namespace holder started (retry)");
-        } else {
-            info!(holder_pid, "namespace holder started");
-        }
-
-        // Write UID/GID mappings for the new user namespace.
-        // Must happen before wait_for_namespace_ready which checks uid_map.
-        if let Err(e) = setup_namespace_mappings(holder_pid).await {
-            warn!(holder_pid, error = %e, "failed to set up namespace mappings");
-            crate::companion::forget(holder_pid);
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(holder_pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-            if std::time::Instant::now() < deadline {
-                tokio::time::sleep(HOLDER_RETRY_INTERVAL).await;
-                continue;
-            }
-            return Err(e).context("setting up namespace mappings");
-        }
-
-        // Give this holder the FULL remaining time to become ready.
-        // Don't kill on timeout — if it times out, the deadline is exceeded anyway.
-        let result = crate::utils::wait_for_namespace_ready(holder_pid, deadline).await;
-
-        match result {
-            crate::utils::NamespaceReadyResult::Ready => {
-                return Ok((child, holder_pid));
-            }
-            crate::utils::NamespaceReadyResult::HolderDied => {
-                crate::companion::forget(holder_pid);
-                if std::time::Instant::now() < deadline {
-                    warn!(
-                        holder_pid,
-                        attempt, "holder died before namespace ready, retrying..."
-                    );
-                    tokio::time::sleep(HOLDER_RETRY_INTERVAL).await;
-                    continue;
-                } else {
-                    let max_user_ns = std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
-                        .unwrap_or_else(|_| "unknown".to_string());
-                    anyhow::bail!(
-                        "namespace holder died and no time remaining to retry \
-                         (attempt {}, holder PID {}, max_user_namespaces={})",
-                        attempt,
-                        holder_pid,
-                        max_user_ns.trim()
-                    );
-                }
-            }
-            crate::utils::NamespaceReadyResult::TimedOut => {
-                // Holder is alive but maps not written within deadline.
-                // No point killing and retrying — deadline is exceeded.
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(holder_pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-                anyhow::bail!(
-                    "namespace not ready within {:?} (holder PID {} alive, \
-                     uid_map not written — likely CPU scheduling pressure \
-                     with many concurrent VMs). Attempt {}.",
-                    HOLDER_RETRY_TIMEOUT,
-                    holder_pid,
-                    attempt
-                );
-            }
-        }
+        warn!(attempt, error = %format!("{error:#}"), "namespace holder failed to start, retrying");
+        tokio::time::sleep(HOLDER_RETRY_INTERVAL).await;
     }
 }
 
@@ -1545,6 +1633,40 @@ fn merge_with(
     Ok(stats)
 }
 
+/// For a confined start, as soon as its Firecracker binary is known and before anything is
+/// created: the binary has the seccomp filter `fcvm setup` compiled for it, unchanged
+/// ([`crate::confine::Decision::require_filter`]). A host that was upgraded and not set up
+/// again is refused here with nothing started, and so is a start whose Firecracker binary
+/// cannot be found: no start builds one (`fcvm setup` does), so there is nothing to wait
+/// for. The launch makes this check again on the binary it runs, and hands the VMM the bytes
+/// it checked.
+pub fn require_confined_filter(
+    decision: &crate::confine::Decision,
+    runtime_config: &RuntimeConfig,
+) -> Result<()> {
+    if decision.confinement().is_none() {
+        return Ok(());
+    }
+    let unfound = |why: String| {
+        anyhow::anyhow!(
+            "this start must be confined and cannot be; nothing was started:\n  seccomp: \
+             {why}, so its confined seccomp filter cannot be checked. Run `fcvm setup`"
+        )
+    };
+    let firecracker = match runtime_config.firecracker_bin.clone() {
+        Some(path) => path,
+        None => find_firecracker(runtime_config)
+            .map_err(|error| unfound(format!("no Firecracker binary was found ({error:#})")))?,
+    };
+    if !firecracker.exists() {
+        return Err(unfound(format!(
+            "the Firecracker binary {} does not exist",
+            firecracker.display()
+        )));
+    }
+    decision.require_filter(&firecracker)
+}
+
 /// Returns the path to the Firecracker binary if it exists and meets minimum version requirements.
 /// Fails with a clear error if Firecracker is not found or version is too old.
 ///
@@ -1611,34 +1733,33 @@ pub(crate) fn find_firecracker_with_version(
     Ok((firecracker_bin, version))
 }
 
+/// What `<cloud-hypervisor> --version` prints, trimmed (`cloud-hypervisor v55.0-117-g4969a51a3d3f`).
+/// Cached per binary identity, and only when the probe succeeds, so a binary that cannot
+/// run here keeps failing.
+pub(crate) fn cloud_hypervisor_version(bin: &std::path::Path) -> Option<String> {
+    crate::version_cache::version_output(bin)
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
 /// Locate the Cloud Hypervisor binary (#632).
 ///
 /// Resolution order:
 ///   1. `FCVM_CLOUD_HYPERVISOR_BIN` (explicit override)
-///   2. newest content-addressed binary built by `fcvm setup --cloud-hypervisor`
-///      (assets_dir/cloud-hypervisor/cloud-hypervisor-<sha>.bin) — offline, no git ls-remote
-///   3. `cloud-hypervisor` on PATH
-///
-/// The content-addressed lookup carries the fork build (aarch64 SVE register fix,
-/// CH #8268, post-v52.0) that CH snapshot/restore requires. Cold boot (P1) works with
-/// any v52+; the cached build is preferred so CI and dev hosts use the pinned fork.
+///   2. the build of the commit the config's `[cloud_hypervisor]` section names
+///      (assets_dir/cloud-hypervisor/cloud-hypervisor-<sha>.bin, built by
+///      `fcvm setup --cloud-hypervisor`). Its name is computed from the config, so this
+///      needs no network, and when that file is absent the lookup fails: no other build
+///      in the store and nothing on PATH stands in for the configured commit.
+///   3. `cloud-hypervisor` on PATH, only for a config with no `[cloud_hypervisor]` section
 pub fn find_cloud_hypervisor() -> Result<std::path::PathBuf> {
-    // Run `<bin> --version`; returns the trimmed version string on success.
-    // Cached per binary identity (only successful probes are cached), so a
-    // binary that cannot run here keeps failing and keeps falling through.
-    fn version_of(bin: &std::path::Path) -> Option<String> {
-        crate::version_cache::version_output(bin)
-            .ok()
-            .map(|s| s.trim().to_string())
-    }
-
     // 1. Explicit override — must exist and run; no fallback (the user asked for THIS one).
     if let Ok(path) = std::env::var("FCVM_CLOUD_HYPERVISOR_BIN") {
         let p = std::path::PathBuf::from(&path);
         if !p.exists() {
             anyhow::bail!("FCVM_CLOUD_HYPERVISOR_BIN={} does not exist", path);
         }
-        match version_of(&p) {
+        match cloud_hypervisor_version(&p) {
             Some(v) => {
                 debug!(
                     "Found Cloud Hypervisor via FCVM_CLOUD_HYPERVISOR_BIN {:?}: {}",
@@ -1650,29 +1771,69 @@ pub fn find_cloud_hypervisor() -> Result<std::path::PathBuf> {
         }
     }
 
-    // 2. Content-addressed build. A cached binary that can't run here (e.g. an assets_dir
-    //    shared across an incompatible arch/libc) must NOT mask a working PATH binary —
-    //    fall through to PATH instead of failing.
-    if let Some(cached) = crate::setup::newest_cached_cloud_hypervisor() {
-        match version_of(&cached) {
-            Some(v) => {
-                debug!(
-                    "Found Cloud Hypervisor (content-addressed build) {:?}: {}",
-                    cached, v
-                );
-                return Ok(cached);
-            }
-            None => warn!(
-                path = %cached.display(),
-                "cached cloud-hypervisor failed `--version`; falling back to PATH"
-            ),
+    let (plan, _, _) = crate::setup::rootfs::load_plan()
+        .context("reading the config that names the Cloud Hypervisor build")?;
+    find_configured_cloud_hypervisor(&plan, cloud_hypervisor_version, || {
+        which::which("cloud-hypervisor").map_err(Into::into)
+    })
+}
+
+/// [`find_cloud_hypervisor`] for the loaded config `plan`: the build it names, in the store
+/// of the assets directory it names. Both come from that one config and not from this
+/// process's paths: `fcvm fleet` starts with the default paths, and its agent looks up the
+/// build that its `fcvm vm run` commands, which read the config, run.
+fn find_configured_cloud_hypervisor(
+    plan: &crate::setup::rootfs::Plan,
+    version_of: impl Fn(&std::path::Path) -> Option<String>,
+    on_path: impl FnOnce() -> Result<std::path::PathBuf>,
+) -> Result<std::path::PathBuf> {
+    find_cloud_hypervisor_in(
+        plan.cloud_hypervisor.as_ref(),
+        &crate::setup::kernel::cloud_hypervisor_store_of(plan),
+        version_of,
+        on_path,
+    )
+}
+
+/// [`find_cloud_hypervisor`] after the override: the configured build in `store`, or PATH
+/// when nothing is configured. `version_of` and `on_path` are parameters so tests need
+/// neither a real binary nor the process's PATH.
+fn find_cloud_hypervisor_in(
+    pin: Option<&crate::setup::rootfs::CloudHypervisorConfig>,
+    store: &std::path::Path,
+    version_of: impl Fn(&std::path::Path) -> Option<String>,
+    on_path: impl FnOnce() -> Result<std::path::PathBuf>,
+) -> Result<std::path::PathBuf> {
+    // 2. The configured build, or nothing.
+    if let Some(pin) = pin {
+        let bin = crate::setup::kernel::cloud_hypervisor_path_in(store, pin)?;
+        if !bin.exists() {
+            anyhow::bail!(
+                "Cloud Hypervisor commit {} of {} is not built here ({} is missing): run \
+                 `fcvm setup --cloud-hypervisor`, or set FCVM_CLOUD_HYPERVISOR_BIN",
+                pin.commit,
+                pin.repo,
+                bin.display()
+            );
         }
+        return match version_of(&bin) {
+            Some(v) => {
+                debug!("Found Cloud Hypervisor (configured build) {:?}: {}", bin, v);
+                Ok(bin)
+            }
+            None => anyhow::bail!(
+                "the Cloud Hypervisor build of commit {} ({}) failed `--version`; remove it and \
+                 run `fcvm setup --cloud-hypervisor`",
+                pin.commit,
+                bin.display()
+            ),
+        };
     }
 
-    // 3. PATH.
-    let bin = which::which("cloud-hypervisor").context(
-        "cloud-hypervisor not found: build it with `fcvm setup --cloud-hypervisor`, \
-         set FCVM_CLOUD_HYPERVISOR_BIN, or install it on PATH",
+    // 3. PATH, for a config that names no build.
+    let bin = on_path().context(
+        "cloud-hypervisor not found: the config has no [cloud_hypervisor] section to build \
+         one from; set FCVM_CLOUD_HYPERVISOR_BIN, or install it on PATH",
     )?;
     match version_of(&bin) {
         Some(v) => {
@@ -1689,7 +1850,7 @@ pub fn find_cloud_hypervisor() -> Result<std::path::PathBuf> {
 /// Parse Firecracker version from --version output
 ///
 /// Expected format: "Firecracker v1.14.0" or similar
-fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
+pub(crate) fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
     // Find version number pattern vX.Y.Z, with an optional pre-release suffix (-dev).
     let version_re =
         regex::Regex::new(r"v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?")
@@ -1711,6 +1872,9 @@ fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
         release: (major, minor, patch),
         prerelease: caps.get(4).is_some(),
         drive_overrides: build.first() == Some(&"fcvm") && build.contains(&"drive-overrides"),
+        numa_window: build.first() == Some(&"fcvm") && build.contains(&"numa-window"),
+        write_set: build.first() == Some(&"fcvm") && build.contains(&"write-set"),
+        tap_fd: build.first() == Some(&"fcvm") && build.contains(&"tap-fd"),
     })
 }
 
@@ -1724,6 +1888,28 @@ pub(crate) struct FirecrackerVersion {
     /// Whether the build metadata says the snapshot load takes `drive_overrides`
     /// (`+fcvm.drive-overrides`, ejc3/firecracker).
     pub drive_overrides: bool,
+    /// Whether the build takes `--numa-balancing-after-secs` (`+fcvm.…numa-window`).
+    pub numa_window: bool,
+    /// Whether a File-backend load takes `mem_backend.write_set_path` (`+fcvm.…write-set`).
+    /// Earlier builds refuse the field.
+    pub write_set: bool,
+    /// Whether the build metadata says a net device takes `host_dev_fd`, a TAP queue the
+    /// VMM inherited (`tap-fd` after `+fcvm.`, ejc3/firecracker).
+    pub tap_fd: bool,
+}
+
+/// The context of a snapshot load that failed. A restore that died under its memory server
+/// is told from other failed restores by it (`restore_failure_with_its_memory_server`).
+pub(crate) const LOADING_SNAPSHOT: &str = "loading snapshot";
+
+/// Whether the Firecracker at `bin` takes `--numa-balancing-after-secs`. False when its
+/// version cannot be read: the flag is then left off, which leaves its guest memory under
+/// the default policy.
+pub(crate) fn firecracker_takes_numa_window(bin: &Path) -> bool {
+    crate::version_cache::version_output(bin)
+        .ok()
+        .and_then(|out| parse_firecracker_version(&out).ok())
+        .is_some_and(|version| version.numa_window)
 }
 
 impl FirecrackerVersion {
@@ -1732,6 +1918,38 @@ impl FirecrackerVersion {
     fn at_least(&self, min: (u32, u32, u32)) -> bool {
         self.release > min || (self.release == min && !self.prerelease)
     }
+}
+
+/// Whether a clone restored by `backend` gets its TAP as a queue it inherits, which is what
+/// lets it run in a pooled namespace (`crate::netpool`): a pooled TAP is attached once, by
+/// its namespace's holder, and nothing can attach to it by name. `firecracker` is the
+/// version of the binary the restore runs, when the backend is Firecracker and the binary
+/// could be read.
+pub(crate) fn vmm_takes_a_tap_queue(
+    backend: crate::hypervisor::Backend,
+    firecracker: Option<FirecrackerVersion>,
+) -> bool {
+    backend == crate::hypervisor::Backend::Firecracker
+        && firecracker.is_some_and(|version| version.tap_fd)
+}
+
+/// A clone that was lent a pooled namespace hands its VMM the TAP's queue, and only a
+/// Firecracker whose version says `tap-fd` takes one. The claim was made for a binary that
+/// does ([`vmm_takes_a_tap_queue`]); this is the same question asked of the binary the
+/// restore is about to run, so a mismatch between the two is named here and not by the
+/// snapshot load refusing a field it does not know.
+pub(crate) fn tap_queue_needs_its_capability(
+    tap_fd: Option<std::os::fd::RawFd>,
+    firecracker: FirecrackerVersion,
+) -> Result<()> {
+    if tap_fd.is_some() && !firecracker.tap_fd {
+        bail!(
+            "this clone was lent a pooled namespace, whose TAP is a queue the VMM inherits, and \
+             the Firecracker that restores it does not take one (no `tap-fd` in its version): \
+             the binary the claim was made for is not the one the restore runs"
+        );
+    }
+    Ok(())
 }
 
 /// Save VM state with complete network configuration
@@ -2411,6 +2629,7 @@ async fn cleanup_vm_inner(
                 .context("waiting for namespace holder process")?;
             if let Some(pid) = pid {
                 crate::companion::forget(pid);
+                crate::network::netns_agent::forget(pid);
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -2511,7 +2730,7 @@ async fn cleanup_vm_inner(
     failures.record("saving the container's output", logs_saved);
     failures.record("removing VM data directory", data_dir_removed);
     // Teardown removed what it made. This deletes the VM's owner record; a resource it
-    // cannot remove stays recorded for the next launch (crate::reclaim).
+    // cannot remove stays recorded for the next sweep (crate::reclaim).
     failures.record(
         "reclaiming the VM's recorded resources",
         crate::reclaim::complete(&vm_id).await,
@@ -2537,7 +2756,12 @@ pub enum MemoryBackend {
     /// Load memory directly from file (used by podman cache restore).
     /// Firecracker maps the snapshot file MAP_PRIVATE, so clean pages are shared through
     /// the host page cache and guest writes CoW.
-    File { memory_path: PathBuf },
+    File {
+        memory_path: PathBuf,
+        /// The snapshot generation's recorded write set (`storage::write_set`), which
+        /// Firecracker populates writable before the VM runs, when the file exists.
+        write_set: Option<PathBuf>,
+    },
     /// Use UFFD server for on-demand page loading (used by snapshot clones).
     /// MISSING faults on anonymous memory, resolved with UFFDIO_COPY: lazy, but every
     /// faulted page becomes a private per-clone copy.
@@ -2637,6 +2861,10 @@ pub struct SnapshotRestoreConfig {
     pub extra_disks: Vec<crate::storage::snapshot::SnapshotExtraDisk>,
     /// Snapshot directory for extra disk source files
     pub snapshot_dir: Option<PathBuf>,
+    /// The Cloud Hypervisor build that wrote the snapshot, as its metadata records it
+    /// (`SnapshotMetadata::cloud_hypervisor_version`). A Cloud Hypervisor restore refuses a
+    /// snapshot another build wrote; a Firecracker restore does not read it.
+    pub cloud_hypervisor_version: Option<String>,
 }
 
 /// What Firecracker reports when it cannot read a snapshot's format, from
@@ -2646,8 +2874,8 @@ pub struct SnapshotRestoreConfig {
 /// first ("An error occurred during bitcode serialization: <cause>"), which is what
 /// v1.17.0 reports for a format 11 snapshot.
 const FIRECRACKER_UNREADABLE_SNAPSHOT: [&str; 2] = [
-    "Invalid data version",
-    "An error occurred during bitcode serialization",
+    crate::firecracker::error_text::INVALID_DATA_VERSION,
+    crate::firecracker::error_text::STATE_DOES_NOT_DECODE,
 ];
 
 /// Why a Firecracker restore runs on the binary it runs on.
@@ -2836,16 +3064,98 @@ fn snapshot_load_drive_overrides(
     Some(overrides)
 }
 
-/// The VM directories a restore's snapshot names its disks under: the VM the snapshot
+/// The ids of the VMs a restore's snapshot names its disks under: the VM the snapshot
 /// lineage started from, and the VM the snapshot was taken of when that is another one.
-fn clone_source_dirs(restore_config: &SnapshotRestoreConfig) -> Vec<PathBuf> {
-    let mut dirs = vec![paths::vm_runtime_dir(&restore_config.original_vm_id)];
-    if let Some(ref snapshot_vm_id) = restore_config.snapshot_vm_id {
-        if snapshot_vm_id != &restore_config.original_vm_id {
-            dirs.push(paths::vm_runtime_dir(snapshot_vm_id));
+fn source_vm_ids<'a>(original_vm_id: &'a str, snapshot_vm_id: Option<&'a str>) -> Vec<&'a str> {
+    let mut ids = vec![original_vm_id];
+    if let Some(snapshot_vm_id) = snapshot_vm_id {
+        if snapshot_vm_id != original_vm_id {
+            ids.push(snapshot_vm_id);
+        }
+    }
+    ids
+}
+
+/// The source VMs' runtime directories as the snapshot recorded them: each directory `D`
+/// named by one of `ids`, inside this host's `vm-disks`, for which a disk path the snapshot
+/// names is under `D/disks/`. What the snapshot recorded is what the VMM will open, so these
+/// are the directories to check (#608) and to redirect, whatever layout the build that made
+/// the snapshot used (`vm-disks/<id>`, or `vm-disks/<bucket>/<id>`).
+///
+/// A directory outside `vm-disks` of this data directory is not taken (a snapshot made under
+/// another data directory, #638), nor one named by another VM's id (a sibling's disk, #608):
+/// the coverage check then refuses the restore.
+fn recorded_source_dirs<'p>(
+    disk_paths: impl IntoIterator<Item = &'p Path>,
+    ids: &[&str],
+) -> Vec<PathBuf> {
+    let vm_disks = paths::vm_disks_dir();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for path in disk_paths {
+        let dir = path.ancestors().skip(1).find(|dir| {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| ids.contains(&name))
+        });
+        let Some(dir) = dir else {
+            continue;
+        };
+        let under_disks = path.starts_with(dir.join("disks"));
+        if under_disks
+            && dir.starts_with(&vm_disks)
+            && dir != vm_disks
+            && !dirs.iter().any(|d| d == dir)
+        {
+            dirs.push(dir.to_path_buf());
         }
     }
     dirs
+}
+
+/// The disk paths inside this host's `vm-disks` that a VMM state names, as far as
+/// `recorded_source_dirs` needs them: for each occurrence of `<data_dir>/vm-disks/` followed
+/// by `<id>/disks/` or by one directory and `<id>/disks/`, for an id of `ids`, the path up
+/// to and including `disks/`. The serialized state gives no reliable end to a string, so the
+/// path is matched by its known parts and never read to an end; the data directory's own
+/// bytes are matched exactly.
+fn vmstate_vm_disks_paths(bytes: &[u8], ids: &[&str]) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let vm_disks = paths::vm_disks_dir();
+    let mut prefix = vm_disks.as_os_str().as_bytes().to_vec();
+    prefix.push(b'/');
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = bytes[from..]
+        .windows(prefix.len())
+        .position(|window| window == prefix.as_slice())
+    {
+        let rest = &bytes[from + at + prefix.len()..];
+        for id in ids {
+            let mut tail = id.as_bytes().to_vec();
+            tail.extend_from_slice(b"/disks/");
+            if rest.starts_with(&tail) {
+                found.push(vm_disks.join(id).join("disks/"));
+                continue;
+            }
+            // One directory between vm-disks and the id: a bucket, short and plain.
+            let Some(slash) = rest.iter().take(64).position(|byte| *byte == b'/') else {
+                continue;
+            };
+            let segment = &rest[..slash];
+            let plain =
+                !segment.is_empty() && segment.iter().all(|b| b.is_ascii_graphic() && *b != b'/');
+            if plain && rest[slash + 1..].starts_with(&tail) {
+                found.push(
+                    vm_disks
+                        .join(std::ffi::OsStr::from_bytes(segment))
+                        .join(id)
+                        .join("disks/"),
+                );
+            }
+        }
+        from += at + prefix.len();
+    }
+    found
 }
 
 /// The vsock base path a restored VMM's state names, which a snapshot of the clone
@@ -3030,6 +3340,8 @@ pub async fn load_vm_state(
 
 /// Parameters for snapshot restore, grouping the many read-only inputs.
 pub struct RestoreParams<'a> {
+    /// From the restore's [`crate::confine::resolve`]; the VMM is spawned under it.
+    pub decision: crate::confine::Decision,
     pub vm_id: &'a str,
     pub vm_name: &'a str,
     pub data_dir: &'a Path,
@@ -3100,6 +3412,10 @@ pub struct GuestProxy {
     pub no_proxy: Option<String>,
 }
 
+/// The restore document's key that says this host takes fc-agent's `agent` stream;
+/// fc-agent's `LatestMetadata::agent_log`.
+pub const RESTORE_AGENT_LOG_KEY: &str = "agent-log";
+
 impl RestoreIdentity {
     /// Add this identity to a restore document. "host-ipv6" is always written, null
     /// when there is none, because the guest sets its address to exactly this.
@@ -3119,6 +3435,12 @@ impl RestoreIdentity {
             "https_proxy": self.proxy.https_proxy,
             "no_proxy": self.proxy.no_proxy,
         });
+        // This fcvm's output listener takes fc-agent's own lines (the `agent` stream) and
+        // logs them (`run_output_listener`). fc-agent sends a restore's progress lines
+        // there only when the document says so; without it, as from an fcvm older than
+        // the stream, it writes them to the serial console (fc-agent
+        // `console::release_source_snapshot_hold`).
+        document[RESTORE_AGENT_LOG_KEY] = serde_json::Value::Bool(true);
     }
 }
 
@@ -3143,7 +3465,15 @@ fn rootfs_disk_vm_ids_in_bytes(bytes: &[u8]) -> Vec<String> {
         .windows(PREFIX.len())
         .position(|w| w == PREFIX)
     {
-        let id_start = search_from + rel + PREFIX.len();
+        let mut id_start = search_from + rel + PREFIX.len();
+        // `vm-disks/<bucket>/<id>` (paths::vm_runtime_dir), or `vm-disks/<id>` from builds
+        // before the buckets.
+        let bucket = bytes.get(id_start..id_start + 3);
+        if bucket.is_some_and(|b| {
+            b[2] == b'/' && std::str::from_utf8(&b[..2]).is_ok_and(paths::is_vm_bucket)
+        }) {
+            id_start += 3;
+        }
         let mut id_end = id_start;
         while id_end < bytes.len() {
             let c = bytes[id_end];
@@ -3289,6 +3619,75 @@ fn view_children(view: &Path, wanted: fn(&std::fs::FileType) -> bool) -> Result<
     Ok(children)
 }
 
+/// The view's entries with every bucket (`paths::is_vm_bucket`) that holds a redirect's
+/// mountpoint or one of the clone's own directories replaced by that bucket's own entries.
+///
+/// The view's direct entries are buckets (and, from builds before the buckets, VM
+/// directories). A bucket that held a mountpoint and were bound onto itself would put that
+/// mountpoint on the host's real directory under it, whose removal by its VM's teardown
+/// detaches the clone's mount (#1187); kept whole after the pairs, it would cover them.
+/// So such a bucket is made in the view's tmpfs like the mountpoints in it, and its entries
+/// are kept one by one, one bucket's worth, not every VM's: its directories (returned first)
+/// and its regular files (returned second, for `keep_files`), such as a read-only `--disk`
+/// image a source VM was given from inside the bucket.
+fn expand_buckets(
+    entries: Vec<PathBuf>,
+    pairs: &[(PathBuf, PathBuf)],
+    own: &[&Path],
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut expanded = Vec::with_capacity(entries.len());
+    let mut files = Vec::new();
+    for entry in entries {
+        let bucket = entry
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(paths::is_vm_bucket);
+        let holds = pairs
+            .iter()
+            .map(|(mountpoint, _)| mountpoint.as_path())
+            .chain(own.iter().copied())
+            .any(|path| path != entry && path.starts_with(&entry));
+        if bucket && holds {
+            expanded.extend(view_entries(&entry)?);
+            files.extend(view_files(&entry)?);
+        } else {
+            expanded.push(entry);
+        }
+    }
+    expanded.sort();
+    files.sort();
+    Ok((expanded, files))
+}
+
+/// The mount view of a clone's VMM, or `None` when the snapshot load overrides every source
+/// path and the VMM needs no mount namespace.
+///
+/// With `None` nothing under `view` is read. `view` is the directory every VM's runtime
+/// directory is in, so listing it costs a directory entry per VM alive, and btrfs takes a
+/// directory's lock exclusively to open it for reading and again in each read of it, which
+/// is the lock every other start's `mkdir` of its own runtime directory needs. Two listings
+/// a start (directories, then files) made that lock the one thing every start queued on:
+/// of 1555 ms a clone spent asleep on locks and I/O in a ramp of 1000 at 512 at a time,
+/// 641 ms was these listings waiting for it and 133 ms the `mkdir`s waiting behind them
+/// (c8gd.metal-24xl, 7.0.0-1018-aws, btrfs on NVMe, 2026-11-25).
+fn clone_mount_redirects(
+    overrides: LoadOverrides,
+    view: &Path,
+    pairs: Vec<(PathBuf, PathBuf)>,
+    clone_dir: &Path,
+    vsock_target_dir: &Path,
+) -> Result<Option<crate::utils::MountRedirects>> {
+    if overrides == LoadOverrides::Everything {
+        return Ok(None);
+    }
+    let (entries, bucket_files) =
+        expand_buckets(view_entries(view)?, &pairs, &[clone_dir, vsock_target_dir])?;
+    let mut redirects = clone_mount_view(view, pairs, clone_dir, vsock_target_dir, &entries)?;
+    redirects.keep_files = view_files(view)?;
+    redirects.keep_files.extend(bucket_files);
+    Ok(Some(redirects))
+}
+
 /// The mount namespace for a clone's VMM: `pairs` (from [`build_clone_mount_redirects`])
 /// under a tmpfs over `view`, the directory every VM's runtime directory is in.
 ///
@@ -3391,7 +3790,7 @@ fn assert_vmstate_rootfs_covered(
     vmstate_path: &Path,
     original_vm_id: &str,
     snapshot_vm_id: Option<&str>,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     // Fail CLOSED: if we cannot read vmstate we cannot verify coverage, and Firecracker
     // may still open whatever path it has embedded — so abort rather than proceed blind.
     let bytes = std::fs::read(vmstate_path).with_context(|| {
@@ -3400,12 +3799,9 @@ fn assert_vmstate_rootfs_covered(
             vmstate_path.display()
         )
     })?;
-    let mut covered_dirs = vec![paths::vm_runtime_dir(original_vm_id)];
-    if let Some(s) = snapshot_vm_id {
-        if s != original_vm_id {
-            covered_dirs.push(paths::vm_runtime_dir(s));
-        }
-    }
+    let ids = source_vm_ids(original_vm_id, snapshot_vm_id);
+    let recorded = vmstate_vm_disks_paths(&bytes, &ids);
+    let covered_dirs = recorded_source_dirs(recorded.iter().map(PathBuf::as_path), &ids);
     if vmstate_rootfs_covered(&bytes, &covered_dirs) {
         // #608 diagnostics: the observed ~0.7% sibling-disk failure has never been
         // caught with its inputs visible (the metadata-divergence hypothesis was
@@ -3424,7 +3820,7 @@ fn assert_vmstate_rootfs_covered(
             data_dir = %paths::data_dir().display(),
             "#608 coverage check passed"
         );
-        return Ok(());
+        return Ok(covered_dirs);
     }
     anyhow::bail!(
         "#608: refusing to restore — vmstate.bin does not reference a rootfs disk under any \
@@ -3480,13 +3876,17 @@ fn assert_ch_config_disks_covered(
     cfg: &serde_json::Value,
     original_vm_id: &str,
     snapshot_vm_id: Option<&str>,
-) -> Result<()> {
-    let mut covered_dirs = vec![paths::vm_runtime_dir(original_vm_id)];
-    if let Some(s) = snapshot_vm_id {
-        if s != original_vm_id {
-            covered_dirs.push(paths::vm_runtime_dir(s));
-        }
-    }
+) -> Result<Vec<PathBuf>> {
+    let ids = source_vm_ids(original_vm_id, snapshot_vm_id);
+    let disk_paths: Vec<&Path> = cfg
+        .get("disks")
+        .and_then(|disks| disks.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|disk| disk.get("path").and_then(|path| path.as_str()))
+        .map(Path::new)
+        .collect();
+    let covered_dirs = recorded_source_dirs(disk_paths, &ids);
     if let Some(path) = ch_config_uncovered_writable_disk(cfg, &covered_dirs) {
         anyhow::bail!(
             "#608 (CH): refusing to restore — snapshot config.json references writable disk \
@@ -3501,7 +3901,7 @@ fn assert_ch_config_disks_covered(
             paths::data_dir().display(),
         );
     }
-    Ok(())
+    Ok(covered_dirs)
 }
 
 /// Refuse a Cloud Hypervisor restore whose snapshot config does not name the exact
@@ -3593,22 +3993,24 @@ async fn cleanup_failed_clone_holder(holder: &mut Option<tokio::process::Child>,
 /// change for Firecracker); the only difference is it records the namespace isolation into a
 /// [`NamespaceParams`](crate::utils::NamespaceParams) instead of mutating a `VmManager`, so a
 /// Cloud Hypervisor backend can apply the same isolation to its `ProcessSpec`.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_clone_substrate(
     network: &mut dyn NetworkManager,
     restore_config: &SnapshotRestoreConfig,
+    // The source VMs' runtime directories as the snapshot recorded them
+    // (`recorded_source_dirs`, from the hypervisor's coverage check).
+    source_dirs: &[PathBuf],
     vm_id: &str,
     data_dir: &Path,
     vm_state: &mut VmState,
     // What the snapshot load overrides, so needs no redirect.
     overrides: LoadOverrides,
+    decision: &crate::confine::Decision,
 ) -> Result<CloneSubstrate> {
     let vm_dir = data_dir.join("disks");
     let mut holder_child: Option<tokio::process::Child> = None;
     let mut holder_pid_for_post_start: Option<u32> = None;
-    let mut namespace = crate::utils::NamespaceParams {
-        vm_id: vm_id.to_string(),
-        ..Default::default()
-    };
+    let mut namespace = crate::utils::NamespaceParams::new(vm_id, decision.clone());
 
     // rootfs_path is set by either the bridged, rootless, or routed branch.
     let rootfs_path: PathBuf;
@@ -3633,15 +4035,45 @@ async fn prepare_clone_substrate(
             source_disk = %restore_config.source_disk_path.display(),
             "CoW disk prepared from snapshot"
         );
+    } else if let Some(lease) = network
+        .as_any()
+        .downcast_ref::<PastaNetwork>()
+        .and_then(PastaNetwork::lease)
+    {
+        // Rootless mode in a pooled namespace (`crate::netpool`): the namespace, its links
+        // and its pasta exist. The VMM enters it through the descriptors the pool sent and
+        // keeps the lease open for as long as it runs.
+        let disk_manager = DiskManager::new(
+            vm_id.to_string(),
+            restore_config.source_disk_path.clone(),
+            vm_dir.clone(),
+        );
+        rootfs_path = disk_manager
+            .create_cow_disk()
+            .await
+            .context("creating CoW disk from snapshot")?;
+        info!(
+            rootfs = %rootfs_path.display(),
+            source_disk = %restore_config.source_disk_path.display(),
+            slot = lease.grant.slot,
+            "CoW disk prepared from snapshot (pooled namespace)"
+        );
+        namespace.user_namespace_path = Some(lease.user_namespace_path());
+        namespace.net_namespace_path = Some(lease.net_namespace_path());
+        // The lease, and the queue of the namespace's TAP: the VMM uses the device through
+        // it and attaches nothing.
+        namespace.keep_fds = vec![lease.fd(), lease.tap_fd()];
+        vm_state.holder_pid = Some(lease.grant.holder_pid);
+        vm_state.netpool = Some(crate::state::PooledNamespace {
+            slot: lease.grant.slot,
+            generation: lease.grant.generation,
+        });
+        holder_pid_for_post_start = Some(lease.grant.holder_pid);
     } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
         // Rootless mode: spawn holder process, then run disk creation and network setup
-        // in parallel via nsenter.
-        let holder_cmd = pasta_net.build_holder_command();
-        info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
-        let (mut child, holder_pid) = spawn_namespace_holder(&holder_cmd).await?;
-
-        let setup_script = pasta_net.build_setup_script();
-        let nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
+        // in parallel.
+        info!("spawning namespace holder for rootless networking");
+        let (mut child, holder_pid) = spawn_namespace_holder().await?;
 
         let source_disk = restore_config.source_disk_path.clone();
         let disk_task = async {
@@ -3659,50 +4091,7 @@ async fn prepare_clone_substrate(
             Ok::<_, anyhow::Error>(rootfs_path)
         };
 
-        let network_task = async {
-            let ns_poll_start = std::time::Instant::now();
-            info!(holder_pid = holder_pid, "running network setup via nsenter");
-            // One nsenter+bash+ip for the whole phase, TAP verification included
-            // as the last batch step (ip -batch aborts at the first failure, so
-            // reaching it proves every step above applied).
-            loop {
-                if !crate::utils::is_process_alive(holder_pid) {
-                    anyhow::bail!(
-                        "holder process (PID {}) died before network setup could run",
-                        holder_pid
-                    );
-                }
-                let output = tokio::process::Command::new(&nsenter_prefix[0])
-                    .args(&nsenter_prefix[1..])
-                    .arg("bash")
-                    .arg("-c")
-                    .arg(setup_script.script())
-                    .output()
-                    .await
-                    .context("running network setup via nsenter")?;
-                if output.status.success() {
-                    debug!("namespace ready after {:?}", ns_poll_start.elapsed());
-                    break;
-                }
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if stderr.contains("Invalid argument") || stderr.contains("No such process") {
-                    if ns_poll_start.elapsed() > NSENTER_MAX_WAIT {
-                        anyhow::bail!(
-                            "namespace not ready after {:?}: {}",
-                            ns_poll_start.elapsed(),
-                            stderr
-                        );
-                    }
-                    tokio::time::sleep(NSENTER_POLL_INTERVAL).await;
-                    continue;
-                }
-                anyhow::bail!(
-                    "network setup failed: {}",
-                    setup_script.describe_failure(&stderr)
-                );
-            }
-            Ok::<_, anyhow::Error>(())
-        };
+        let network_task = pasta_net.build_namespace(holder_pid);
 
         let (disk_result, network_result) = tokio::join!(disk_task, network_task);
         if let Err(e) = &disk_result {
@@ -3711,7 +4100,7 @@ async fn prepare_clone_substrate(
         }
         if let Err(e) = &network_result {
             let _ = child.kill().await;
-            return Err(anyhow::anyhow!("network setup failed: {}", e));
+            return Err(anyhow::anyhow!("network setup failed: {:#}", e));
         }
         rootfs_path = disk_result?;
         network_result?;
@@ -3761,7 +4150,7 @@ async fn prepare_clone_substrate(
     // A load that overrides every such path needs neither the namespace nor the lease.
     let disk_dirs = match overrides {
         LoadOverrides::Everything => Vec::new(),
-        LoadOverrides::None | LoadOverrides::Vsock => clone_source_dirs(restore_config),
+        LoadOverrides::None | LoadOverrides::Vsock => source_dirs.to_vec(),
     };
     let vsock_target_dir = restore_config
         .vsock_target_dir
@@ -3780,34 +4169,27 @@ async fn prepare_clone_substrate(
         .iter()
         .any(|(mountpoint, _)| mountpoint.file_name() == Some(std::ffi::OsStr::new("disks")))
     {
-        tokio::fs::create_dir_all(vsock_target_dir.join("disks"))
+        crate::paths::ensure_dir_async(vsock_target_dir.join("disks"))
             .await
             .context("creating disks backing dir inside the vsock target")?;
     }
     let view = paths::data_dir().join("vm-disks");
-    let redirects = match view_entries(&view).and_then(|entries| {
-        let mut redirects =
-            clone_mount_view(&view, redirects, data_dir, &vsock_target_dir, &entries)?;
-        redirects.keep_files = view_files(&view)?;
-        Ok(redirects)
-    }) {
-        Ok(redirects) => redirects,
+    match clone_mount_redirects(overrides, &view, redirects, data_dir, &vsock_target_dir) {
+        Ok(Some(redirects)) => {
+            info!(
+                view = %redirects.view.display(),
+                redirects = ?redirects.pairs.iter().map(|(m, s)| format!("{} <- {}", m.display(), s.display())).collect::<Vec<_>>(),
+                "enabling mount namespace for path isolation"
+            );
+            namespace.mount_redirects = Some(redirects);
+        }
+        Ok(None) => info!(
+            "the snapshot load overrides every source path; the VMM runs without a mount namespace"
+        ),
         Err(error) => {
             cleanup_failed_clone_holder(&mut holder_child, "building the clone's mount view").await;
             return Err(error);
         }
-    };
-    info!(
-        view = %redirects.view.display(),
-        redirects = ?redirects.pairs.iter().map(|(m, s)| format!("{} <- {}", m.display(), s.display())).collect::<Vec<_>>(),
-        "enabling mount namespace for path isolation"
-    );
-    if overrides == LoadOverrides::Everything {
-        info!(
-            "the snapshot load overrides every source path; the VMM runs without a mount namespace"
-        );
-    } else {
-        namespace.mount_redirects = Some(redirects);
     }
 
     // The VMM opens the snapshot's disks at these directories' paths, which its view binds
@@ -3908,6 +4290,7 @@ pub async fn restore_from_snapshot(
     vm_state: &mut VmState,
 ) -> Result<RestoredVmm<FirecrackerBackend>> {
     let RestoreParams {
+        decision,
         vm_id,
         vm_name,
         data_dir,
@@ -3931,7 +4314,7 @@ pub async fn restore_from_snapshot(
 
     // #608: abort BEFORE any side effects (holder/disk) if vmstate's rootfs path would not
     // be covered by the mount redirect — otherwise LoadSnapshot opens a sibling VM's disk.
-    assert_vmstate_rootfs_covered(
+    let source_dirs = assert_vmstate_rootfs_covered(
         &restore_config.vmstate_path,
         &restore_config.original_vm_id,
         restore_config.snapshot_vm_id.as_deref(),
@@ -3945,6 +4328,7 @@ pub async fn restore_from_snapshot(
     // pure validation and must not create a process that a later `?` can detach.
     let (firecracker_bin, firecracker_version) =
         restore_firecracker_bin(runtime_config, &firecracker_choice, vm_state)?;
+    tap_queue_needs_its_capability(network_config.tap_fd, firecracker_version)?;
     let clone_vsock_socket_path = vm_state
         .config
         .vsock_socket_path
@@ -3962,7 +4346,7 @@ pub async fn restore_from_snapshot(
         firecracker_version,
         vsock_override.is_some(),
         &vmstate,
-        &clone_source_dirs(restore_config),
+        &source_dirs,
         &restore_config.source_vsock_socket_path,
         &restore_config.extra_disks,
         &vm_dir,
@@ -3979,10 +4363,12 @@ pub async fn restore_from_snapshot(
     let mut substrate = prepare_clone_substrate(
         network,
         restore_config,
+        &source_dirs,
         vm_id,
         data_dir,
         vm_state,
         load_overrides,
+        &decision,
     )
     .await?;
     failpoint::hit_async("restore.post_clone_disk").await;
@@ -4003,6 +4389,7 @@ pub async fn restore_from_snapshot(
         vm_id.to_string(),
         socket_path.to_path_buf(),
         Some(fc_log_path),
+        decision.clone(),
     );
     vm_manager.set_vm_name(vm_name.to_string());
     // Apply the substrate's namespace/mount isolation to the Firecracker VmManager (the
@@ -4017,6 +4404,14 @@ pub async fn restore_from_snapshot(
     if let Some(p) = &ns.net_namespace_path {
         vm_manager.set_net_namespace_path(p.clone());
     }
+    vm_manager.set_keep_fds(ns.keep_fds.clone());
+    // A confined clone never runs in a pooled namespace (`clone_may_pool`), so this TAP is
+    // its own.
+    vm_manager.set_tap_owner(
+        decision
+            .confinement()
+            .map(|_| network.tap_device().to_string()),
+    );
     if let Some(redirects) = &ns.mount_redirects {
         vm_manager.set_mount_redirects(redirects.clone());
     }
@@ -4059,7 +4454,7 @@ pub async fn restore_from_snapshot(
         // process runs. A memory server that starts for another snapshot then leaves its
         // page cache alone. Best effort, like a server's mark: without it the restore works
         // and may read pages from disk.
-        if let MemoryBackend::File { memory_path } = &restore_config.memory_backend {
+        if let MemoryBackend::File { memory_path, .. } = &restore_config.memory_backend {
             if let Err(error) = vm_manager.mark_memory_in_use(memory_path).await {
                 warn!(
                     error = %format!("{error:#}"),
@@ -4078,14 +4473,22 @@ pub async fn restore_from_snapshot(
         };
 
         let mem_backend = match &restore_config.memory_backend {
-            MemoryBackend::File { memory_path } => {
+            MemoryBackend::File {
+                memory_path,
+                write_set,
+            } => {
                 info!(
                     memory = %memory_path.display(),
                     "loading snapshot with File backend"
                 );
+                let write_set = write_set.as_ref().filter(|p| p.is_file());
+                if let Some(path) = write_set {
+                    info!(write_set = %path.display(), "populating the recorded write set before resume");
+                }
                 MemBackend {
                     backend_type: "File".to_string(),
                     backend_path: memory_path.display().to_string(),
+                    write_set_path: write_set.map(|p| p.display().to_string()),
                 }
             }
             MemoryBackend::Uffd { socket_path } => {
@@ -4096,6 +4499,7 @@ pub async fn restore_from_snapshot(
                 MemBackend {
                     backend_type: "Uffd".to_string(),
                     backend_path: socket_path.display().to_string(),
+                    write_set_path: None,
                 }
             }
             MemoryBackend::UffdMinor { socket_path } => {
@@ -4106,6 +4510,7 @@ pub async fn restore_from_snapshot(
                 MemBackend {
                     backend_type: "UffdMinor".to_string(),
                     backend_path: socket_path.display().to_string(),
+                    write_set_path: None,
                 }
             }
             MemoryBackend::Prefilled { socket_path, .. } => {
@@ -4116,6 +4521,7 @@ pub async fn restore_from_snapshot(
                 MemBackend {
                     backend_type: "Prefilled".to_string(),
                     backend_path: socket_path.display().to_string(),
+                    write_set_path: None,
                 }
             }
         };
@@ -4149,6 +4555,7 @@ pub async fn restore_from_snapshot(
                 network_overrides: Some(vec![NetworkOverride {
                     iface_id: "eth0".to_string(),
                     host_dev_name: network_config.tap_device.clone(),
+                    host_dev_fd: network_config.tap_fd,
                 }]),
                 vsock_override: vsock_override.clone(),
                 drive_overrides: drive_overrides.clone(),
@@ -4156,7 +4563,7 @@ pub async fn restore_from_snapshot(
                 huge_pages,
             })
             .await
-            .context("loading snapshot")
+            .context(LOADING_SNAPSHOT)
             .map_err(|error| {
                 match firecracker_choice.load_failure_hint(&error, &firecracker_bin) {
                     Some(hint) => error.context(hint),
@@ -4164,6 +4571,10 @@ pub async fn restore_from_snapshot(
                 }
             })?;
         let load_duration = load_start.elapsed();
+        // The load built the VM and left it paused. A confined VMM's threads are checked
+        // here, before the guest is resumed, so a clone never runs unfiltered: a failure
+        // leaves this block, whose error path kills the VMM.
+        vm_manager.check_confined().await?;
         if let Some(sender) = prefilled_sender {
             // The load returned, so Firecracker connected and mapped the backing: the sender
             // has finished, and a failure there already failed the load.
@@ -4410,7 +4821,7 @@ pub const CH_MEMORY_FILE: &str = "memory-ranges";
 /// `config.json`, which the caller rewrites.
 ///
 /// The memory file is a symbolic link to the snapshot's, not a copy: the restore maps it
-/// `MAP_PRIVATE` (`memory_restore_mode=map`), and clones share its clean pages only when
+/// `MAP_PRIVATE` (`memory_restore_mode=copyonwrite`), and clones share its clean pages only when
 /// they map the same inode. A reflink is a new inode with a page cache of its own, so every
 /// clone would read every page from disk again (measured: a reflinked memory file answered
 /// RDP 1.0 to 1.2 s after launch for one Windows clone, a shared one in 74 to 76 ms;
@@ -4446,15 +4857,38 @@ async fn prepare_ch_restore_files(ch_dir: &Path, clone_ch_dir: &Path) -> Result<
     Ok(())
 }
 
-/// What a failed `--restore` launch says. A Cloud Hypervisor older than the pinned fork rejects
-/// `memory_restore_mode=map` while it parses its arguments ("unable to convert map for
-/// memory_restore_mode"), before any VM exists, so that failure names the fix.
+/// The `--restore` argument of a clone: `clone_ch_dir` holds the snapshot's Cloud Hypervisor
+/// files with the clone's own `config.json`.
+///
+/// - `memory_restore_mode=copyonwrite` maps the snapshot's memory file `MAP_PRIVATE` over
+///   guest RAM, so nothing is read before the guest resumes and clones of one snapshot share
+///   its clean pages through the page cache, as Firecracker's File backend does.
+/// - `clock_restore_mode=preserve` resumes the guest's clock from its value at the snapshot.
+///   Cloud Hypervisor's default (`advance`) adds the wall time since the snapshot, so a clone
+///   of a day-old snapshot would start with CLOCK_MONOTONIC a day ahead and every armed timer
+///   expired. fcvm sets a restored guest's wall clock itself (the restore epoch for a guest
+///   with fc-agent, the namespace's clock line for a raw guest).
+/// - `resume=false` restores paused, so the network post-start runs before the guest does.
+fn ch_restore_args(clone_ch_dir: &Path) -> String {
+    format!(
+        "--restore source_url=file://{},memory_restore_mode=copyonwrite,\
+         clock_restore_mode=preserve,resume=false",
+        clone_ch_dir.display()
+    )
+}
+
+/// What a failed `--restore` launch says. A Cloud Hypervisor without one of the options (a
+/// release before v54.0 has no `copyonwrite`, and no release up to v55.0 has
+/// `clock_restore_mode`) rejects it while it parses its arguments ("Error parsing
+/// --restore"), before any VM exists, so that failure names the fix. Only a build named by
+/// `FCVM_CLOUD_HYPERVISOR_BIN` or found on PATH can be one.
 fn ch_restore_launch_error(error: anyhow::Error, ch_bin: &std::path::Path) -> anyhow::Error {
-    if format!("{error:#}").contains("memory_restore_mode") {
+    if format!("{error:#}").contains("Error parsing --restore") {
         error.context(format!(
-            "{} does not support memory_restore_mode=map, which fcvm restores Cloud Hypervisor \
-             clones with; run `fcvm setup --cloud-hypervisor` to build the pinned fork \
-             (rootfs-config.toml [cloud_hypervisor]), or set FCVM_CLOUD_HYPERVISOR_BIN to such a build",
+            "{} does not take the restore options fcvm passes (memory_restore_mode=copyonwrite, \
+             clock_restore_mode=preserve); run `fcvm setup --cloud-hypervisor` to build the \
+             pinned commit (rootfs-config.toml [cloud_hypervisor]), or set \
+             FCVM_CLOUD_HYPERVISOR_BIN to such a build",
             ch_bin.display()
         ))
     } else {
@@ -4462,23 +4896,115 @@ fn ch_restore_launch_error(error: anyhow::Error, ch_bin: &std::path::Path) -> an
     }
 }
 
+/// Refuse a snapshot another Cloud Hypervisor build wrote.
+///
+/// Cloud Hypervisor's `state.json` is the serialized state of that build's devices, and
+/// upstream promises compatibility only for live migration from the two previous releases.
+/// `recorded` is what the VMM that wrote the snapshot printed for
+/// `--version` ([`SnapshotMetadata::cloud_hypervisor_version`]), and `None` for a snapshot
+/// from before fcvm recorded it, which one of the v52-based fork builds fcvm pinned
+/// earlier wrote (a create that cannot name its VMM's build fails,
+/// [`snapshot_cloud_hypervisor_version`]). Whether another build's state loads, and loads
+/// correctly, is not something fcvm can tell from the file, so it restores a snapshot only
+/// on the build that wrote it. `podman run` treats the refusal of a cached snapshot as an
+/// unusable entry: it deletes it and boots fresh ([`CH_SNAPSHOT_OF_ANOTHER_BUILD`]).
+///
+/// [`SnapshotMetadata::cloud_hypervisor_version`]: crate::storage::SnapshotMetadata
+pub(crate) const CH_SNAPSHOT_OF_ANOTHER_BUILD: &str =
+    "a Cloud Hypervisor snapshot restores only on the build that wrote it";
+
+fn ensure_ch_snapshot_written_by(
+    recorded: Option<&str>,
+    running: &str,
+    ch_bin: &std::path::Path,
+) -> Result<()> {
+    match recorded {
+        Some(recorded) if recorded == running => Ok(()),
+        Some(recorded) => bail!(
+            "this snapshot was written by `{recorded}` and this host runs `{running}` ({}): \
+             {CH_SNAPSHOT_OF_ANOTHER_BUILD}. Create the snapshot again, or set \
+             FCVM_CLOUD_HYPERVISOR_BIN to the build that wrote it",
+            ch_bin.display()
+        ),
+        None => bail!(
+            "this snapshot records no Cloud Hypervisor build, so an earlier Cloud Hypervisor \
+             than `{running}` ({}) wrote it: {CH_SNAPSHOT_OF_ANOTHER_BUILD}. Create the \
+             snapshot again",
+            ch_bin.display()
+        ),
+    }
+}
+
+/// Whether `maps` (the text of a `/proc/<pid>/maps`) has a mapping of the file with inode
+/// `ino` whose path ends in `file_name`. A file replaced after it was mapped reads back as
+/// "<path> (deleted)".
+fn maps_names_file(maps: &str, ino: u64, file_name: &str) -> bool {
+    maps.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let inode = fields.nth(4).and_then(|inode| inode.parse::<u64>().ok());
+        let path = line.trim_end();
+        let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+        inode == Some(ino) && path.ends_with(file_name)
+    })
+}
+
+/// Fail a restore whose VMM did not map the snapshot's memory file.
+///
+/// `memory_restore_mode=copyonwrite` falls back to reading the whole file into anonymous
+/// memory, with one line in the VMM's log, when it judges the guest's RAM unsuitable (shared
+/// or huge pages, hotplug, a passthrough device). The restored guest runs the same, but
+/// every clone then holds a private copy of the whole guest (4,097 MiB against 840 MiB for
+/// eight 4 GiB Windows clones) and reads it before it runs. fcvm configures none of those,
+/// so a fallback is a defect to see at the restore, not in a host's memory a day later.
+///
+/// `memory_ino` is the file's inode as the caller read it before the VMM started
+/// ([`memory_file_inode`]): the clone's memory file is a link into the snapshot, and a
+/// snapshot replaced under its tag after the VMM mapped it would otherwise be compared with
+/// the new file's inode.
+fn ensure_ch_mapped_the_memory_file(
+    vmm_pid: u32,
+    memory_ino: u64,
+    memory_file: &Path,
+) -> Result<()> {
+    let maps_path = format!("/proc/{vmm_pid}/maps");
+    let maps = std::fs::read_to_string(&maps_path)
+        .with_context(|| format!("reading {maps_path} to check the restored memory mapping"))?;
+    if !maps_names_file(&maps, memory_ino, CH_MEMORY_FILE) {
+        bail!(
+            "Cloud Hypervisor (pid {vmm_pid}) restored without mapping {}: it copied the \
+             guest's memory instead (its log says why, at \"falling back to copy\"), which \
+             costs every clone a private copy of the whole guest",
+            memory_file.display()
+        );
+    }
+    Ok(())
+}
+
+/// The inode of the file `path` names, following a link.
+fn memory_file_inode(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .ino())
+}
+
 /// Restore a Cloud Hypervisor VM from a snapshot (#632 P2).
 ///
 /// The Cloud Hypervisor analogue of [`restore_from_snapshot`]. It reuses the shared clone
 /// substrate (network/namespace/CoW disk/mount-redirect via [`prepare_clone_substrate`]),
 /// then — instead of Firecracker's `LoadSnapshot` + `patch_drive` — launches
-/// `cloud-hypervisor --restore source_url=file://{clone dir}/ch-restore,memory_restore_mode=map`.
+/// `cloud-hypervisor --restore` with [`ch_restore_args`], which says what each option is for.
 /// CH reads its own `config.json`/`state.json`/memory ranges from that subdir; the disk
 /// paths it embeds are redirected to the clone's CoW disk by the mount namespace (CH has no
 /// `patch_drive`). The VM restores PAUSED (`resume=false`) so the network post-start runs
 /// before [`Hypervisor::resume`], mirroring Firecracker.
 ///
-/// `map` (our fork, ejc3/cloud-hypervisor#1) maps the snapshot's memory file `MAP_PRIVATE`
-/// over guest RAM, so nothing is read before the guest resumes and clones of one snapshot
-/// share its clean pages through the page cache, as Firecracker's File backend does.
-/// Measured against `copy` (eager read-copy) on 4 GiB Windows clones: first desktop frame
-/// 2.2 to 2.6 s against 4.2 to 4.6 s for one, 3.0 s against 8.7 s for eight at once, 845 MiB
-/// PSS each against 4,097 MiB. The restored guest reconnects its
+/// A snapshot restores only on the Cloud Hypervisor build that wrote it
+/// ([`ensure_ch_snapshot_written_by`]), and the restore fails if the VMM copied the memory
+/// file instead of mapping it ([`ensure_ch_mapped_the_memory_file`]). Mapped against copied,
+/// measured on 4 GiB Windows clones: first desktop frame 2.2 to 2.6 s against 4.2 to 4.6 s
+/// for one, 3.0 s against 8.7 s for eight at once, 845 MiB PSS each against 4,097 MiB.
+/// The restored guest reconnects its
 /// vsock channels and syncs its clock when the CALLER serves a restore-epoch over the
 /// boot-plan vsock port (its restore-epoch watcher triggers `handle_clone_restore`).
 pub async fn restore_from_snapshot_ch(
@@ -4487,15 +5013,20 @@ pub async fn restore_from_snapshot_ch(
     state_manager: &StateManager,
     vm_state: &mut VmState,
 ) -> Result<RestoredVmm<crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend>> {
+    anyhow::ensure!(
+        params.decision.confinement().is_none(),
+        "confinement supports the Firecracker backend only"
+    );
     use crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend;
     use crate::hypervisor::{Hypervisor, ProcessSpec};
 
     let RestoreParams {
+        decision,
         vm_id,
         vm_name,
         data_dir,
         socket_path,
-        runtime_config: _, // CH binary is resolved via find_cloud_hypervisor (env/PATH)
+        runtime_config: _, // the binary is find_cloud_hypervisor's: the configured build
         restore_config,
         network_config,
         restore_epoch: _,      // delivered by the caller's boot-plan vsock listener
@@ -4526,6 +5057,15 @@ pub async fn restore_from_snapshot_ch(
             ch_dir.display()
         );
     }
+    // Before any side effect: a snapshot another build wrote is refused, not loaded.
+    let ch_bin = find_cloud_hypervisor()?;
+    let running = cloud_hypervisor_version(&ch_bin)
+        .with_context(|| format!("{} failed `--version`", ch_bin.display()))?;
+    ensure_ch_snapshot_written_by(
+        restore_config.cloud_hypervisor_version.as_deref(),
+        &running,
+        &ch_bin,
+    )?;
 
     // #608 guard (CH analogue of assert_vmstate_rootfs_covered): CH opens the disk paths
     // embedded in config.json directly (no patch_drive), so validate they are covered by the
@@ -4537,7 +5077,7 @@ pub async fn restore_from_snapshot_ch(
         .context("reading CH snapshot config.json")?;
     let mut cfg: serde_json::Value =
         serde_json::from_slice(&cfg_bytes).context("parsing CH snapshot config.json")?;
-    assert_ch_config_disks_covered(
+    let source_dirs = assert_ch_config_disks_covered(
         &cfg,
         &restore_config.original_vm_id,
         restore_config.snapshot_vm_id.as_deref(),
@@ -4552,10 +5092,12 @@ pub async fn restore_from_snapshot_ch(
     let mut substrate = prepare_clone_substrate(
         network,
         restore_config,
+        &source_dirs,
         vm_id,
         data_dir,
         vm_state,
         LoadOverrides::None,
+        &decision,
     )
     .await?;
 
@@ -4567,10 +5109,10 @@ pub async fn restore_from_snapshot_ch(
     // to the clone's TAP before restoring (the FC path does the equivalent via
     // LoadSnapshot's `network_overrides`). Copying also avoids mutating the shared snapshot,
     // which concurrent clones restore from.
-    let clone_prepare: Result<(PathBuf, PathBuf)> = async {
+    let clone_prepare: Result<(PathBuf, u64)> = async {
         let clone_ch_dir = data_dir.join("ch-restore");
         let _ = tokio::fs::remove_dir_all(&clone_ch_dir).await;
-        tokio::fs::create_dir_all(&clone_ch_dir)
+        crate::paths::ensure_dir_async(&clone_ch_dir)
             .await
             .context("creating CH restore directory")?;
         prepare_ch_restore_files(&ch_dir, &clone_ch_dir).await?;
@@ -4592,10 +5134,12 @@ pub async fn restore_from_snapshot_ch(
         .await
         .context("writing CH restore config.json")?;
 
-        Ok((clone_ch_dir, find_cloud_hypervisor()?))
+        // Read before the VMM starts, for the mapping check after the resume.
+        let memory_ino = memory_file_inode(&clone_ch_dir.join(CH_MEMORY_FILE))?;
+        Ok((clone_ch_dir, memory_ino))
     }
     .await;
-    let (clone_ch_dir, ch_bin) = match clone_prepare {
+    let (clone_ch_dir, memory_ino) = match clone_prepare {
         Ok(prepared) => prepared,
         Err(error) => {
             cleanup_failed_clone_holder(
@@ -4607,14 +5151,15 @@ pub async fn restore_from_snapshot_ch(
         }
     };
     let log_path = data_dir.join("firecracker.log");
-    let mut backend =
-        CloudHypervisorBackend::new(vm_id.to_string(), socket_path.to_path_buf(), Some(log_path));
+    let mut backend = CloudHypervisorBackend::new(
+        vm_id.to_string(),
+        socket_path.to_path_buf(),
+        Some(log_path),
+        decision.clone(),
+    );
 
     // Restore paused, then resume after network post-start (mirrors the FC load/resume split).
-    let restore_args = format!(
-        "--restore source_url=file://{},memory_restore_mode=map,resume=false",
-        clone_ch_dir.display()
-    );
+    let restore_args = ch_restore_args(&clone_ch_dir);
     let ch_bin_shown = ch_bin.clone();
     let spec = ProcessSpec {
         binary: ch_bin,
@@ -4625,6 +5170,8 @@ pub async fn restore_from_snapshot_ch(
         user_namespace_path: substrate.namespace.user_namespace_path.clone(),
         net_namespace_path: substrate.namespace.net_namespace_path.clone(),
         mount_redirects: substrate.namespace.mount_redirects.clone(),
+        keep_fds: substrate.namespace.keep_fds.clone(),
+        tap_owner: None,
     };
     if let Err(error) = backend
         .spawn(&spec)
@@ -4672,8 +5219,10 @@ pub async fn restore_from_snapshot_ch(
                 .health_port
                 .context("a raw VM's state names no health port")?;
             *slot = Some(
-                crate::commands::vm::NsHelper::start(user_ns, net_ns, vm_id, data_dir, rdp_port)
-                    .await?,
+                crate::commands::vm::NsHelper::start(
+                    user_ns, net_ns, vm_id, data_dir, rdp_port, &decision,
+                )
+                .await?,
             );
         }
 
@@ -4691,6 +5240,9 @@ pub async fn restore_from_snapshot_ch(
             .resume()
             .await
             .context("resuming Cloud Hypervisor after restore")?;
+        // The resume is answered once the restore has finished, so the mapping is there now
+        // if it ever will be.
+        ensure_ch_mapped_the_memory_file(vm_pid, memory_ino, &clone_ch_dir.join(CH_MEMORY_FILE))?;
 
         vm_state.pid = Some(std::process::id());
         // Future snapshots of this clone must redirect using the original vsock vm_id.
@@ -4776,6 +5328,26 @@ pub(crate) async fn reflink_copy(source: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The `disks` directory of the VM being snapshotted, from its rootfs path: the VM's own
+/// record of where its disks are (`<runtime dir>/disks/<rootfs>`), so a VM an older build
+/// started under another layout is found. A rootfs outside a `disks` directory named by the
+/// VM's id falls back to where this build puts a VM's disks.
+fn runtime_disks_of(disk_path: &Path, vm_id: &str) -> PathBuf {
+    disk_path
+        .parent()
+        .filter(|disks| disks.file_name().is_some_and(|name| name == "disks"))
+        .filter(|disks| {
+            disks
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == vm_id)
+        })
+        .map_or_else(
+            || paths::vm_runtime_dir(vm_id).join("disks"),
+            Path::to_path_buf,
+        )
+}
+
 /// Reflink the rootfs + any extra disks into the temp snapshot dir (instant btrfs CoW).
 /// Shared by the Firecracker and Cloud Hypervisor snapshot-create paths; the caller must
 /// have the VM paused so the disk image matches the captured memory.
@@ -4786,7 +5358,7 @@ async fn reflink_disks_to_snapshot(
     commit_free: bool,
 ) -> Result<()> {
     let disk_dir = crate::storage::snapshot::snapshot_disk_dir(temp_snapshot_dir);
-    let runtime_disks = paths::vm_runtime_dir(&snapshot_config.vm_id).join("disks");
+    let runtime_disks = runtime_disks_of(disk_path, &snapshot_config.vm_id);
     // `commit_free` (--memory-dir): disks with few extents are reflinked into an ordinary
     // directory, which commits no transaction, and a clone of the snapshot reflinks them
     // again (REFLINK_MAX_EXTENTS) rather than snapshotting a subvolume.
@@ -4827,7 +5399,7 @@ async fn reflink_disks_to_snapshot(
         }
     }
     if reflink_into_dir {
-        tokio::fs::create_dir_all(&disk_dir)
+        crate::paths::ensure_dir_async(&disk_dir)
             .await
             .context("creating the snapshot's disk directory")?;
     } else {
@@ -4837,9 +5409,7 @@ async fn reflink_disks_to_snapshot(
     }
     reflink_copy(disk_path, &disk_dir.join("disk.raw")).await?;
     for extra_disk in &snapshot_config.metadata.extra_disks {
-        let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
-            .join("disks")
-            .join(&extra_disk.filename);
+        let source = runtime_disks.join(&extra_disk.filename);
         let dest = disk_dir.join(&extra_disk.filename);
         reflink_copy(&source, &dest)
             .await
@@ -4913,8 +5483,9 @@ fn snapshot_semaphore() -> &'static Semaphore {
 /// different formats (VolumeConfig vs SnapshotVolumeConfig, ExtraDisk vs
 /// SnapshotExtraDisk) and the conversion depends on context.
 ///
-/// `firecracker_pid` is the VM's Firecracker process, when the caller can name it;
-/// the snapshot records the executable it runs (see [`snapshot_firecracker_bin`]).
+/// `firecracker_pid` is the VM's VMM process, when the caller can name it; the snapshot
+/// records the executable it runs (see [`snapshot_firecracker_bin`]) or, for Cloud
+/// Hypervisor, the build that executable is (see [`snapshot_cloud_hypervisor_version`]).
 pub fn build_snapshot_config(
     vm_state: &VmState,
     snapshot_key: &str,
@@ -5029,6 +5600,7 @@ pub fn build_snapshot_config(
             image_disk_identity: vm_state.config.image_disk_identity.clone(),
             hypervisor: vm_state.config.hypervisor,
             firecracker_bin: snapshot_firecracker_bin(vm_state, firecracker_pid),
+            cloud_hypervisor_version: snapshot_cloud_hypervisor_version(vm_state, firecracker_pid)?,
             balloon_mib: vm_state.config.balloon_mib,
             balloon_free_page_reporting: vm_state.config.balloon_free_page_reporting,
             // Read from the guest by `create_snapshot_core`, just before the pause.
@@ -5058,6 +5630,47 @@ fn snapshot_firecracker_bin(vm_state: &VmState, firecracker_pid: Option<u32>) ->
         Some(RunningExecutable::Replaced) => None,
         Some(RunningExecutable::Unreadable) | None => vm_state.config.firecracker_bin.clone(),
     }
+}
+
+/// The Cloud Hypervisor build a snapshot of `vm_state` records: what the executable of the
+/// VM's VMM process prints for `--version`, which a restore compares with its own build
+/// ([`ensure_ch_snapshot_written_by`]). Without a process to ask, it is the build this host
+/// resolves. Firecracker VMs record none.
+///
+/// A Cloud Hypervisor VM whose build cannot be named fails the create, before anything is
+/// paused: its executable was replaced after it started (so no path names the build that is
+/// running), or does not answer `--version`. A snapshot written without the record would be
+/// one no restore accepts.
+fn snapshot_cloud_hypervisor_version(
+    vm_state: &VmState,
+    vmm_pid: Option<u32>,
+) -> Result<Option<String>> {
+    if vm_state.config.hypervisor != crate::hypervisor::Backend::CloudHypervisor {
+        return Ok(None);
+    }
+    let bin = match vmm_pid.map(running_executable) {
+        Some(RunningExecutable::Path(exe)) => exe,
+        Some(RunningExecutable::Unreadable) | None => find_cloud_hypervisor()
+            .context("finding the Cloud Hypervisor build to record in the snapshot")?,
+        Some(RunningExecutable::Replaced) => bail!(
+            "VM {} runs a Cloud Hypervisor whose binary was replaced after it started, so the \
+             build that would write this snapshot cannot be named and no restore would \
+             accept it; restart the VM on the current build, then snapshot it",
+            vm_state.vm_id
+        ),
+    };
+    ch_version_for_snapshot(&bin, cloud_hypervisor_version(&bin)).map(Some)
+}
+
+/// The version to record, or why there is none.
+fn ch_version_for_snapshot(bin: &Path, version: Option<String>) -> Result<String> {
+    version.with_context(|| {
+        format!(
+            "{} failed `--version`, so the build that would write this snapshot cannot be \
+             named and no restore would accept it",
+            bin.display()
+        )
+    })
 }
 
 /// What /proc/<pid>/exe says about the executable a process runs.
@@ -5108,7 +5721,7 @@ pub fn volume_configs_to_snapshot(
 /// External --disk files are at arbitrary host paths and don't need copying
 /// into the snapshot — clones access them directly.
 pub fn extra_disks_to_snapshot(vm_state: &VmState) -> Vec<crate::storage::SnapshotExtraDisk> {
-    let vm_data_dir = paths::vm_runtime_dir(&vm_state.vm_id);
+    let vm_data_dir = vm_state.vm_runtime_dir();
     let vm_data_prefix = vm_data_dir.to_string_lossy().to_string();
     vm_state
         .config
@@ -5193,10 +5806,14 @@ async fn lock_vm_snapshots(
         .and_then(|p| p.parent())
         .ok_or_else(|| anyhow::anyhow!("cannot derive VM directory from disk path"))?;
     let lock_path = vm_dir.join("snapshot.lock");
-    let lock_file = std::fs::File::create(&lock_path)
+    let lock_file = open_lock_file(&lock_path)
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
     use fs2::FileExt;
     let mut noted_wait = false;
+    // A holder that is about to let go (a restore publishing its clone holds this for a
+    // few milliseconds) is not waited out in 100 ms steps: the wait starts short and
+    // doubles up to that.
+    let mut pause = std::time::Duration::from_millis(2);
     loop {
         match lock_file.try_lock_exclusive() {
             Ok(()) => break,
@@ -5209,7 +5826,11 @@ async fn lock_vm_snapshots(
                     noted_wait = true;
                 }
                 debug!("waiting for per-VM snapshot lock");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let left = give_up_at
+                    .map(|at| at.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap_or(pause);
+                tokio::time::sleep(pause.min(left)).await;
+                pause = (pause * 2).min(std::time::Duration::from_millis(100));
             }
             Err(e) => {
                 return Err(anyhow::anyhow!("acquiring per-VM snapshot lock: {}", e));
@@ -5218,6 +5839,75 @@ async fn lock_vm_snapshots(
     }
     debug!(lock = %lock_path.display(), "acquired per-VM snapshot lock");
     Ok(Some(lock_file))
+}
+
+/// How long `snapshot create` waits for the per-VM snapshot lock of a restored clone whose
+/// owner has the acknowledgement and has not published the lifecycle.
+///
+/// The owner holds the lock for exactly that stretch (`cmd_snapshot_run_inner`), through
+/// its output handshake and its port check, so that a snapshot does not pause the guest
+/// under them. The port check is bounded (about 5 s per port) and the stretch measured
+/// 7 ms on a 1 GiB guest, but the output handshake has no bound of its own: it ends when
+/// the guest reconnects its output, the VMM exits or the owner is signalled. A guest that
+/// stays up and never reconnects would hold a create for ever, so the create gives up here
+/// with an error that says what it was waiting for.
+pub(crate) const RESTORE_PUBLICATION_LIMIT: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Whether the owner of this restored VM is between the acknowledgement and its lifecycle
+/// publication, which is when it holds the per-VM snapshot lock.
+fn restore_publication_pending(state: &VmState) -> bool {
+    state.config.process_type == Some(crate::state::ProcessType::Clone)
+        && state.restore_acknowledged
+        && !state.lifecycle_ready
+        && !matches!(state.status, VmStatus::Failed)
+}
+
+/// The per-VM snapshot lock for `snapshot create`.
+///
+/// A create asked for when a clone's restored record appears finds the lock held by the
+/// clone's owner and waits for it, up to `publication_limit`
+/// ([`RESTORE_PUBLICATION_LIMIT`]). Behind any other holder (another snapshot of the VM, a
+/// balloon command) it waits as long as that takes, as it always did. Which of the two it
+/// is waiting behind is read from the VM's state, once a second.
+pub(crate) async fn acquire_vm_snapshot_lock_for_create(
+    disk_path: &Path,
+    state_manager: &StateManager,
+    vm_id: &str,
+    publication_limit: std::time::Duration,
+) -> Result<std::fs::File> {
+    const LOOK: std::time::Duration = std::time::Duration::from_secs(1);
+    let started = std::time::Instant::now();
+    let mut said = false;
+    loop {
+        let slice = LOOK.min(publication_limit.max(std::time::Duration::from_millis(1)));
+        if let Some(lock) = acquire_vm_snapshot_lock_within(disk_path, slice).await? {
+            return Ok(lock);
+        }
+        let Ok(state) = state_manager.load_state(vm_id).await else {
+            continue;
+        };
+        if !restore_publication_pending(&state) {
+            continue;
+        }
+        if !said {
+            info!(
+                vm_id,
+                "waiting for the VM's fcvm to publish its restored clone before snapshotting it"
+            );
+            said = true;
+        }
+        anyhow::ensure!(
+            started.elapsed() < publication_limit,
+            "cannot snapshot VM '{}' yet: its restore was acknowledged {} s or more ago and \
+             its fcvm process{} has not finished its own checks of the clone (the guest's \
+             output connection, the port check), during which it holds the VM's snapshot \
+             lock. `fcvm ls --json` shows \"lifecycle_ready\": true once it has.",
+            state.name.as_deref().unwrap_or(vm_id),
+            publication_limit.as_secs(),
+            state.pid.map(|pid| format!(" {pid}")).unwrap_or_default()
+        );
+    }
 }
 
 /// Sibling path for a snapshot directory's auxiliary files (lock, .creating,
@@ -5275,9 +5965,16 @@ pub async fn acquire_snapshot_dir_lock(
     acquire_flock(&snapshot_sibling(snapshot_dir, "lock"), exclusive).await
 }
 
+/// Open `lock_path` for an flock, created if missing and never truncated: every clone takes
+/// its snapshot's lock, and an O_TRUNC open takes the inode lock for writing and changes the
+/// file each time.
+fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
+    crate::utils::open_shared_lock_file(lock_path)
+}
+
 /// Take an flock on `lock_path`, created if missing, waiting for it.
 async fn acquire_flock(lock_path: &Path, exclusive: bool) -> Result<std::fs::File> {
-    let lock_file = std::fs::File::create(lock_path)
+    let lock_file = open_lock_file(lock_path)
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
     let wait_started = std::time::Instant::now();
     let mut next_info_log = std::time::Duration::from_secs(5);
@@ -5377,6 +6074,214 @@ pub async fn acquire_snapshot_create_generation_locks(
         files.push(acquire_snapshot_stage_lock(parent_dir, false).await?);
     }
     Ok(SnapshotCreateGenerationLocks { _files: files })
+}
+
+/// Refuse a snapshot of a restored VM whose restore has not been acknowledged.
+///
+/// A VM restored from a memory snapshot resumes behind the network gate its snapshot was
+/// taken behind, with its container frozen and its source's sockets still in it. Its guest
+/// retires those sockets, runs the restore hook, opens the gate and only then acknowledges
+/// the restore. A snapshot's guest one-shots know none of that: run in a guest that has not
+/// got there, the resume one-shot (or a failed prepare's rollback) opens the gate with the
+/// source's sockets alive, the container thawed and no hook run, and the image is of a
+/// restore part way through (issue 2138).
+///
+/// The process that owns the VM (`snapshot run`, or `podman run` on a cache hit) writes
+/// `restore_acknowledged` when it has the guest's acknowledgement, before it prints the
+/// restored record ([`publish_restore_acknowledged`]), and never for a restore that failed
+/// or for `podman prepare`'s disposable VM. So a caller that has read the restored record
+/// may ask for a snapshot at once, and a restored VM without the flag is refused before
+/// anything reaches its guest or its VMM. `lifecycle_ready`, which an owner writes later in
+/// the same restore, admits the two restored VMs that have no such record: a raw guest's
+/// clone, which has no agent to acknowledge anything and no gate, and a state written
+/// before `restore_acknowledged` existed. A restored VM whose state says `failed` is
+/// refused whatever else it says: a restore can fail after its acknowledgement (the
+/// owner's port check, a memory server that died), and its owner is then tearing it down.
+/// A VM that was booted has no inherited gate and is not checked.
+///
+/// Acknowledged is not yet published: the owner goes on to its output handshake and its
+/// port check, and holds the per-VM snapshot lock from before it records the
+/// acknowledgement until it has published the lifecycle or recorded the failure. A create
+/// asked for in that stretch is taken and waits on that lock
+/// ([`acquire_vm_snapshot_lock_for_create`]), so it never pauses the guest under those
+/// checks, and it reads this state again once it has the lock.
+///
+/// The refusal itself needs no lock against the owner. The flag goes from false to
+/// true once and `StateManager` never writes it back, and every restore runs under a VM id
+/// of its own, so a state that reads acknowledged cannot go back to restoring. The create
+/// checks the state it re-reads under the per-VM snapshot lock, after
+/// [`validate_snapshot_vm_identity`] has tied that state to the process it is about to
+/// snapshot. A check that reads false while the acknowledgement lands refuses a VM that is
+/// acknowledged a moment later, which `--await-restore` waits for.
+pub(crate) fn ensure_restore_acknowledged(state: &crate::state::VmState) -> Result<()> {
+    let restored = state.config.process_type == Some(crate::state::ProcessType::Clone);
+    if !restored {
+        return Ok(());
+    }
+    let name = state.name.as_deref().unwrap_or(&state.vm_id);
+    let owner = match state.pid {
+        Some(pid) => format!("fcvm process {pid}"),
+        None => "no fcvm process".to_string(),
+    };
+    // Failed before the acknowledgement or after it (the owner's port check, a memory
+    // server that died): its owner is tearing it down either way.
+    if matches!(state.status, VmStatus::Failed) {
+        anyhow::bail!(
+            "cannot snapshot VM '{name}' ({owner}): its restore failed and it is being \
+             stopped. Its fcvm's output says why."
+        );
+    }
+    if state.restore_acknowledged || state.lifecycle_ready {
+        return Ok(());
+    }
+    let source = match state.config.snapshot_name.as_deref() {
+        Some(snapshot) => format!("snapshot '{snapshot}'"),
+        None => "a snapshot".to_string(),
+    };
+    let listing = match state.pid {
+        Some(pid) => format!("fcvm ls --json --pid {pid}"),
+        None => "fcvm ls --json".to_string(),
+    };
+    anyhow::bail!(
+        "cannot snapshot VM '{name}' ({owner}): it was restored from {source} and its \
+         restore has not been acknowledged. `{listing}` shows \"restore_acknowledged\": \
+         true once it has, which is when `fcvm snapshot run` prints the restored record; \
+         `fcvm snapshot create --await-restore SECONDS` waits for it."
+    )
+}
+
+/// Record that the guest has acknowledged this VM's restore, so that `snapshot create`
+/// takes it ([`ensure_restore_acknowledged`]).
+///
+/// The identity predicate is evaluated under the state lock, as in
+/// [`publish_lifecycle_ready`]: a state that now belongs to another process is not marked.
+pub async fn publish_restore_acknowledged(
+    state_manager: &StateManager,
+    vm_state: &mut VmState,
+) -> Result<()> {
+    let identity = (vm_state.pid, vm_state.pid_start_time);
+    anyhow::ensure!(
+        identity.0.is_some() && identity.1.is_some(),
+        "cannot record a restore's acknowledgement for a state without a process identity"
+    );
+    let mut identity_matched = false;
+    let updated = state_manager
+        .update_state(&vm_state.vm_id, |state| {
+            if (state.pid, state.pid_start_time) == identity {
+                state.restore_acknowledged = true;
+                identity_matched = true;
+            }
+        })
+        .await
+        .context("recording the restore's acknowledgement")?;
+    anyhow::ensure!(
+        updated.is_some(),
+        "VM state disappeared before the restore's acknowledgement could be recorded"
+    );
+    anyhow::ensure!(
+        identity_matched,
+        "VM state identity changed before the restore's acknowledgement could be recorded"
+    );
+    vm_state.restore_acknowledged = true;
+    Ok(())
+}
+
+/// Record on the VM's state that its restore failed, so a `snapshot create` waiting for
+/// its acknowledgement stops waiting and `fcvm ls` shows the failure while the VM is torn
+/// down. Best-effort: the restore's own error is what the caller reports.
+pub async fn record_restore_failed(state_manager: &StateManager, vm_id: &str) {
+    let recorded = state_manager
+        .update_state(vm_id, |state| {
+            state.status = VmStatus::Failed;
+            state.health_status = crate::state::HealthStatus::Unhealthy;
+        })
+        .await;
+    if let Err(error) = recorded {
+        warn!(vm_id, error = %format!("{error:#}"), "could not record the failed restore in state");
+    }
+}
+
+/// How often `snapshot create --await-restore` re-reads the state of a clone it waits for
+/// when nothing tells it of a change: the owner's death changes no file, and a watch can
+/// fail to start.
+const RESTORE_ACKNOWLEDGEMENT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// [`ensure_restore_acknowledged`] for the VM `snapshot create` selected, waiting up to
+/// `wait` (`--await-restore`) for the owner of a restored VM to record the acknowledgement.
+/// Returns the state as last read, which is the acknowledged one after a wait.
+///
+/// The wait watches the state file, so it ends when the owner's write lands, not at the
+/// next poll. It ends with the refusal as soon as there is nothing left to wait for: the
+/// owner recorded the restore as failed, the owner is gone, or the state is gone or names
+/// another process.
+pub(crate) async fn await_restore_acknowledged(
+    state_manager: &StateManager,
+    selected: VmState,
+    wait: std::time::Duration,
+) -> Result<VmState> {
+    await_restore_acknowledged_polling(state_manager, selected, wait, RESTORE_ACKNOWLEDGEMENT_POLL)
+        .await
+}
+
+/// [`await_restore_acknowledged`] with its fallback poll interval given.
+async fn await_restore_acknowledged_polling(
+    state_manager: &StateManager,
+    selected: VmState,
+    wait: std::time::Duration,
+    poll: std::time::Duration,
+) -> Result<VmState> {
+    if wait.is_zero() || ensure_restore_acknowledged(&selected).is_ok() {
+        return ensure_restore_acknowledged(&selected).map(|()| selected);
+    }
+    let started = std::time::Instant::now();
+    // The watch begins before the state is read again, so a write between the two is seen.
+    let mut watch = match state_manager.watch_state(&selected.vm_id) {
+        Ok(watch) => Some(watch),
+        Err(error) => {
+            debug!(error = %format!("{error:#}"), "waiting for the restore by polling its state");
+            None
+        }
+    };
+    let mut current = selected;
+    loop {
+        let refusal = match ensure_restore_acknowledged(&current) {
+            Ok(()) => return Ok(current),
+            Err(refusal) => refusal,
+        };
+        let reread = match state_manager.load_state(&current.vm_id).await {
+            Ok(reread) => reread,
+            Err(_) => return Err(refusal.context("the VM's state is gone")),
+        };
+        if (reread.pid, reread.pid_start_time) != (current.pid, current.pid_start_time) {
+            return Err(refusal.context("the VM's state now names another fcvm process"));
+        }
+        current = reread;
+        let refusal = match ensure_restore_acknowledged(&current) {
+            Ok(()) => return Ok(current),
+            Err(refusal) => refusal,
+        };
+        if matches!(current.status, VmStatus::Failed) {
+            return Err(refusal.context("the VM's restore failed"));
+        }
+        if !crate::state::owner_is_live(&current) {
+            return Err(refusal.context("the VM's fcvm process has exited"));
+        }
+        let left = wait.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err(refusal.context(format!(
+                "no acknowledgement of the VM's restore within the {} s of --await-restore",
+                wait.as_secs()
+            )));
+        }
+        let pause = tokio::time::sleep(left.min(poll));
+        match watch.as_mut() {
+            Some(watch) => tokio::select! {
+                _ = watch.changed() => {}
+                _ = pause => {}
+            },
+            None => pause.await,
+        }
+    }
 }
 
 /// Fail closed if the state selected before snapshot locking no longer identifies the same
@@ -5675,9 +6580,7 @@ pub async fn create_disk_only_snapshot_core(
         let temp_disk = disk_dir.join("disk.raw");
         reflink_copy(disk_path, &temp_disk).await?;
         for extra in &snapshot_config.metadata.extra_disks {
-            let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
-                .join("disks")
-                .join(&extra.filename);
+            let source = runtime_disks_of(disk_path, &snapshot_config.vm_id).join(&extra.filename);
             let dest = disk_dir.join(&extra.filename);
             reflink_copy(&source, &dest).await?;
         }
@@ -5821,8 +6724,123 @@ pub(crate) fn recorded_vsock_socket_path(vm_state: &VmState) -> Result<&Path> {
 /// The caller supplies the exact socket recorded in the running VM's state.
 /// This is intentionally part of both snapshot APIs: deriving a conventional
 /// runtime path here would silently bypass `--vsock-dir`.
+///
+/// This is the prepare, and it begins a boundary: the create's token goes into the VM's
+/// state first and then to the guest, which writes it into its `owed` mark (#2159). Every
+/// resume reads the token back from the state ([`ask_source_to_reopen`]), so the reopen
+/// after a prepare whose reply was lost carries it too.
 async fn run_snapshot_network_command(vsock_socket: &Path, vm_id: &str, flag: &str) -> Result<()> {
-    run_fc_agent_one_shot(vsock_socket, vm_id, flag).await
+    let state_manager = crate::state::StateManager::new(paths::state_dir());
+    let token = begin_source_boundary(&state_manager, vm_id).await?;
+    let mut args = vec![flag];
+    if let Some(token) = &token {
+        args.extend(["--boundary", token]);
+    }
+    run_fc_agent_command(vsock_socket, vm_id, &args)
+        .await
+        .map(|_| ())
+}
+
+/// Give a snapshot create's boundary its token and write it on the VM's state.
+///
+/// A resume the host gave up on can still be delivered later: its exec runs on a blocking
+/// thread that goes on connecting after the try was cut off, and a delivered one-shot can
+/// wait in the guest for the boundary lock. Landing between a later create's prepare and
+/// its pause it would open the gate, and the pause would save an image with the gate open
+/// and no manifest. The guest obeys a resume only when its token is the one in the mark,
+/// so that resume finds the later create's token and does nothing.
+///
+/// `Ok(None)` for a VM with no state file: the prepare is then sent no token, and the
+/// resumes, which find no state either, send none, which the guest takes as a pair. A
+/// state that is there and cannot be written is an error, and the prepare is not sent: a
+/// prepare with no token beside a state that still holds an earlier boundary's would have
+/// every resume of this create refused as stale, with the gate closed.
+async fn begin_source_boundary(
+    state_manager: &crate::state::StateManager,
+    vm_id: &str,
+) -> Result<Option<String>> {
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let written = state_manager
+        .update_state(vm_id, |state| state.boundary_token = Some(token.clone()))
+        .await
+        .map_err(|error| {
+            error.context(PrepareNotSent {
+                vm_id: vm_id.to_string(),
+            })
+        })?;
+    Ok(written.map(|_| token))
+}
+
+/// A snapshot's prepare was not sent to the guest: the boundary's token could not be
+/// written on the VM's state first. Nothing in the guest changed, so there is no gate to
+/// reopen, and the creators skip the reopen ([`prepare_was_sent`]). Every other failure of
+/// a prepare leaves open whether it ran.
+#[derive(Debug)]
+struct PrepareNotSent {
+    vm_id: String,
+}
+
+impl std::fmt::Display for PrepareNotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "writing the snapshot boundary's token on the state of VM {}; nothing was sent \
+             to its guest",
+            self.vm_id
+        )
+    }
+}
+
+/// Whether a failed prepare may have run in the guest. False only for a prepare that was
+/// never sent.
+fn prepare_was_sent(prepare_error: &anyhow::Error) -> bool {
+    prepare_error.downcast_ref::<PrepareNotSent>().is_none()
+}
+
+/// The token of the boundary the VM's guest is owed a resume for, from its state.
+/// `Ok(None)` when the state holds none or there is no state file. A state that is there
+/// and cannot be read is an error, never "no token": a resume sent without the token the
+/// guest's mark holds is refused as stale.
+async fn owed_boundary_token(
+    state_manager: &crate::state::StateManager,
+    vm_id: &str,
+) -> Result<Option<String>> {
+    match state_manager.load_state(vm_id).await {
+        Ok(state) => Ok(state.boundary_token),
+        Err(error)
+            if error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.context(format!(
+            "reading the snapshot boundary's token from the state of VM {vm_id}"
+        ))),
+    }
+}
+
+/// The arguments of one resume: the host's clock when a pause preceded it, and the token
+/// of the owed boundary as the VM's state holds it now.
+///
+/// Read at every try. A later create cannot have written another token meanwhile: the
+/// tries run under the per-VM snapshot lock. A try that is cut off and delivered late
+/// carries what it read when it was sent.
+async fn resume_args(
+    state_manager: &crate::state::StateManager,
+    vm_id: &str,
+    pause_preceded: bool,
+) -> Result<Vec<String>> {
+    let mut args = vec!["--resume-snapshot-network".to_string()];
+    if pause_preceded {
+        let host_time = crate::utils::host_clock_now().as_nanos().to_string();
+        args.extend(["--host-time-ns".to_string(), host_time]);
+    }
+    if let Some(token) = owed_boundary_token(state_manager, vm_id).await? {
+        args.extend(["--boundary".to_string(), token]);
+    }
+    Ok(args)
 }
 
 /// Reopen the source's network once a pause has been invoked, and set the source's
@@ -5839,18 +6857,518 @@ async fn run_snapshot_network_command(vsock_socket: &Path, vm_id: &str, flag: &s
 /// (`bootplan::advance_system_clock`), so a source whose clock kept running through
 /// the pause (the arm64 `default` profile: 0 ms behind after the same pause) is left
 /// alone.
+///
+/// **A source whose agent died in the boundary fails the create.** The resume is then
+/// answered by the agent systemd started next, which says so in its report. The death may
+/// have come before the pause, and the image then holds a dead or starting agent and a
+/// killed container: on Firecracker a clone of it waits for a boot plan behind its closed
+/// gate until the host ends it. The host cannot tell when the agent died, so every such
+/// create fails, after the gate is open again, and its caller discards the image.
 async fn resume_paused_source(vsock_socket: &Path, vm_id: &str) -> Result<()> {
-    let host_time = crate::utils::host_clock_now().as_nanos().to_string();
-    let output = run_fc_agent_command(
+    if reopen_source_network(vsock_socket, vm_id, true).await? {
+        bail!(
+            "snapshot create of VM {vm_id} failed and its image is discarded: the VM's guest \
+             agent died during the snapshot and its successor answered the resume, so the \
+             image may hold a dead agent and a killed container. The VM's network gate is \
+             open again"
+        );
+    }
+    Ok(())
+}
+
+/// Reopen the source's network after a prepare that failed, whose failure does not prove
+/// it did not run. No pause preceded it, so the guest's clock is left alone.
+///
+/// One failure does prove it: a prepare that was never sent ([`PrepareNotSent`]). Nothing
+/// is asked of the guest then. Asked, it would be asked for the whole bound with the
+/// state still unreadable, and the create would end by reporting a gate left closed that
+/// was never closed.
+async fn reopen_source_after_failed_prepare(
+    vsock_socket: &Path,
+    vm_id: &str,
+    prepare_error: &anyhow::Error,
+) -> Result<()> {
+    if !prepare_was_sent(prepare_error) {
+        info!(
+            vm_id,
+            "the snapshot's prepare was not sent to the guest; there is no gate to reopen"
+        );
+        return Ok(());
+    }
+    reopen_source_network(vsock_socket, vm_id, false)
+        .await
+        .map(|_agent_restarted| ())
+}
+
+/// What the guest's resume one-shot writes on its stderr when the agent that served the
+/// prepare died before the resume (`AGENT_RESTARTED_REPORT` in fc-agent's
+/// snapshot_network.rs, which holds the two equal).
+const SOURCE_AGENT_RESTARTED_REPORT: &str =
+    "the agent that served this snapshot's prepare died before its resume";
+
+/// The exit status of a boundary one-shot that the guest refused because a restore is
+/// under way in it (`REFUSED_EXIT` in fc-agent's main.rs), and for nothing else. Running
+/// it again changes nothing, and the guest's gate is its restore's, not this snapshot's
+/// to open or to record.
+const ONE_SHOT_REFUSED_EXIT: i32 = 3;
+
+/// The exit status of a resume the guest refused because its token is not the one of the
+/// boundary the guest owes (`STALE_RESUME_EXIT` in fc-agent's main.rs). Unlike the
+/// restore's refusal it says nothing about the gate, which can be this source's own and
+/// closed: the record and the token stay, and the create reports the source left gated.
+const ONE_SHOT_STALE_EXIT: i32 = 5;
+
+/// What precedes the owed boundary's token in a stale refusal's stderr: the token, or
+/// `none` (`OWED_TOKEN_REPORT` in fc-agent's snapshot_network.rs, which holds the two
+/// equal).
+const OWED_TOKEN_REPORT: &str = "owed-boundary-token=";
+
+/// The token of the guest's owed boundary, as a stale refusal reported it: `Some(None)`
+/// for a mark with no token, `None` when the refusal reports nothing this host can put
+/// into a command (letters, digits and `-`, as the guest takes them).
+fn reported_owed_token(stderr: &str) -> Option<Option<String>> {
+    let (_, after) = stderr.split_once(OWED_TOKEN_REPORT)?;
+    let token: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    match token.as_str() {
+        "" => None,
+        "none" => Some(None),
+        _ if token.len() <= 64 => Some(Some(token)),
+        _ => None,
+    }
+}
+
+/// The exit status of a resume that opened the gate and could not remove the boundary's
+/// manifest or mark afterwards (`OPEN_UNCLEAN_EXIT` in fc-agent's main.rs). The gate is
+/// open: the state must say so, and the next prepare writes both anew.
+const ONE_SHOT_OPEN_UNCLEAN_EXIT: i32 = 4;
+
+/// What a resume one-shot's result says about the gate.
+fn reopen_try_of(vm_id: &str, output: crate::commands::exec::ExecOutput) -> ReopenTry {
+    let open = |output: &crate::commands::exec::ExecOutput| {
+        if output.stderr.contains(SOURCE_AGENT_RESTARTED_REPORT) {
+            ReopenTry::OpenAfterAgentRestart
+        } else {
+            ReopenTry::Open
+        }
+    };
+    match output.exit_code {
+        0 => {
+            // The one-shot's own report, including the size of the clock step, reaches no
+            // console: it is this exec's stderr.
+            debug!(vm_id, guest = %output.stderr.trim(), "source network reopened");
+            open(&output)
+        }
+        ONE_SHOT_OPEN_UNCLEAN_EXIT => {
+            warn!(
+                vm_id,
+                guest = %output.stderr.trim(),
+                "the source's network gate is open, and its guest could not remove the \
+                 boundary's manifest or mark; the next snapshot's prepare writes both anew"
+            );
+            open(&output)
+        }
+        code => {
+            let error = anyhow::anyhow!(
+                "`fc-agent --resume-snapshot-network` failed in guest {vm_id} with exit code \
+                 {code}: stdout={:?}, stderr={:?}",
+                output.stdout,
+                output.stderr
+            );
+            match code {
+                ONE_SHOT_REFUSED_EXIT => ReopenTry::Refused(error),
+                ONE_SHOT_STALE_EXIT => ReopenTry::Stale(error, reported_owed_token(&output.stderr)),
+                _ => ReopenTry::Failed(error),
+            }
+        }
+    }
+}
+
+/// How long a snapshot create keeps asking its source to reopen, in all: every try is
+/// cut off at what is left of it, so the create is over `SOURCE_REOPEN_BOUND` after its
+/// first ask at the latest. The create holds the per-VM snapshot lock and the global
+/// snapshot permit for that long.
+///
+/// The guest opens the gate a prepare closed only when its host asks: a guest cannot
+/// tell a resumed source from a clone that has not been told of its restore, and the
+/// host can. So a source whose resume one-shot failed is asked again. Each ask is an
+/// exec whose connect is tried for about 54 s (`commands::exec`), so an ask that finds no
+/// exec server takes that long. The case the bound is for: fc-agent dies between the
+/// prepare and the resume, systemd starts it again (`Restart=on-failure`,
+/// `RestartSec=1`), and the new agent serves this one command before its boot plan. In
+/// the VM test the new agent was up about a second after the kill and the first ask
+/// landed. The bound also covers a stop that waits systemd's 90 s stop timeout for a
+/// frozen container that ignores SIGTERM, which was read from systemd and not observed.
+const SOURCE_REOPEN_BOUND: std::time::Duration = std::time::Duration::from_secs(150);
+/// The wait between two tries, and the least a try is worth starting for.
+const SOURCE_REOPEN_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+const SOURCE_REOPEN_LEAST_TRY: std::time::Duration = std::time::Duration::from_secs(5);
+/// What the one ask of a later create is cut off at: the exec's connect retries and the
+/// one-shot's run.
+const SOURCE_REOPEN_ONE_ASK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Why a source's network was not reopened.
+#[derive(Debug)]
+enum ReopenFailure {
+    /// The guest refused because a restore is under way in it: its gate is that restore's,
+    /// and nothing is recorded of it.
+    Refused(anyhow::Error),
+    /// The bound passed with the gate still closed. The state records it.
+    LeftGated(anyhow::Error),
+    /// The guest refused this resume as not its owed boundary's: the token the state
+    /// holds is not the one in the guest's mark. Nothing is known of the gate from that,
+    /// so it is recorded closed and the token is kept, as for `LeftGated`. With the
+    /// mark's token as the refusal reported it ([`reported_owed_token`]).
+    Stale(anyhow::Error, Option<Option<String>>),
+}
+
+impl ReopenFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            ReopenFailure::Refused(error)
+            | ReopenFailure::LeftGated(error)
+            | ReopenFailure::Stale(error, _) => error,
+        }
+    }
+}
+
+/// What one try at reopening a source's network came to.
+#[derive(Debug)]
+enum ReopenTry {
+    Open,
+    /// Open, and the one-shot reported that the agent which served the prepare died
+    /// before this resume (`SOURCE_AGENT_RESTARTED_REPORT`).
+    OpenAfterAgentRestart,
+    /// The guest refused because a restore is under way in it (exit 3).
+    Refused(anyhow::Error),
+    /// The guest refused the resume as another boundary's (exit 5), and said which token
+    /// its owed boundary has.
+    Stale(anyhow::Error, Option<Option<String>>),
+    /// The one-shot failed, or could not be run at all.
+    Failed(anyhow::Error),
+}
+
+/// Run the guest's resume one-shot until it has opened the gate or `SOURCE_REOPEN_BOUND`
+/// has passed (#2142). `pause_preceded` sends the host's clock with each try, taken at
+/// that try.
+///
+/// A source that is still gated when the bound has passed is left running: its
+/// established connections go on working behind the gate, and ending it would end them.
+/// It is reported failed instead. The create fails with the VM's id, the VM's state
+/// records `network_gate_closed`, and the next `snapshot create` of it is refused until
+/// the gate is open ([`refuse_a_source_left_gated`]).
+///
+/// The state is written before the first ask and cleared by the try that opens the gate:
+/// a create that is interrupted while it is asking (Ctrl-C; nothing here handles a
+/// signal), at its first try as at any later one, leaves the source gated, and the record
+/// is what makes the next create ask again before it prepares. A reopen that needs no
+/// second try writes the record and clears it, and leaves the state as it found it.
+///
+/// `Ok(true)`: open, and the agent that served the prepare died before the resume.
+async fn reopen_source_network(
+    vsock_socket: &Path,
+    vm_id: &str,
+    pause_preceded: bool,
+) -> Result<bool> {
+    ask_source_to_reopen(
         vsock_socket,
         vm_id,
-        &["--resume-snapshot-network", "--host-time-ns", &host_time],
+        pause_preceded,
+        SOURCE_REOPEN_BOUND,
+        u32::MAX,
+        false,
     )
-    .await?;
-    // The one-shot's own report, including the size of the clock step, reaches no
-    // console: it is this exec's stderr.
-    debug!(vm_id, guest = %output.stderr.trim(), "source network reopened");
-    Ok(())
+    .await
+    .map_err(ReopenFailure::into_error)
+}
+
+/// Write `network_gate_closed` on the VM's state, and take the boundary's token off it
+/// when the gate is open: no resume is owed then. Best-effort: the create's own error
+/// already names the VM, and a VM being torn down has no state to write.
+async fn record_source_gate(vm_id: &str, closed: bool) {
+    let state_manager = crate::state::StateManager::new(paths::state_dir());
+    record_source_gate_in(&state_manager, vm_id, closed).await
+}
+
+async fn record_source_gate_in(
+    state_manager: &crate::state::StateManager,
+    vm_id: &str,
+    closed: bool,
+) {
+    match state_manager
+        .update_state(vm_id, |state| {
+            state.network_gate_closed = closed;
+            if !closed {
+                state.boundary_token = None;
+            }
+        })
+        .await
+    {
+        Ok(_) => {}
+        Err(error) => warn!(
+            vm_id,
+            closed,
+            error = %format!("{error:#}"),
+            "could not record the source's gate on its state"
+        ),
+    }
+}
+
+/// Refuse a snapshot of a VM whose gate an earlier create left closed, unless the gate
+/// can be opened now. The guest is asked once: the reopen is the same one-shot, it does
+/// nothing to an open gate, and an operator or a restarted agent may have made it
+/// possible since. A source that opens is recorded open and snapshotted as any other.
+///
+/// The creators call this before anything else: before the global permit, before the
+/// staging directory, and outside every step whose failure reopens the source. A refusal
+/// that came from inside the prepare ran the whole reopen loop as that prepare's
+/// recovery.
+async fn refuse_a_source_left_gated(vsock_socket: &Path, vm_id: &str) -> Result<()> {
+    let state_manager = crate::state::StateManager::new(paths::state_dir());
+    let gated = state_manager
+        .load_state(vm_id)
+        .await
+        .is_ok_and(|state| state.network_gate_closed);
+    if !gated {
+        return Ok(());
+    }
+    match ask_source_to_reopen(vsock_socket, vm_id, false, SOURCE_REOPEN_ONE_ASK, 1, true).await {
+        Ok(_agent_restarted) => {
+            info!(
+                vm_id,
+                "the gate an earlier snapshot create left closed is open"
+            );
+            Ok(())
+        }
+        Err(failure) => Err(failure.into_error().context(format!(
+            "snapshot create of VM {vm_id} is refused: its state records its network gate \
+             closed since an earlier snapshot create (left closed, or refused a resume \
+             without saying), and its guest still does not report it open"
+        ))),
+    }
+}
+
+/// Ask the guest to reopen: at most `max_tries` tries within `bound`. `gated` says
+/// whether the VM's state already records the gate closed.
+async fn ask_source_to_reopen(
+    vsock_socket: &Path,
+    vm_id: &str,
+    pause_preceded: bool,
+    bound: std::time::Duration,
+    max_tries: u32,
+    gated: bool,
+) -> std::result::Result<bool, ReopenFailure> {
+    let state_manager = crate::state::StateManager::new(paths::state_dir());
+    let state_manager = &state_manager;
+    let reopened = reopen_until_open(
+        vm_id,
+        bound,
+        (SOURCE_REOPEN_PAUSE, SOURCE_REOPEN_LEAST_TRY),
+        max_tries,
+        gated,
+        |limit| async move {
+            // A state that cannot be read is a try that failed, and is tried again: sent
+            // without the token the guest's mark holds, the resume would be refused.
+            let args = match resume_args(state_manager, vm_id, pause_preceded).await {
+                Ok(args) => args,
+                Err(error) => return ReopenTry::Failed(error),
+            };
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            match run_fc_agent_command_any_exit(vsock_socket, vm_id, &args, Some(limit)).await {
+                Ok(output) => reopen_try_of(vm_id, output),
+                Err(error) => ReopenTry::Failed(error),
+            }
+        },
+        |closed| record_source_gate(vm_id, closed),
+    )
+    .await;
+    match reopened {
+        Ok(agent_restarted) => Ok(agent_restarted),
+        Err(failure @ ReopenFailure::Refused(_)) => Err(failure),
+        Err(failure) => {
+            let state = state_manager.load_state(vm_id).await.ok();
+            let pid = state.as_ref().and_then(|state| state.pid);
+            let token = state.and_then(|state| state.boundary_token);
+            Err(with_the_resume_by_hand(failure, pid, token.as_deref()))
+        }
+    }
+}
+
+/// Put before a left-gated or stale failure what an operator runs to open the gate by
+/// hand. The guest runs only the resume that carries the token in its `owed` mark.
+fn with_the_resume_by_hand(
+    failure: ReopenFailure,
+    pid: Option<u32>,
+    token: Option<&str>,
+) -> ReopenFailure {
+    let exec = match pid {
+        Some(pid) => format!("fcvm exec --pid {pid} --vm --"),
+        None => "fcvm exec --pid <the VM's fcvm pid> --vm --".to_string(),
+    };
+    match failure {
+        ReopenFailure::LeftGated(error) => {
+            let boundary = token
+                .map(|token| format!(" --boundary {token}"))
+                .unwrap_or_default();
+            ReopenFailure::LeftGated(error.context(format!(
+                "to open the gate by hand: `{exec} {FC_AGENT_PATH} --resume-snapshot-network\
+                 {boundary}`"
+            )))
+        }
+        ReopenFailure::Stale(error, owed) => {
+            let held = token.unwrap_or("none");
+            let resume = format!("{exec} {FC_AGENT_PATH} --resume-snapshot-network");
+            let by_hand = match &owed {
+                Some(Some(owed)) => format!(
+                    "its guest's owed boundary has the token {owed}. To open the gate by \
+                     hand: `{resume} --boundary {owed}`"
+                ),
+                Some(None) => format!(
+                    "its guest's owed boundary has no token. To open the gate by hand: \
+                     `{resume}`"
+                ),
+                // A guest that did not say: the mark holds it. A restarted agent that
+                // serves the resume alone refuses this read.
+                None => format!(
+                    "its guest did not say which token its owed boundary has. To open the \
+                     gate by hand, read the mark: `{exec} /usr/bin/cat \
+                     /run/fcvm/snapshot-boundary-owed`, then run the resume with the value \
+                     after `token=`: `{resume} --boundary <that value>` (with no \
+                     `--boundary` when the mark has no `token=` line)"
+                ),
+            };
+            ReopenFailure::Stale(
+                error.context(format!(
+                    "the token this VM's state holds ({held}) is not the one of the boundary \
+                     its guest owes: {by_hand}"
+                )),
+                owed,
+            )
+        }
+        refused @ ReopenFailure::Refused(_) => refused,
+    }
+}
+
+/// The loop of [`reopen_source_network`], with the try and the state's record as
+/// parameters.
+///
+/// - Each try is given what is left of `bound` and cut off there, so the loop is over
+///   within `bound` of its start. A try is not started for less than `least_try`.
+/// - `record(true)` runs before the first try, unless `gated` says the state already
+///   holds it, and `record(false)` when a try opens the gate. A guest that refuses (a
+///   restore is under way in it, and the gate is the restore's) has the record this call
+///   wrote taken back.
+/// - `Ok(true)` is a gate opened by a resume that reported the agent's restart.
+/// - A source that is still gated at the end is reported as that, by name: it refuses
+///   every new TCP connection in both directions until a resume lands, and nothing else
+///   in the system says so.
+async fn reopen_until_open<F, Fut, R, RFut>(
+    vm_id: &str,
+    bound: std::time::Duration,
+    (pause, least_try): (std::time::Duration, std::time::Duration),
+    max_tries: u32,
+    mut gated: bool,
+    mut reopen: F,
+    record: R,
+) -> std::result::Result<bool, ReopenFailure>
+where
+    F: FnMut(std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = ReopenTry>,
+    R: Fn(bool) -> RFut,
+    RFut: std::future::Future<Output = ()>,
+{
+    let started = std::time::Instant::now();
+    let mut tries = 0u32;
+    let recorded_here = !gated;
+    if recorded_here {
+        gated = true;
+        record(true).await;
+    }
+    loop {
+        tries += 1;
+        let limit = bound.saturating_sub(started.elapsed());
+        let tried = match tokio::time::timeout(limit, reopen(limit)).await {
+            Ok(tried) => tried,
+            Err(_) => ReopenTry::Failed(anyhow::anyhow!(
+                "guest {vm_id} did not answer `fc-agent --resume-snapshot-network` within \
+                 {limit:.0?}"
+            )),
+        };
+        let error = match tried {
+            ReopenTry::Open | ReopenTry::OpenAfterAgentRestart => {
+                if gated {
+                    record(false).await;
+                }
+                if tries > 1 {
+                    warn!(
+                        vm_id,
+                        tries,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "the source's network reopened after failed tries"
+                    );
+                }
+                return Ok(matches!(tried, ReopenTry::OpenAfterAgentRestart));
+            }
+            ReopenTry::Refused(error) => {
+                if recorded_here {
+                    record(false).await;
+                }
+                return Err(ReopenFailure::Refused(error.context(format!(
+                    "guest {vm_id} refused to reopen its network: a restore is under way in \
+                     it, and its gate is that restore's"
+                ))));
+            }
+            // Not tried again: the same resume gets the same answer. The record written
+            // before the first try stays, and so does the token, because the gate can be
+            // this source's own and closed.
+            ReopenTry::Stale(error, owed) => {
+                error!(
+                    vm_id,
+                    error = %format!("{error:#}"),
+                    "CRITICAL: the source VM's guest refused the resume as another \
+                     boundary's; its network gate may be closed"
+                );
+                return Err(ReopenFailure::Stale(
+                    error.context(format!(
+                        "source VM {vm_id} MAY BE LEFT WITH ITS NETWORK GATE CLOSED: its guest \
+                     refused the resume because the resume's token is not the one of the \
+                     boundary the guest owes. Its state records the gate closed; the next \
+                     `fcvm snapshot create` of it asks again and is refused while the guest \
+                     answers the same"
+                    )),
+                    owed,
+                ));
+            }
+            ReopenTry::Failed(error) => error,
+        };
+        if tries >= max_tries || started.elapsed() + pause + least_try > bound {
+            error!(
+                vm_id,
+                tries,
+                error = %format!("{error:#}"),
+                "CRITICAL: the source VM is left with its network gate closed"
+            );
+            return Err(ReopenFailure::LeftGated(error.context(format!(
+                "source VM {vm_id} is LEFT WITH ITS NETWORK GATE CLOSED: {tries} tries over \
+                 {:.0?} did not reopen it. It is left running and keeps the connections it \
+                 has, and refuses every new TCP connection, in and out, until \
+                 `{FC_AGENT_PATH} --resume-snapshot-network` succeeds in it. Its state \
+                 records the closed gate; the next `fcvm snapshot create` of it asks again, \
+                 clears the record when the gate opens, and is refused while it stays \
+                 closed",
+                started.elapsed()
+            ))));
+        }
+        warn!(
+            vm_id,
+            tries,
+            error = %format!("{error:#}"),
+            "reopening the source's network failed; trying again"
+        );
+        tokio::time::sleep(pause).await;
+    }
 }
 
 /// The guest's free page reporting parameter, which holds the order its balloon reports at.
@@ -5908,22 +7426,35 @@ pub(crate) async fn run_fc_agent_one_shot(
         .map(|_| ())
 }
 
-/// Run `fc-agent <args>` in the guest over the exec channel and fail unless it exits 0.
-async fn run_fc_agent_command(
+/// Run `fc-agent <args>` in the guest over the exec channel, whatever it exits with.
+/// With `answer_within`, a guest that takes the command and then sends nothing for that
+/// long is given up on.
+async fn run_fc_agent_command_any_exit(
     vsock_socket: &Path,
     vm_id: &str,
     args: &[&str],
+    answer_within: Option<std::time::Duration>,
 ) -> Result<crate::commands::exec::ExecOutput> {
-    use crate::commands::exec::run_exec_in_vm_captured;
+    use crate::commands::exec::run_exec_in_vm_captured_within;
 
     let command: Vec<String> = std::iter::once(FC_AGENT_PATH)
         .chain(args.iter().copied())
         .map(str::to_string)
         .collect();
     let shown = command.join(" ");
-    let output = run_exec_in_vm_captured(vsock_socket, &command, false, vm_id)
+    run_exec_in_vm_captured_within(vsock_socket, &command, false, vm_id, answer_within)
         .await
-        .with_context(|| format!("running `{shown}` in guest {vm_id}"))?;
+        .with_context(|| format!("running `{shown}` in guest {vm_id}"))
+}
+
+/// Run `fc-agent <args>` in the guest over the exec channel and fail unless it exits 0.
+async fn run_fc_agent_command(
+    vsock_socket: &Path,
+    vm_id: &str,
+    args: &[&str],
+) -> Result<crate::commands::exec::ExecOutput> {
+    let shown = format!("{FC_AGENT_PATH} {}", args.join(" "));
+    let output = run_fc_agent_command_any_exit(vsock_socket, vm_id, args, None).await?;
     anyhow::ensure!(
         output.exit_code == 0,
         "`{shown}` failed in guest {vm_id} with exit code {}: \
@@ -6120,6 +7651,10 @@ pub async fn create_snapshot_core(
 ) -> Result<PublishedMemoryFile> {
     use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
 
+    // First, before the permit and before anything is staged: a source an earlier
+    // create left gated is asked once more, and refused if it stays closed.
+    refuse_a_source_left_gated(vsock_socket_path, &snapshot_config.vm_id).await?;
+
     // Acquire snapshot concurrency permit BEFORE pausing the VM.
     // This prevents dirty_ratio throttling when many VMs snapshot simultaneously.
     let _permit = snapshot_semaphore()
@@ -6238,7 +7773,7 @@ pub async fn create_snapshot_core(
     // transaction commit a file fsynced in a new subvolume forces.
     if !staged {
         if memory_dir.is_some() {
-            tokio::fs::create_dir_all(&temp_snapshot_dir)
+            crate::paths::ensure_dir_async(&temp_snapshot_dir)
                 .await
                 .context("creating temp snapshot directory")?;
         } else {
@@ -6313,7 +7848,7 @@ pub async fn create_snapshot_core(
         let created = match memory_dir {
             Some(dir) => {
                 // Recorded before it exists: a create killed before it publishes leaves the
-                // file to the next launch's reclaim instead of to the memory directory forever.
+                // file to the next sweep instead of to the memory directory forever.
                 let target = crate::storage::disk::linked_memory_target(dir);
                 begin_memory_file_owner(&target)
                     .and_then(|owner| {
@@ -6383,10 +7918,10 @@ pub async fn create_snapshot_core(
         // invoked yet.
         let operation_error =
             error.context("preparing guest network boundary for Firecracker snapshot");
-        let guest_network_resume_result = run_snapshot_network_command(
+        let guest_network_resume_result = reopen_source_after_failed_prepare(
             vsock_socket_path,
             &snapshot_config.vm_id,
-            "--resume-snapshot-network",
+            &operation_error,
         )
         .await
         .context("reopening guest network after Firecracker preparation failure");
@@ -6620,6 +8155,9 @@ pub async fn create_snapshot_core(
     // the socket-generation boundary its restored clones consume.
     let guest_network_resume_result = match source_disposition {
         SnapshotSourceDisposition::Resume => {
+            // failpoint: the source runs again, behind its closed gate, and has not been
+            // asked to reopen. A test kills the guest's agent here.
+            failpoint::hit_async("snapshot.post_resume_pre_reopen").await;
             resume_paused_source(vsock_socket_path, &snapshot_config.vm_id)
                 .await
                 .context("reopening guest network after Firecracker snapshot")
@@ -6906,6 +8444,17 @@ impl<'a> ChSnapshotGuest<'a> {
         Ok(ChSnapshotGuest::FcAgent { vsock_socket_path })
     }
 
+    /// Refuse a source that an earlier create left gated and that still cannot be
+    /// opened. Before, and outside, every step whose failure reopens the source.
+    async fn refuse_if_left_gated(&self, vm_id: &str) -> Result<()> {
+        match self {
+            ChSnapshotGuest::FcAgent { vsock_socket_path } => {
+                refuse_a_source_left_gated(vsock_socket_path, vm_id).await
+            }
+            ChSnapshotGuest::Raw => Ok(()),
+        }
+    }
+
     /// Close the guest network boundary before the pause.
     async fn prepare(&self, vm_id: &str) -> Result<()> {
         match self {
@@ -6919,11 +8468,14 @@ impl<'a> ChSnapshotGuest<'a> {
 
     /// Reopen the boundary after a failed `prepare`, whose failure does not prove it did
     /// not run. Guest-side flock serialization makes the unconditional reopen exact.
-    async fn reopen_after_failed_prepare(&self, vm_id: &str) -> Result<()> {
+    async fn reopen_after_failed_prepare(
+        &self,
+        vm_id: &str,
+        prepare_error: &anyhow::Error,
+    ) -> Result<()> {
         match self {
             ChSnapshotGuest::FcAgent { vsock_socket_path } => {
-                run_snapshot_network_command(vsock_socket_path, vm_id, "--resume-snapshot-network")
-                    .await
+                reopen_source_after_failed_prepare(vsock_socket_path, vm_id, prepare_error).await
             }
             ChSnapshotGuest::Raw => Ok(()),
         }
@@ -6966,6 +8518,9 @@ pub async fn create_snapshot_ch(
     extra_files: SnapshotExtraFiles<'_>,
     source_disposition: SnapshotSourceDisposition,
 ) -> Result<()> {
+    // First, as in `create_snapshot_core`: a source an earlier create left gated.
+    guest.refuse_if_left_gated(&snapshot_config.vm_id).await?;
+
     // CH snapshots are always self-contained (no diff base / parent chain).
     snapshot_config.parent_snapshot = None;
 
@@ -7020,7 +8575,7 @@ pub async fn create_snapshot_ch(
         .await
         .context("creating temp CH snapshot directory")?;
     let ch_dir = temp_snapshot_dir.join(CH_SNAPSHOT_SUBDIR);
-    tokio::fs::create_dir_all(&ch_dir)
+    crate::paths::ensure_dir_async(&ch_dir)
         .await
         .context("creating temp CH snapshot directory")?;
 
@@ -7035,7 +8590,7 @@ pub async fn create_snapshot_ch(
         let operation_error =
             error.context("preparing guest network boundary for Cloud Hypervisor snapshot");
         let guest_network_resume_result = guest
-            .reopen_after_failed_prepare(&snapshot_config.vm_id)
+            .reopen_after_failed_prepare(&snapshot_config.vm_id, &operation_error)
             .await
             .context("reopening guest network after Cloud Hypervisor preparation failure");
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
@@ -7192,16 +8747,564 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_terminal_interrupt_does_not_reach_the_namespace_holder() {
         let interrupt = crate::utils::TerminalInterrupt::arm();
-        let holder_cmd =
-            crate::network::PastaNetwork::new("vm-test".to_string(), "tap-fc".to_string(), vec![])
-                .build_holder_command();
-        let (mut holder, holder_pid) = super::spawn_namespace_holder(&holder_cmd)
+        let (mut holder, holder_pid) = super::spawn_namespace_holder()
             .await
             .expect("spawning the namespace holder");
         interrupt
             .assert_misses(&mut holder, "the namespace holder")
             .await;
         crate::companion::forget(holder_pid);
+        crate::network::netns_agent::forget(holder_pid);
+    }
+
+    /// A confined start whose Firecracker binary cannot be found is refused at the
+    /// preflight, where nothing has been created yet. It used to pass there and fail at the
+    /// launch, after namespaces and disks existed.
+    #[test]
+    fn the_confined_preflight_refuses_a_binary_it_cannot_find() {
+        let confined = crate::confine::Decision::for_test(Some(crate::confine::Confinement {
+            landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
+            layers: vec![
+                crate::confine::Layer::Process,
+                crate::confine::Layer::Seccomp,
+            ],
+            core_limit: 1,
+            seccomp: Some(crate::confine::SeccompMode::Enforce),
+        }));
+        let absent = super::RuntimeConfig {
+            firecracker_bin: Some("/nonexistent/firecracker".into()),
+            ..super::RuntimeConfig::default()
+        };
+        let refused = super::require_confined_filter(&confined, &absent)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("nothing was started")
+                && refused.contains("/nonexistent/firecracker does not exist"),
+            "{refused}"
+        );
+        // An unconfined start needs no filter and is not asked for the binary here.
+        super::require_confined_filter(&crate::confine::Decision::for_test(None), &absent).unwrap();
+    }
+
+    /// `SO_NETNS_COOKIE` of a socket: the identity of the network namespace it was made in.
+    fn netns_cookie(socket: &impl std::os::fd::AsRawFd) -> u64 {
+        let mut cookie = 0u64;
+        let mut len = std::mem::size_of::<u64>() as libc::socklen_t;
+        // SAFETY: `cookie` is 8 bytes, which is what SO_NETNS_COOKIE writes.
+        let rc = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NETNS_COOKIE,
+                (&mut cookie as *mut u64).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "SO_NETNS_COOKIE: {}",
+            std::io::Error::last_os_error()
+        );
+        cookie
+    }
+
+    /// Kill and reap a holder a test started.
+    async fn stop_holder(mut holder: tokio::process::Child, holder_pid: u32) {
+        let _ = holder.start_kill();
+        let _ = holder.wait().await;
+        crate::companion::forget(holder_pid);
+        crate::network::netns_agent::forget(holder_pid);
+    }
+
+    /// The holder is the agent, named as such, in namespaces of its own with the id maps
+    /// written, and the sockets it hands out belong to its network namespace, not this
+    /// process's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_namespace_holder_hands_out_sockets_made_in_its_namespace() {
+        let (holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        let comm = std::fs::read_to_string(format!("/proc/{holder_pid}/comm")).unwrap();
+        assert_eq!(
+            comm.trim(),
+            crate::network::netns_agent::COMM.to_str().unwrap()
+        );
+        for ns in ["user", "net"] {
+            assert_ne!(
+                std::fs::read_link(format!("/proc/{holder_pid}/ns/{ns}")).unwrap(),
+                std::fs::read_link(format!("/proc/self/ns/{ns}")).unwrap(),
+                "the holder shares this process's {ns} namespace"
+            );
+        }
+        let uid_map = std::fs::read_to_string(format!("/proc/{holder_pid}/uid_map")).unwrap();
+        assert!(
+            uid_map.split_whitespace().next() == Some("0") && !uid_map.contains("4294967295"),
+            "uid_map: {uid_map}"
+        );
+
+        let agent = crate::network::netns_agent::client(holder_pid)
+            .expect("the holder's channel is registered under its pid");
+        let here = tokio::net::TcpSocket::new_v4().unwrap();
+        for address in ["10.0.2.100", "fd00::100"] {
+            let socket = agent.tcp_socket(&address.parse().unwrap()).await.unwrap();
+            assert_ne!(
+                netns_cookie(&socket),
+                netns_cookie(&here),
+                "a {address} socket from the holder is in this process's network namespace"
+            );
+        }
+        let first = agent
+            .tcp_socket(&"10.0.2.100".parse().unwrap())
+            .await
+            .unwrap();
+        let second = agent
+            .tcp_socket(&"10.0.2.100".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(netns_cookie(&first), netns_cookie(&second));
+        stop_holder(holder, holder_pid).await;
+    }
+
+    /// `argv` in the holder's namespaces; its failure fails the test.
+    fn in_namespace(holder_pid: u32, argv: &[&str]) {
+        let output = std::process::Command::new("nsenter")
+            .args(["--preserve-credentials", "-U", "-n", "-t"])
+            .arg(holder_pid.to_string())
+            .arg("--")
+            .args(argv)
+            .output()
+            .expect("running a command in the holder's namespaces");
+        assert!(
+            output.status.success(),
+            "{argv:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A lessee's channel gets sockets made in the namespace and nothing else: it cannot
+    /// build, reset or fingerprint a namespace it does not own. The reset ends it, and the
+    /// owner is served before and after.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_adopted_channel_gets_sockets_and_nothing_else() {
+        use crate::network::netns_agent;
+        let (holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        let owner = netns_agent::client(holder_pid).unwrap();
+        let (holder_end, lessee_end) = netns_agent::channel().unwrap();
+        owner.adopt(&holder_end).await.expect("adopting a channel");
+        drop(holder_end);
+        let lessee = netns_agent::Client::new(lessee_end).unwrap();
+        let guest: std::net::IpAddr = "10.0.2.100".parse().unwrap();
+
+        let theirs = lessee.tcp_socket(&guest).await.expect("a lessee's socket");
+        let ours = owner.tcp_socket(&guest).await.expect("the owner's socket");
+        assert_eq!(netns_cookie(&theirs), netns_cookie(&ours));
+
+        let network = crate::network::PastaNetwork::isolated("vm-lessee".into(), "tap-fc".into());
+        let refused = lessee.build(&network.shape()).await.unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("unknown request"),
+            "{refused:#}"
+        );
+        assert!(lessee.reset().await.is_err());
+        assert!(lessee.fingerprint("tap-fc").await.is_err());
+        let links = ip_json(holder_pid, &["link", "show"]);
+        assert_eq!(
+            links.as_array().unwrap().len(),
+            1,
+            "a lessee built links: {links}"
+        );
+
+        owner.reset().await.expect("resetting the namespace");
+        // The holder closed the lessee's channel before it answered the reset.
+        let ended = lessee.tcp_socket(&guest).await.unwrap_err();
+        assert!(format!("{ended:#}").contains("Broken pipe"), "{ended:#}");
+        owner
+            .tcp_socket(&guest)
+            .await
+            .expect("the owner after a reset");
+        stop_holder(holder, holder_pid).await;
+    }
+
+    /// What a VM's use leaves in a namespace shows in its fingerprint, and the reset takes
+    /// it out: a neighbour entry, an address the bridge learned on the VMM's port, a TCP
+    /// connection towards the guest. A route through loopback is something no VM can add
+    /// and no reset removes (the reset renews the bridge's address, and with it every route
+    /// through the bridge): the namespace then reads differently for good, which is what
+    /// gets a pooled namespace destroyed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reset_namespace_reads_as_it_was_built() {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+        let (holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        let network = crate::network::PastaNetwork::isolated("vm-reset".into(), "tap-fc".into());
+        network
+            .build_namespace(holder_pid)
+            .await
+            .expect("building the namespace");
+        let agent = crate::network::netns_agent::client(holder_pid).unwrap();
+        let built = agent
+            .fingerprint("tap-fc")
+            .await
+            .expect("the first fingerprint");
+        assert!(built.contains("link tap-fc "), "{built}");
+        assert!(built.contains("sockets sockstat: TCP=0 "), "{built}");
+        assert!(!built.contains("cached route"), "{built}");
+
+        let mac = "02:00:00:00:00:99";
+        in_namespace(
+            holder_pid,
+            &[
+                "ip",
+                "neigh",
+                "replace",
+                "10.0.2.100",
+                "lladdr",
+                mac,
+                "dev",
+                "br0",
+                "nud",
+                "reachable",
+            ],
+        );
+        // An IPv6 neighbour too. The renewal of the bridge's IPv4 address takes the IPv4
+        // entries of the bridge with it; nothing but the reset's own pass over the
+        // neighbours removes this one.
+        in_namespace(
+            holder_pid,
+            &[
+                "ip",
+                "-6",
+                "neigh",
+                "replace",
+                "fd00::99",
+                "lladdr",
+                mac,
+                "dev",
+                "br0",
+                "nud",
+                "reachable",
+            ],
+        );
+        in_namespace(
+            holder_pid,
+            &[
+                "bridge", "fdb", "add", mac, "dev", "tap-fc", "master", "dynamic",
+            ],
+        );
+        // A connection towards the guest that nothing answers: the socket stays, sending SYNs.
+        let socket = agent
+            .tcp_socket(&"10.0.2.100".parse().unwrap())
+            .await
+            .expect("a socket in the namespace");
+        // SAFETY: the descriptor is a TCP socket this test owns alone.
+        let socket = unsafe { std::net::TcpStream::from_raw_fd(socket.into_raw_fd()) };
+        let guest: std::net::SocketAddrV4 = "10.0.2.100:80".parse().unwrap();
+        let address = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: guest.port().to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from(*guest.ip()).to_be(),
+            },
+            sin_zero: [0; 8],
+        };
+        // SAFETY: `address` is a sockaddr_in that outlives the call.
+        let rc = unsafe {
+            libc::connect(
+                socket.as_raw_fd(),
+                (&address as *const libc::sockaddr_in).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(
+            (rc, std::io::Error::last_os_error().raw_os_error()),
+            (-1, Some(libc::EINPROGRESS))
+        );
+
+        let used = agent
+            .fingerprint("tap-fc")
+            .await
+            .expect("the used fingerprint");
+        assert!(
+            used.contains(&format!("neigh br0 10.0.2.100 {mac}")),
+            "{used}"
+        );
+        assert!(
+            used.contains(&format!("neigh br0 fd00::99 {mac}")),
+            "{used}"
+        );
+        assert!(
+            used.contains(&format!("fdb tap-fc {mac} learned")),
+            "{used}"
+        );
+        assert!(used.contains("sockets sockstat: TCP=1 "), "{used}");
+
+        agent.reset().await.expect("resetting the namespace");
+        let after = agent
+            .fingerprint("tap-fc")
+            .await
+            .expect("the reset fingerprint");
+        assert_eq!(after, built);
+        drop(socket);
+
+        in_namespace(
+            holder_pid,
+            &["ip", "route", "add", "192.0.2.0/24", "dev", "lo"],
+        );
+        agent.reset().await.expect("resetting again");
+        let foreign = agent
+            .fingerprint("tap-fc")
+            .await
+            .expect("the last fingerprint");
+        assert_ne!(foreign, built);
+        assert!(foreign.contains("192.0.2.0/24"), "{foreign}");
+        stop_holder(holder, holder_pid).await;
+    }
+
+    /// Each kind of state the fingerprint reads shows in it when something adds to it, and
+    /// reads as built again when that is taken back: an address, an extra queueing
+    /// discipline, a link's forwarding switch, a policy rule, an nftables table.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_change_in_the_namespace_shows_in_its_fingerprint() {
+        let (holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        let network = crate::network::PastaNetwork::isolated("vm-marks".into(), "tap-fc".into());
+        network
+            .build_namespace(holder_pid)
+            .await
+            .expect("building the namespace");
+        let agent = crate::network::netns_agent::client(holder_pid).unwrap();
+        let built = agent.fingerprint("tap-fc").await.expect("a fingerprint");
+        const FLIP_FORWARDING: &str =
+            "f=/proc/sys/net/ipv4/conf/br0/forwarding; echo $((1 - $(cat $f))) > $f";
+        let changes: [(&str, &[&str], &[&str]); 5] = [
+            (
+                "an address",
+                &["ip", "addr", "add", "192.0.2.7/32", "dev", "lo"],
+                &["ip", "addr", "del", "192.0.2.7/32", "dev", "lo"],
+            ),
+            (
+                "a queueing discipline",
+                &["tc", "qdisc", "add", "dev", "br0", "clsact"],
+                &["tc", "qdisc", "del", "dev", "br0", "clsact"],
+            ),
+            // Flipped, then flipped back: a new namespace takes the host's value.
+            (
+                "a forwarding switch",
+                &["sh", "-c", FLIP_FORWARDING],
+                &["sh", "-c", FLIP_FORWARDING],
+            ),
+            (
+                "a policy rule",
+                &["ip", "rule", "add", "from", "192.0.2.0/24", "table", "main"],
+                &["ip", "rule", "del", "from", "192.0.2.0/24", "table", "main"],
+            ),
+            (
+                "an nftables table",
+                &["iptables-nft", "-N", "FCVM-FINGERPRINT-TEST"],
+                &["iptables-nft", "-X", "FCVM-FINGERPRINT-TEST"],
+            ),
+        ];
+        for (what, add, remove) in changes {
+            in_namespace(holder_pid, add);
+            let changed = agent.fingerprint("tap-fc").await.expect("a fingerprint");
+            assert_ne!(changed, built, "{what} does not show in the fingerprint");
+            in_namespace(holder_pid, remove);
+            if what == "an nftables table" {
+                // Removing the chain leaves the table iptables made for it.
+                continue;
+            }
+            let back = agent.fingerprint("tap-fc").await.expect("a fingerprint");
+            assert_eq!(back, built, "{what} left a trace after it was removed");
+        }
+        stop_holder(holder, holder_pid).await;
+    }
+
+    /// `ip -j ARGS` in the holder's namespaces, parsed. `ip` is the second instrument here:
+    /// the links are made over netlink by the holder and read back by iproute2.
+    fn ip_json(holder_pid: u32, args: &[&str]) -> serde_json::Value {
+        let output = std::process::Command::new("nsenter")
+            .args(["--preserve-credentials", "-U", "-n", "-t"])
+            .arg(holder_pid.to_string())
+            .args(["--", "ip", "-j", "-d"])
+            .args(args)
+            .output()
+            .expect("running ip in the holder's namespaces");
+        assert!(
+            output.status.success(),
+            "ip {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("ip -j prints JSON")
+    }
+
+    fn link<'a>(links: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        links
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|link| link["ifname"] == name)
+            .unwrap_or_else(|| panic!("no link {name} in {links}"))
+    }
+
+    fn is_up(link: &serde_json::Value) -> bool {
+        link["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|flag| flag == "UP")
+    }
+
+    /// The holder builds what a rootless VM's namespace needs in one request: the VMM's TAP
+    /// and pasta's, both persistent and on `br0`, every link up at the guest's MTU, the
+    /// bridge under the pinned MAC with 10.0.2.1/24, loopback up, and no automatic IPv6
+    /// link-local address on any of the three.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_holder_builds_the_links_a_rootless_vm_needs() {
+        let (holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        let network =
+            crate::network::PastaNetwork::new("vm-build".to_string(), "tap-fc".to_string(), vec![]);
+        network
+            .build_namespace(holder_pid)
+            .await
+            .expect("building the namespace");
+
+        let links = ip_json(holder_pid, &["link", "show"]);
+        let mtu = crate::network::pasta::GUEST_MTU;
+        for tap in ["tap-fc", "pasta0"] {
+            let tap_link = link(&links, tap);
+            assert_eq!(tap_link["master"], "br0", "{tap_link}");
+            assert_eq!(tap_link["mtu"], mtu, "{tap_link}");
+            assert!(is_up(tap_link), "{tap_link}");
+            assert_eq!(tap_link["linkinfo"]["info_kind"], "tun", "{tap_link}");
+            assert_eq!(
+                tap_link["linkinfo"]["info_data"]["type"], "tap",
+                "{tap_link}"
+            );
+            assert_eq!(
+                tap_link["linkinfo"]["info_data"]["persist"], true,
+                "{tap_link}"
+            );
+            assert_eq!(tap_link["linkinfo"]["info_data"]["pi"], false, "{tap_link}");
+            assert_eq!(tap_link["inet6_addr_gen_mode"], "none", "{tap_link}");
+        }
+        let bridge = link(&links, "br0");
+        assert_eq!(bridge["address"], crate::network::pasta::NAMESPACE_MAC);
+        assert_eq!(bridge["mtu"], mtu);
+        assert!(is_up(bridge), "{bridge}");
+        assert_eq!(bridge["linkinfo"]["info_kind"], "bridge");
+        assert_eq!(bridge["inet6_addr_gen_mode"], "none", "{bridge}");
+        assert!(is_up(link(&links, "lo")));
+        assert_eq!(links.as_array().unwrap().len(), 4, "{links}");
+
+        let addresses = ip_json(holder_pid, &["-4", "addr", "show", "dev", "br0"]);
+        let info = &addresses[0]["addr_info"];
+        assert_eq!(info.as_array().unwrap().len(), 1, "{addresses}");
+        assert_eq!(info[0]["local"], "10.0.2.1");
+        assert_eq!(info[0]["prefixlen"], 24);
+        assert!(info[0].get("broadcast").is_none(), "{addresses}");
+        let routes = ip_json(holder_pid, &["-4", "route", "show"]);
+        assert_eq!(routes.as_array().unwrap().len(), 1, "{routes}");
+        assert_eq!(routes[0]["dst"], "10.0.2.0/24");
+        assert_eq!(routes[0]["dev"], "br0");
+        let v6 = ip_json(holder_pid, &["-6", "addr", "show"]);
+        let v6_devices: Vec<&str> = v6
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|link| link["addr_info"].as_array().is_some_and(|a| !a.is_empty()))
+            .map(|link| link["ifname"].as_str().unwrap())
+            .collect();
+        assert_eq!(v6_devices, ["lo"], "{v6}");
+
+        // The shape is built once, into an empty namespace. A second build stops at the
+        // first thing that exists and is not a TAP, and says which step that was.
+        let again = network.build_namespace(holder_pid).await.unwrap_err();
+        let said = format!("{again:#}");
+        assert!(
+            said.contains("creating bridge br0") && said.contains("exists"),
+            "{said}"
+        );
+        stop_holder(holder, holder_pid).await;
+    }
+
+    /// An isolated namespace (a raw VM's) gets the VM's TAP on the bridge and nothing that
+    /// leads out: no pasta TAP, the default MTU, one route.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_holder_builds_an_isolated_namespace_with_no_way_out() {
+        let (holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        let network =
+            crate::network::PastaNetwork::isolated("vm-raw".to_string(), "tap-fc".to_string());
+        network
+            .build_namespace(holder_pid)
+            .await
+            .expect("building the namespace");
+        let links = ip_json(holder_pid, &["link", "show"]);
+        let names: Vec<&str> = links
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|link| link["ifname"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(!names.contains(&"pasta0"), "{names:?}");
+        let tap = link(&links, "tap-fc");
+        assert_eq!(tap["master"], "br0");
+        assert_eq!(tap["mtu"], 1500);
+        assert_eq!(
+            link(&links, "br0")["address"],
+            crate::network::pasta::NAMESPACE_MAC
+        );
+        let routes = ip_json(holder_pid, &["route", "show"]);
+        assert_eq!(routes.as_array().unwrap().len(), 1, "{routes}");
+        stop_holder(holder, holder_pid).await;
+    }
+
+    /// Dropping this process's end of the channel is the holder's order to exit: nothing
+    /// signals it here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_namespace_holder_exits_when_its_channel_closes() {
+        let (mut holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        crate::network::netns_agent::forget(holder_pid);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), holder.wait())
+            .await
+            .expect("the holder is still running 10 s after its channel closed")
+            .unwrap();
+        assert!(status.success(), "the holder exited with {status}");
+        crate::companion::forget(holder_pid);
+    }
+
+    /// The holder's end of the channel is open in the holder alone: this process closed its
+    /// copy once the holder had started. So a request to a holder that has died fails at once
+    /// instead of waiting on a channel nothing will answer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dead_namespace_holder_reads_as_a_closed_channel() {
+        let (mut holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        let agent = crate::network::netns_agent::client(holder_pid).unwrap();
+        holder.start_kill().unwrap();
+        holder.wait().await.unwrap();
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            agent.tcp_socket(&"10.0.2.100".parse().unwrap()),
+        )
+        .await
+        .expect("a request to a dead holder was still waiting after 10 s");
+        assert!(refused.is_err(), "a dead holder handed out a socket");
+        crate::companion::forget(holder_pid);
+        crate::network::netns_agent::forget(holder_pid);
     }
 
     /// The restore document carries the restoring host's identity in the shape
@@ -7234,6 +9337,7 @@ mod tests {
                     "https_proxy": "http://10.0.2.2:3129",
                     "no_proxy": "localhost",
                 },
+                "agent-log": true,
             })
         );
 
@@ -7245,7 +9349,19 @@ mod tests {
                 "restore-epoch": "e",
                 "host-ipv6": null,
                 "proxy": { "http_proxy": null, "https_proxy": null, "no_proxy": null },
+                "agent-log": true,
             })
+        );
+        // Every restore document says this host takes fc-agent's `agent` stream, under
+        // the key fc-agent reads. Without it fc-agent keeps a restore's lines on the
+        // serial console, which is what an fcvm older than the stream needs: it would
+        // print them as the container's stderr.
+        assert!(
+            include_str!("../../fc-agent/src/types.rs").contains(&format!(
+                "#[serde(rename = \"{}\", default)]\n    pub agent_log: bool,",
+                super::RESTORE_AGENT_LOG_KEY
+            )),
+            "fc-agent no longer reads the restore document's agent-log key"
         );
     }
 
@@ -7609,6 +9725,158 @@ mod tests {
         );
     }
 
+    /// A restore whose load overrides every source path reads nothing under the view, the
+    /// directory every VM's runtime directory is in: it needs no mount namespace, and listing
+    /// that directory takes the lock every other start's `mkdir` needs. The other two kinds
+    /// of load list it, for the directories and the files they keep visible.
+    ///
+    /// RED BEFORE THE FIX: every restore listed the view twice and threw the result away
+    /// when the load overrode everything, so here, where the view cannot be listed, it
+    /// failed.
+    #[test]
+    fn a_load_that_overrides_every_path_does_not_list_the_view() {
+        let root = tempfile::tempdir().unwrap();
+        // Not a directory: listing it fails, so a restore that succeeds did not list it.
+        let unlistable = root.path().join("not-a-directory");
+        std::fs::write(&unlistable, b"").unwrap();
+        let clone = unlistable.join("vm-clone");
+        let redirects = clone_mount_redirects(
+            LoadOverrides::Everything,
+            &unlistable,
+            Vec::new(),
+            &clone,
+            &clone,
+        )
+        .expect("a load that overrides everything listed the view");
+        assert!(redirects.is_none(), "it needs no mount namespace");
+        for overrides in [LoadOverrides::None, LoadOverrides::Vsock] {
+            let error = clone_mount_redirects(overrides, &unlistable, Vec::new(), &clone, &clone)
+                .expect_err("a load that needs the view did not list it");
+            assert!(
+                format!("{error:#}").contains("for the clone's mount view"),
+                "{error:#}"
+            );
+        }
+
+        // A load that needs the view gets what the view holds.
+        let view = root.path().join("vm-disks");
+        let (clone, other) = (view.join("vm-clone"), view.join("vm-other"));
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(view.join("ro.img"), b"").unwrap();
+        let redirects =
+            clone_mount_redirects(LoadOverrides::Vsock, &view, Vec::new(), &clone, &clone)
+                .unwrap()
+                .expect("a load that does not override the disks needs the view");
+        assert_eq!(redirects.keep, vec![other]);
+        assert_eq!(redirects.keep_files, vec![view.join("ro.img")]);
+        assert!(clone_mount_redirects(
+            LoadOverrides::Everything,
+            &view,
+            Vec::new(),
+            &clone,
+            &clone
+        )
+        .unwrap()
+        .is_none());
+
+        // The restore goes through that function and lists nothing itself.
+        let source = include_str!("common.rs");
+        let prepare = &source[source.find("async fn prepare_clone_substrate(").unwrap()..];
+        let prepare = &prepare[..prepare.find("\n}\n").unwrap()];
+        assert!(prepare.contains("clone_mount_redirects(overrides, &view,"));
+        for listing in ["view_entries(", "view_files(", "read_dir("] {
+            assert!(
+                !prepare.contains(listing),
+                "prepare_clone_substrate calls {listing} itself"
+            );
+        }
+    }
+
+    /// With buckets in the view: a bucket that holds a redirect's mountpoint or the clone's own
+    /// directory is opened into its VMs' directories, which are kept one by one; any other
+    /// bucket, and a VM directory of the layout before the buckets, is kept whole.
+    #[test]
+    fn a_bucket_that_holds_a_mountpoint_is_opened_and_one_that_does_not_is_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let view = root.path().join("vm-disks");
+        let (held, quiet, own) = (view.join("3c"), view.join("7f"), view.join("a0"));
+        let (source, neighbour, clone) = (
+            held.join("vm-source"),
+            held.join("vm-neighbour"),
+            own.join("vm-clone"),
+        );
+        let flat = view.join("vm-old");
+        for dir in [&source, &neighbour, &quiet.join("vm-other"), &clone, &flat] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let pairs = vec![(source.clone(), clone.clone())];
+        let (entries, _) = expand_buckets(view_entries(&view).unwrap(), &pairs, &[&clone]).unwrap();
+        assert_eq!(
+            entries,
+            [
+                clone.clone(),
+                neighbour.clone(),
+                source.clone(),
+                quiet.clone(),
+                flat.clone()
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+            "the source's bucket and the clone's are opened into their VMs' directories; the \
+             bucket with no mountpoint and the old layout's VM directory stay whole"
+        );
+        let redirects = clone_mount_view(&view, pairs, &clone, &clone, &entries).unwrap();
+        assert!(
+            !redirects.keep.iter().any(|dir| *dir == held || *dir == own),
+            "a bucket that holds a mountpoint is never bound onto itself (#1187): {:?}",
+            redirects.keep
+        );
+        assert!(redirects.keep.contains(&neighbour) && redirects.keep.contains(&quiet));
+        assert!(
+            !redirects
+                .pairs
+                .iter()
+                .any(|(mountpoint, _)| *mountpoint == held),
+            "{:?}",
+            redirects.pairs
+        );
+    }
+
+    /// A regular file directly in a bucket the mount view opens (a read-only `--disk` image
+    /// a source VM was given at `<vm-disks>/<b>/data.raw`) stays reachable to the clone's
+    /// VMM: the view keeps it, as it keeps a file directly in `vm-disks`.
+    #[test]
+    fn a_file_in_an_opened_bucket_is_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let view = root.path().join("vm-disks");
+        let held = view.join("3c");
+        let (source, clone) = (held.join("vm-source"), view.join("a0").join("vm-clone"));
+        for dir in [&source, &clone] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let disk = held.join("data.raw");
+        std::fs::write(&disk, b"").unwrap();
+        let top = view.join("top.raw");
+        std::fs::write(&top, b"").unwrap();
+        let redirects = clone_mount_redirects(
+            LoadOverrides::None,
+            &view,
+            vec![(source.clone(), clone.clone())],
+            &clone,
+            &clone,
+        )
+        .unwrap()
+        .expect("a mount view");
+        assert!(
+            redirects.keep_files.contains(&disk) && redirects.keep_files.contains(&top),
+            "{:?}",
+            redirects.keep_files
+        );
+    }
+
     /// A read-only `--disk` under another directory of vm-disks stays reachable,
     /// whatever that directory is called: every directory the view holds that no
     /// redirect replaces is kept, bound onto itself when it still exists as the VMM starts.
@@ -7808,6 +10076,48 @@ mod tests {
         );
     }
 
+    /// Taking a snapshot's lock, or a VM's snapshot lock, again does not truncate the lock
+    /// file: every clone takes its snapshot's lock, and an O_TRUNC open takes the inode lock
+    /// for writing and modifies the file (an IN_MODIFY event; creating it is not one).
+    #[tokio::test]
+    async fn taking_a_snapshot_lock_again_truncates_nothing() {
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        let root = tempfile::tempdir().unwrap();
+        let snapshot_dir = root.path().join("snap");
+        let disk = root.path().join("vm").join("disks").join("rootfs.raw");
+        std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        drop(
+            acquire_snapshot_dir_lock(&snapshot_dir, false)
+                .await
+                .unwrap(),
+        );
+        drop(
+            acquire_vm_snapshot_lock_within(&disk, std::time::Duration::from_secs(1))
+                .await
+                .unwrap(),
+        );
+        let inotify = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
+        for dir in [root.path(), &root.path().join("vm")] {
+            inotify.add_watch(dir, AddWatchFlags::IN_MODIFY).unwrap();
+        }
+        drop(
+            acquire_snapshot_dir_lock(&snapshot_dir, false)
+                .await
+                .unwrap(),
+        );
+        drop(
+            acquire_vm_snapshot_lock_within(&disk, std::time::Duration::from_secs(1))
+                .await
+                .unwrap(),
+        );
+        let modified: Vec<_> = match inotify.read_events() {
+            Ok(events) => events.into_iter().map(|e| e.name).collect(),
+            Err(nix::errno::Errno::EAGAIN) => Vec::new(),
+            Err(error) => panic!("reading inotify events: {error}"),
+        };
+        assert!(modified.is_empty(), "lock files modified: {modified:?}");
+    }
+
     /// `with_extension` would map "app.v1" onto "app.creating", colliding with an
     /// unrelated tag's files — snapshot_sibling must APPEND instead.
     #[test]
@@ -7833,6 +10143,7 @@ mod tests {
 
     fn make_vm_state(vm_id: &str, original_vsock: Option<&str>) -> VmState {
         let mut state = VmState::new(vm_id.to_string(), "nginx:alpine".to_string(), 2, 1024);
+        state.config.vm_runtime_dir = Some(paths::vm_runtime_dir(vm_id));
         state.config.network = NetworkConfig::default();
         state.config.health_check_url = Some("http://localhost/".to_string());
         state.config.hugepages = false;
@@ -7931,6 +10242,451 @@ mod tests {
         let mut reused = current.clone();
         reused.pid_start_time = Some(start + 1);
         assert!(validate_snapshot_vm_identity(&reused, &reused).is_err());
+    }
+
+    /// The state `snapshot run` leaves on disk for a clone of `base` before the guest has
+    /// acknowledged its restore.
+    fn restoring_clone(vm_id: &str) -> VmState {
+        let mut state = make_vm_state(vm_id, Some("vm-source"));
+        state.name = Some(format!("{vm_id}-name"));
+        state.pid = Some(4242);
+        state.status = crate::state::VmStatus::Running;
+        state.config.snapshot_name = Some("base".to_string());
+        state.config.process_type = Some(crate::state::ProcessType::Clone);
+        state
+    }
+
+    /// [`restoring_clone`] owned by this test process, saved.
+    async fn saved_restoring_clone(manager: &crate::state::StateManager, vm_id: &str) -> VmState {
+        let pid = std::process::id();
+        let mut clone = restoring_clone(vm_id);
+        clone.pid = Some(pid);
+        clone.pid_start_time = crate::utils::process_start_time(pid);
+        manager.save_state(&clone).await.unwrap();
+        clone
+    }
+
+    /// `snapshot create` refuses a VM that was restored from a snapshot until the process
+    /// that owns it has recorded the guest's acknowledgement, and takes a VM that was booted
+    /// as it always did (issue 2138). Each state is one an owner leaves on disk. `snapshot
+    /// run` saves a clone's state before it resumes the guest and records the acknowledgement
+    /// when it has it. A restore that failed is marked failed and never acknowledged, and a
+    /// prepare's restore is never recorded either.
+    ///
+    /// RED BEFORE THE FIX: nothing read the restore's state. With the check admitting every
+    /// state, as `snapshot create` did, the restoring, failed and served cases are admitted.
+    #[test]
+    fn a_snapshot_is_refused_until_the_restore_is_acknowledged() {
+        let restoring = restoring_clone("vm-clone");
+        let refusal = ensure_restore_acknowledged(&restoring)
+            .expect_err("a clone whose restore is not acknowledged was admitted")
+            .to_string();
+        for part in [
+            "VM 'vm-clone-name'",
+            "fcvm process 4242",
+            "restored from snapshot 'base'",
+            "has not been acknowledged",
+            "`fcvm ls --json --pid 4242` shows \"restore_acknowledged\": true once it has",
+            "--await-restore",
+        ] {
+            assert!(refusal.contains(part), "no {part:?} in: {refusal}");
+        }
+        // The refusal says what the state says, and nothing of the guest's gate, which the
+        // guest may have opened already.
+        assert!(!refusal.contains("gate"), "{refusal}");
+
+        // A restore that failed, as `snapshot run` records it before it tears the VM down:
+        // before its acknowledgement, and after it (the owner's port check, a memory
+        // server that died), when the state still says acknowledged or even published.
+        let mut failed = restoring.clone();
+        failed.status = crate::state::VmStatus::Failed;
+        failed.health_status = crate::state::HealthStatus::Unhealthy;
+        for (acknowledged, published) in [(false, false), (true, false), (true, true)] {
+            failed.restore_acknowledged = acknowledged;
+            failed.lifecycle_ready = published;
+            let refusal = ensure_restore_acknowledged(&failed)
+                .expect_err("a clone whose restore failed was admitted")
+                .to_string();
+            assert!(
+                refusal.contains("VM 'vm-clone-name'") && refusal.contains("its restore failed"),
+                "{refusal}"
+            );
+        }
+        // A booted VM that its owner marked failed is not this check's business.
+        let mut failed_boot = make_vm_state("vm-failed-boot", None);
+        failed_boot.status = crate::state::VmStatus::Failed;
+        ensure_restore_acknowledged(&failed_boot).unwrap();
+
+        // A clone served by a memory server is a restore like one from the snapshot's files.
+        let mut served = restoring.clone();
+        served.config.serve_pid = Some(77);
+        assert!(ensure_restore_acknowledged(&served).is_err());
+
+        // A state with neither a name nor a process still says which VM and how to look.
+        let mut anonymous = restoring.clone();
+        anonymous.name = None;
+        anonymous.pid = None;
+        anonymous.config.snapshot_name = None;
+        let refusal = ensure_restore_acknowledged(&anonymous)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains("VM 'vm-clone'") && refusal.contains("`fcvm ls --json`"),
+            "{refusal}"
+        );
+
+        let mut acknowledged = restoring.clone();
+        acknowledged.restore_acknowledged = true;
+        ensure_restore_acknowledged(&acknowledged)
+            .expect("a clone whose restore was acknowledged was refused");
+
+        // A state from before the acknowledgement was recorded: its owner published the
+        // lifecycle, which it does only after the acknowledgement.
+        let mut published = restoring.clone();
+        published.lifecycle_ready = true;
+        ensure_restore_acknowledged(&published)
+            .expect("a published clone of an fcvm from before the field was refused");
+
+        // A VM that was booted, during its setup and after: unchanged.
+        let mut booted = make_vm_state("vm-booted", None);
+        assert_eq!(
+            booted.config.process_type,
+            Some(crate::state::ProcessType::Vm)
+        );
+        ensure_restore_acknowledged(&booted).expect("a booted VM in setup was refused");
+        booted.lifecycle_ready = true;
+        ensure_restore_acknowledged(&booted).expect("a booted VM was refused");
+    }
+
+    /// The acknowledgement that admits a snapshot is the owner's one locked write: a create
+    /// that reads the clone's state before it refuses, and one that reads it after is
+    /// admitted. A state that has passed to another process is not marked.
+    #[tokio::test]
+    async fn the_owners_record_of_the_acknowledgement_is_what_admits_a_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = crate::state::StateManager::new(tmp.path().to_path_buf());
+        manager.init().await.unwrap();
+        let pid = std::process::id();
+
+        let mut clone = saved_restoring_clone(&manager, "vm-admit").await;
+        let on_disk = manager.load_state_by_pid(pid).await.unwrap();
+        assert!(ensure_restore_acknowledged(&on_disk).is_err());
+
+        publish_restore_acknowledged(&manager, &mut clone)
+            .await
+            .unwrap();
+        assert!(clone.restore_acknowledged);
+        let on_disk = manager.load_state_by_pid(pid).await.unwrap();
+        assert!(on_disk.restore_acknowledged && !on_disk.lifecycle_ready);
+        validate_snapshot_vm_identity(&clone, &on_disk).unwrap();
+        ensure_restore_acknowledged(&on_disk).unwrap();
+
+        let mut stale = saved_restoring_clone(&manager, "vm-admit-stale").await;
+        stale.pid_start_time = stale.pid_start_time.map(|start| start + 1);
+        assert!(publish_restore_acknowledged(&manager, &mut stale)
+            .await
+            .is_err());
+        assert!(
+            !manager
+                .load_state("vm-admit-stale")
+                .await
+                .unwrap()
+                .restore_acknowledged,
+            "a stale process identity recorded an acknowledgement"
+        );
+    }
+
+    /// Why `snapshot create` needs no lock against a restore: a state that reads
+    /// acknowledged never reads restoring again, whatever writes the state afterwards. The
+    /// owner saving a copy of the state it made before the acknowledgement, a health update,
+    /// a later publication and a closure that clears the flag outright all leave it set, and
+    /// a save does the same for `lifecycle_ready`. Another process's state under the same
+    /// VM id starts unacknowledged.
+    ///
+    /// RED BEFORE THE FIX: `save_state` wrote the copy it was given, so the stale copy
+    /// cleared both flags, and `update_state` wrote what the closure left.
+    #[tokio::test]
+    async fn an_acknowledged_restore_is_never_taken_back_by_a_later_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = crate::state::StateManager::new(tmp.path().to_path_buf());
+        manager.init().await.unwrap();
+        let vm_id = "vm-sticky";
+        let mut clone = saved_restoring_clone(&manager, vm_id).await;
+        let before = clone.clone();
+
+        publish_restore_acknowledged(&manager, &mut clone)
+            .await
+            .unwrap();
+        publish_lifecycle_ready(&manager, &mut clone).await.unwrap();
+
+        // A save of the copy made before either was written.
+        manager.save_state(&before).await.unwrap();
+        let on_disk = manager.load_state(vm_id).await.unwrap();
+        assert!(
+            on_disk.restore_acknowledged && on_disk.lifecycle_ready,
+            "a save of a stale copy took the publication back"
+        );
+
+        // The writers that follow an acknowledgement in a clone's life.
+        manager
+            .update_health_status(vm_id, crate::state::HealthStatus::Healthy, None)
+            .await
+            .unwrap();
+        manager.bump_vsock_epoch(vm_id).await.unwrap();
+        record_restore_failed(&manager, vm_id).await;
+        assert!(
+            manager
+                .load_state(vm_id)
+                .await
+                .unwrap()
+                .restore_acknowledged
+        );
+
+        // A closure that clears it.
+        manager
+            .update_state(vm_id, |state| state.restore_acknowledged = false)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .load_state(vm_id)
+                .await
+                .unwrap()
+                .restore_acknowledged,
+            "an update took the acknowledgement back"
+        );
+
+        // An update that hands the state to another process does not hand it the flag.
+        let start = clone.pid_start_time.unwrap();
+        manager
+            .update_state(vm_id, |state| {
+                state.pid_start_time = Some(start + 1);
+                state.restore_acknowledged = false;
+            })
+            .await
+            .unwrap();
+        assert!(
+            !manager
+                .load_state(vm_id)
+                .await
+                .unwrap()
+                .restore_acknowledged,
+            "an update kept the acknowledgement for another process's state"
+        );
+
+        // Nor is a state with no start time on record this restore's: a PID alone does not
+        // say which process. A file left by a process that is gone, then a save for the
+        // same PID.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let gone = child.id();
+        child.wait().unwrap();
+        let mut left = restoring_clone("vm-sticky-gone");
+        left.pid = Some(gone);
+        left.pid_start_time = None;
+        left.restore_acknowledged = true;
+        left.lifecycle_ready = true;
+        // Written where `save_state` reads the state it replaces, or the save below would
+        // find nothing to inherit from and prove nothing.
+        let left_file = manager.state_file("vm-sticky-gone");
+        std::fs::create_dir_all(left_file.parent().unwrap()).unwrap();
+        std::fs::write(&left_file, serde_json::to_string(&left).unwrap()).unwrap();
+        left.restore_acknowledged = false;
+        left.lifecycle_ready = false;
+        manager.save_state(&left).await.unwrap();
+        let on_disk = manager.load_state("vm-sticky-gone").await.unwrap();
+        assert!(
+            !on_disk.restore_acknowledged && !on_disk.lifecycle_ready,
+            "a state with no start time inherited another's publication"
+        );
+    }
+
+    /// A create asked for when a clone's restored record appears waits for the clone's
+    /// owner, which holds the per-VM snapshot lock until it has published the clone, and
+    /// gives up with an error that says so when the owner does not publish within the
+    /// limit. Behind any other holder of the lock it waits as long as that takes.
+    ///
+    /// RED BEFORE THE FIX: the create took the lock with no regard to who held it and no
+    /// bound, so behind an owner that never published it waited for ever.
+    #[tokio::test]
+    async fn a_create_waits_for_the_owners_publication_and_no_longer_than_its_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = crate::state::StateManager::new(tmp.path().join("state"));
+        manager.init().await.unwrap();
+        let disk = tmp.path().join("vm-held/disks/rootfs.raw");
+        std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        let vm_id = "vm-held";
+        let limit = std::time::Duration::from_secs(1);
+
+        // The owner: acknowledged, holding the lock, not yet published.
+        let mut clone = saved_restoring_clone(&manager, vm_id).await;
+        let held = acquire_vm_snapshot_lock(&disk).await.unwrap();
+        publish_restore_acknowledged(&manager, &mut clone)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let gave_up = tokio::time::timeout(
+            limit * 10,
+            acquire_vm_snapshot_lock_for_create(&disk, &manager, vm_id, limit),
+        )
+        .await
+        .expect("a create waited behind an owner that had not published, past its limit")
+        .expect_err("a create got the lock its clone's owner holds")
+        .to_string();
+        assert!(started.elapsed() >= limit);
+        assert!(
+            gave_up.contains("has not finished its own checks")
+                && gave_up.contains("vm-held-name")
+                && gave_up.contains("\"lifecycle_ready\": true"),
+            "{gave_up}"
+        );
+
+        // Published while the create waits: it gets the lock when the owner lets go.
+        let waiting = acquire_vm_snapshot_lock_for_create(&disk, &manager, vm_id, limit);
+        let owner = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            publish_lifecycle_ready(&manager, &mut clone).await.unwrap();
+            drop(held);
+        };
+        let (got, ()) = tokio::join!(waiting, owner);
+        let got = got.expect("a create did not get the lock its clone's owner gave back");
+
+        // Behind another holder (here the lock just taken) there is no limit to run into:
+        // the VM is published, so the wait is the ordinary one.
+        let waiting = acquire_vm_snapshot_lock_for_create(&disk, &manager, vm_id, limit);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(limit * 3, &mut waiting).await.is_err(),
+            "a create gave up, or got a lock that was held"
+        );
+        drop(got);
+        tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
+            .await
+            .expect("the lock was free and the create did not get it")
+            .unwrap();
+    }
+
+    /// `--await-restore` waits for the owner's record of the acknowledgement and no longer:
+    /// it returns the acknowledged state once the owner has written it, and gives the
+    /// refusal at the deadline, or at once when the restore is recorded as failed, the owner
+    /// has exited or the state is gone. Without the flag an unacknowledged clone is refused
+    /// at once.
+    #[tokio::test]
+    async fn awaiting_a_restore_ends_at_its_acknowledgement_its_failure_or_the_deadline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = crate::state::StateManager::new(tmp.path().to_path_buf());
+        manager.init().await.unwrap();
+        let long = std::time::Duration::from_secs(60);
+        // With no poll to fall back on, a wait ends before its deadline only when the watch
+        // on the state file wakes it.
+        let never = std::time::Duration::from_secs(3600);
+        // A host that cannot give a watch fails here, at once, and not at the end of a
+        // wait that nothing wakes.
+        drop(
+            manager
+                .watch_state("vm-await-probe")
+                .expect("this test needs an inotify watch on the state directory"),
+        );
+        let ended_early = |started: std::time::Instant| {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "the wait ran to its deadline"
+            );
+        };
+
+        // No wait: refused at once, with the plain refusal.
+        let clone = saved_restoring_clone(&manager, "vm-await-none").await;
+        let refusal = await_restore_acknowledged(&manager, clone, std::time::Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.to_string().starts_with("cannot snapshot VM"),
+            "{refusal:#}"
+        );
+
+        // Acknowledged while the create waits: the acknowledged state comes back, woken by
+        // the owner's write. Another VM's write in between wakes nothing.
+        let mut clone = saved_restoring_clone(&manager, "vm-await-acknowledged").await;
+        let started = std::time::Instant::now();
+        let waited = await_restore_acknowledged_polling(&manager, clone.clone(), long, never);
+        let written = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            saved_restoring_clone(&manager, "vm-await-bystander").await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            publish_restore_acknowledged(&manager, &mut clone)
+                .await
+                .unwrap();
+        };
+        let (admitted, ()) = tokio::join!(waited, written);
+        assert!(admitted.unwrap().restore_acknowledged);
+        ended_early(started);
+
+        // Recorded as failed while the create waits.
+        saved_restoring_clone(&manager, "vm-await-failed").await;
+        let clone = manager.load_state("vm-await-failed").await.unwrap();
+        let started = std::time::Instant::now();
+        let waited = await_restore_acknowledged_polling(&manager, clone, long, never);
+        let failed = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            record_restore_failed(&manager, "vm-await-failed").await;
+        };
+        let (refused, ()) = tokio::join!(waited, failed);
+        let refusal = format!("{:#}", refused.unwrap_err());
+        assert!(refusal.contains("restore failed"), "{refusal}");
+        ended_early(started);
+
+        // The state removed while the create waits, as the owner's teardown does.
+        let clone = saved_restoring_clone(&manager, "vm-await-gone").await;
+        let started = std::time::Instant::now();
+        let waited = await_restore_acknowledged_polling(&manager, clone, long, never);
+        let removed = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            manager.delete_state("vm-await-gone").await.unwrap();
+        };
+        let (refused, ()) = tokio::join!(waited, removed);
+        let refusal = format!("{:#}", refused.unwrap_err());
+        assert!(refusal.contains("state is gone"), "{refusal}");
+        ended_early(started);
+
+        // An owner that has exited: nothing will ever acknowledge.
+        let mut orphan = restoring_clone("vm-await-orphan");
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        orphan.pid = Some(child.id());
+        child.wait().unwrap();
+        manager.save_state(&orphan).await.unwrap();
+        let started = std::time::Instant::now();
+        let refusal = format!(
+            "{:#}",
+            await_restore_acknowledged(&manager, orphan, long)
+                .await
+                .unwrap_err()
+        );
+        assert!(refusal.contains("has exited"), "{refusal}");
+        ended_early(started);
+
+        // Never acknowledged: refused at the deadline, which the refusal names.
+        let clone = saved_restoring_clone(&manager, "vm-await-deadline").await;
+        let started = std::time::Instant::now();
+        let refusal = format!(
+            "{:#}",
+            await_restore_acknowledged(&manager, clone, std::time::Duration::from_secs(1))
+                .await
+                .unwrap_err()
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+        assert!(
+            refusal.contains("within the 1 s of --await-restore")
+                && refusal.contains("cannot snapshot VM"),
+            "{refusal}"
+        );
+
+        // A booted VM is never waited for.
+        let mut booted = make_vm_state("vm-await-booted", None);
+        booted.pid = Some(std::process::id());
+        let started = std::time::Instant::now();
+        await_restore_acknowledged(&manager, booted, long)
+            .await
+            .unwrap();
+        ended_early(started);
     }
 
     #[tokio::test]
@@ -8055,6 +10811,29 @@ mod tests {
                 .lifecycle_ready,
             "cancellation that wins the lifecycle gate must leave persisted readiness false"
         );
+    }
+
+    /// What a pool key holds of the holder's id maps changes with every input that decides
+    /// them: the ids, the sudo invoker, and each subordinate id file.
+    #[test]
+    fn the_holders_id_inputs_follow_the_subordinate_id_files() {
+        let grants = b"root:100000:65536\n";
+        let other = b"someone:100000:65536\n";
+        let base = holder_id_inputs_of(0, 0, Some((1000, 1000)), Some(grants), Some(grants));
+        assert_eq!(
+            base,
+            holder_id_inputs_of(0, 0, Some((1000, 1000)), Some(grants), Some(grants))
+        );
+        for changed in [
+            holder_id_inputs_of(0, 0, Some((1000, 1000)), Some(other), Some(grants)),
+            holder_id_inputs_of(0, 0, Some((1000, 1000)), Some(grants), Some(other)),
+            holder_id_inputs_of(0, 0, Some((1000, 1000)), None, Some(grants)),
+            holder_id_inputs_of(0, 0, Some((1001, 1000)), Some(grants), Some(grants)),
+            holder_id_inputs_of(0, 0, None, Some(grants), Some(grants)),
+            holder_id_inputs_of(1000, 1000, None, Some(grants), Some(grants)),
+        ] {
+            assert_ne!(base, changed);
+        }
     }
 
     /// The holder namespace's id maps: unchanged without a sudo invoker, and with one, the
@@ -8556,7 +11335,7 @@ mod tests {
         let body = &source[start..start + end];
         let steps = [
             ".start(&firecracker_bin, None, firecracker_args.as_deref())",
-            "MemoryBackend::File { memory_path } = &restore_config.memory_backend",
+            "MemoryBackend::File { memory_path, .. } = &restore_config.memory_backend",
             "vm_manager.mark_memory_in_use(memory_path)",
             ".load_snapshot(",
             "if let Err(e) = post_start {",
@@ -8614,22 +11393,148 @@ mod tests {
         }
     }
 
-    /// A Cloud Hypervisor without `map` (upstream, or a cached build of the fork from before it)
-    /// fails at argument parsing with this stderr; the restore's error then says how to get one
-    /// that has it, and any other launch failure is left as it was.
+    fn ch_pin(commit: &str) -> crate::setup::rootfs::CloudHypervisorConfig {
+        crate::setup::rootfs::CloudHypervisorConfig {
+            repo: "example/cloud-hypervisor".to_string(),
+            commit: commit.to_string(),
+            artifacts: Default::default(),
+        }
+    }
+
+    /// A store holding another build (newer on disk, and it runs) and a `cloud-hypervisor`
+    /// on PATH do not stand in for the configured commit: the lookup fails and names the
+    /// command that builds it. Launch used to run the newest build in the store whatever
+    /// the config named, so a host whose setup had not run after a pin change kept running
+    /// the old VMM with no word of it.
     #[test]
-    fn a_ch_without_map_restore_names_the_fix() {
-        let bin = std::path::Path::new("/assets/cloud-hypervisor/cloud-hypervisor-old.bin");
+    fn a_configured_commit_that_is_not_built_fails_and_names_setup() {
+        let store = tempfile::tempdir().unwrap();
+        let other = store.path().join("cloud-hypervisor-0123456789ab.bin");
+        std::fs::write(&other, b"another build").unwrap();
+        let pin = ch_pin(&"a".repeat(40));
+
+        let error = find_cloud_hypervisor_in(
+            Some(&pin),
+            store.path(),
+            |_| Some("cloud-hypervisor v0".to_string()),
+            || Ok(std::path::PathBuf::from("/usr/bin/cloud-hypervisor")),
+        )
+        .expect_err("another build ran in place of the configured commit");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("fcvm setup --cloud-hypervisor"),
+            "{message}"
+        );
+        assert!(message.contains(&pin.commit), "{message}");
+    }
+
+    /// The build is looked up in the assets directory the config names, also in a process
+    /// that started with the default paths, as `fcvm fleet` does. Its agent looked in the
+    /// default store and refused to start with a build its `fcvm vm run` commands find.
+    #[test]
+    fn the_configured_build_is_found_in_the_configured_assets_dir() {
+        crate::paths::init_with_defaults();
+        let assets = tempfile::tempdir().unwrap();
+        let mut plan: crate::setup::rootfs::Plan =
+            toml::from_str(crate::setup::rootfs::EMBEDDED_CONFIG).unwrap();
+        plan.paths.assets_dir = assets.path().to_str().unwrap().to_string();
+        let pin = plan
+            .cloud_hypervisor
+            .as_ref()
+            .expect("the embedded config pins Cloud Hypervisor");
+        let store = assets.path().join("cloud-hypervisor");
+        std::fs::create_dir_all(&store).unwrap();
+        let built = crate::setup::kernel::cloud_hypervisor_path_in(&store, pin).unwrap();
+        std::fs::write(&built, b"the configured build").unwrap();
+
+        let found = find_configured_cloud_hypervisor(
+            &plan,
+            |_| Some("cloud-hypervisor v0".to_string()),
+            || anyhow::bail!("PATH is not consulted when a commit is configured"),
+        )
+        .unwrap();
+        assert_eq!(found, built);
+    }
+
+    /// The configured commit's build is the one that runs, whatever else the store holds,
+    /// and another commit resolves to another file (the name the snapshot cache key
+    /// carries, so a new pin never restores a cached snapshot the old build wrote).
+    #[test]
+    fn the_configured_commit_resolves_to_its_own_build() {
+        let store = tempfile::tempdir().unwrap();
+        let pin = ch_pin(&"a".repeat(40));
+        let built = crate::setup::kernel::cloud_hypervisor_path_in(store.path(), &pin).unwrap();
+        std::fs::write(&built, b"the configured build").unwrap();
+        // Written after it, so it is the newest file in the store.
+        std::fs::write(store.path().join("cloud-hypervisor-0123456789ab.bin"), b"x").unwrap();
+
+        let found = find_cloud_hypervisor_in(
+            Some(&pin),
+            store.path(),
+            |_| Some("cloud-hypervisor v0".to_string()),
+            || anyhow::bail!("PATH is not consulted when a commit is configured"),
+        )
+        .unwrap();
+        assert_eq!(found, built);
+
+        let next = ch_pin(&"b".repeat(40));
+        assert_ne!(
+            crate::setup::kernel::cloud_hypervisor_path_in(store.path(), &next).unwrap(),
+            built
+        );
+        // A build that does not run is an error, not a reason to look elsewhere.
+        let broken = find_cloud_hypervisor_in(
+            Some(&pin),
+            store.path(),
+            |_| None,
+            || Ok(std::path::PathBuf::from("/usr/bin/cloud-hypervisor")),
+        )
+        .unwrap_err();
+        assert!(format!("{broken:#}").contains("failed `--version`"));
+        // An abbreviated commit is refused: it does not name one build.
+        assert!(find_cloud_hypervisor_in(
+            Some(&ch_pin("4969a51a3")),
+            store.path(),
+            |_| Some(String::new()),
+            || anyhow::bail!("unused"),
+        )
+        .is_err());
+    }
+
+    /// A config with no `[cloud_hypervisor]` section names no build, so PATH is all there is.
+    #[test]
+    fn without_a_configured_commit_cloud_hypervisor_comes_from_path() {
+        let store = tempfile::tempdir().unwrap();
+        std::fs::write(store.path().join("cloud-hypervisor-0123456789ab.bin"), b"x").unwrap();
+        let on_path = std::path::PathBuf::from("/usr/bin/cloud-hypervisor");
+        let found = find_cloud_hypervisor_in(
+            None,
+            store.path(),
+            |_| Some("cloud-hypervisor v0".to_string()),
+            || Ok(on_path.clone()),
+        )
+        .unwrap();
+        assert_eq!(found, on_path);
+    }
+
+    /// A Cloud Hypervisor without `copyonwrite` (only an override or a PATH binary can be one)
+    /// fails at argument parsing with this stderr; the restore's error then says how to get a
+    /// build that takes the options, and any other launch failure is left as it was.
+    #[test]
+    fn a_ch_that_rejects_the_restore_options_names_the_fix() {
+        let bin = std::path::Path::new("/opt/old/cloud-hypervisor");
         let parse = anyhow::anyhow!(
             "Cloud Hypervisor exited with exit status: 1 before its API socket became ready; last stderr output:\n  \
              Error: Cloud Hypervisor exited with the following chain of errors:\n  \
              0: Error parsing restore\n  1: Error parsing --restore\n  \
-             2: unable to convert map for memory_restore_mode"
+             2: unable to convert copyonwrite for memory_restore_mode"
         )
         .context("launching Cloud Hypervisor --restore");
         let message = format!("{:#}", ch_restore_launch_error(parse, bin));
         assert!(
-            message.starts_with("/assets/cloud-hypervisor/cloud-hypervisor-old.bin does not support memory_restore_mode=map"),
+            message.starts_with(
+                "/opt/old/cloud-hypervisor does not take the restore options fcvm passes"
+            ),
             "{message}"
         );
         assert!(
@@ -8637,7 +11542,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("unable to convert map for memory_restore_mode"),
+            message.contains("unable to convert copyonwrite for memory_restore_mode"),
             "{message}"
         );
         let other = anyhow::anyhow!("Cloud Hypervisor exited with signal 9")
@@ -8648,7 +11553,106 @@ mod tests {
         );
     }
 
-    /// A Cloud Hypervisor clone maps the snapshot's memory file (`memory_restore_mode=map`),
+    /// A snapshot restores only on the Cloud Hypervisor build that wrote it. One written by
+    /// another build, and one from before snapshots recorded their build (every snapshot the
+    /// v52-based fork builds wrote), is refused with both builds named, before the restore
+    /// creates anything.
+    #[test]
+    fn a_ch_snapshot_another_build_wrote_is_refused() {
+        let bin = std::path::Path::new("/assets/cloud-hypervisor/cloud-hypervisor-abc.bin");
+        let running = "cloud-hypervisor v55.0-117-g4969a51a3d3f";
+        ensure_ch_snapshot_written_by(Some(running), running, bin).unwrap();
+
+        let other = ensure_ch_snapshot_written_by(
+            Some("cloud-hypervisor v52.0-49-ga354afd77"),
+            running,
+            bin,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(other.contains("v52.0-49-ga354afd77"), "{other}");
+        assert!(other.contains(running), "{other}");
+        // The text `podman run` classifies a cached entry by.
+        assert!(other.contains(CH_SNAPSHOT_OF_ANOTHER_BUILD), "{other}");
+        assert!(other.contains("Create the snapshot again"), "{other}");
+
+        let unrecorded = ensure_ch_snapshot_written_by(None, running, bin)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unrecorded.contains("records no Cloud Hypervisor build")
+                && unrecorded.contains(CH_SNAPSHOT_OF_ANOTHER_BUILD),
+            "{unrecorded}"
+        );
+        assert!(
+            unrecorded.contains("Create the snapshot again"),
+            "{unrecorded}"
+        );
+
+        let source = include_str!("common.rs");
+        assert_in_order(
+            "restore_from_snapshot_ch",
+            body_of(source, "pub async fn restore_from_snapshot_ch("),
+            &[
+                "ensure_ch_snapshot_written_by(",
+                "prepare_clone_substrate(",
+                ".spawn(&spec)",
+            ],
+        );
+    }
+
+    /// The mapping check reads `/proc/<pid>/maps`: the memory file is there by inode and
+    /// name when the VMM mapped it, also after the snapshot was replaced under the clone, and
+    /// absent when the VMM copied it into anonymous memory.
+    #[test]
+    fn a_ch_restore_that_copied_the_memory_file_is_told_from_one_that_mapped_it() {
+        let mapped = "\
+aaaae0000000-aaaae0a00000 r-xp 00000000 00:1f 4242 /assets/cloud-hypervisor/cloud-hypervisor-abc.bin\n\
+ffff40000000-ffff80000000 rw-p 00000000 00:1f 9001 /mnt/store/snapshots/s 1/ch/memory-ranges\n\
+ffffb0000000-ffffb0021000 rw-p 00000000 00:00 0 [heap]\n";
+        assert!(maps_names_file(mapped, 9001, CH_MEMORY_FILE));
+        // Another file with that inode number, and that name under another inode.
+        assert!(!maps_names_file(mapped, 4242, CH_MEMORY_FILE));
+        assert!(!maps_names_file(mapped, 9002, CH_MEMORY_FILE));
+        let replaced = mapped.replace("memory-ranges", "memory-ranges (deleted)");
+        assert!(maps_names_file(&replaced, 9001, CH_MEMORY_FILE));
+        let copied = "\
+ffff40000000-ffff80000000 rw-p 00000000 00:00 0 \n\
+ffffb0000000-ffffb0021000 rw-p 00000000 00:00 0 [heap]\n";
+        assert!(!maps_names_file(copied, 9001, CH_MEMORY_FILE));
+
+        // This process maps no memory file, so the check refuses it and says what happened.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(CH_MEMORY_FILE);
+        std::fs::write(&file, b"x").unwrap();
+        let ino = memory_file_inode(&file).unwrap();
+        let error = ensure_ch_mapped_the_memory_file(std::process::id(), ino, &file)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("restored without mapping"), "{error}");
+        // A VMM that has exited cannot be checked, which is an error too, not a pass.
+        assert!(ensure_ch_mapped_the_memory_file(u32::MAX, ino, &file).is_err());
+        // The inode is the snapshot's file, through the clone's link, read before the VMM
+        // starts: a snapshot replaced under its tag afterwards does not change it.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(memory_file_inode(&link).unwrap(), ino);
+        let body = body_of(
+            include_str!("common.rs"),
+            "pub async fn restore_from_snapshot_ch(",
+        );
+        assert_in_order(
+            "restore_from_snapshot_ch",
+            body,
+            &[
+                "memory_file_inode(",
+                ".spawn(&spec)",
+                "ensure_ch_mapped_the_memory_file(",
+            ],
+        );
+    }
+
+    /// A Cloud Hypervisor clone maps the snapshot's memory file (`memory_restore_mode=copyonwrite`),
     /// and clones share its pages only through one inode: the clone's restore directory gets
     /// a link to the snapshot's memory file, never a copy, while every other snapshot file is the
     /// clone's own and config.json is left to the caller to rewrite.
@@ -8687,24 +11691,39 @@ mod tests {
         assert!(!clone.join("config.json").exists());
     }
 
-    /// Every Cloud Hypervisor restore maps the memory file; `copy` read the whole guest
-    /// into each clone before it ran (8.7 s to the first desktop frame for eight Windows
-    /// clones at once, against 3.0 s mapped).
+    /// Every Cloud Hypervisor restore maps the memory file (`copy` read the whole guest into
+    /// each clone before it ran: 8.7 s to the first desktop frame for eight Windows clones at
+    /// once, against 3.0 s mapped), keeps the guest's clock where the snapshot left it
+    /// (Cloud Hypervisor's default adds the snapshot's age to CLOCK_MONOTONIC), and checks
+    /// after the resume that the VMM did map the file, since `copyonwrite` falls back to
+    /// copying without failing.
     #[test]
-    fn a_ch_restore_maps_the_memory_file() {
+    fn a_ch_restore_maps_the_memory_file_and_preserves_the_clock() {
+        let args = ch_restore_args(Path::new("/clones/c1/ch-restore"));
+        assert_eq!(
+            args,
+            "--restore source_url=file:///clones/c1/ch-restore,memory_restore_mode=copyonwrite,\
+             clock_restore_mode=preserve,resume=false"
+        );
         let body = body_of(
             include_str!("common.rs"),
             "pub async fn restore_from_snapshot_ch(",
         );
+        assert!(body.contains("ch_restore_args(&clone_ch_dir)"));
         assert!(
-            body.contains("memory_restore_mode=map,"),
-            "restore_from_snapshot_ch does not restore with map"
-        );
-        assert!(
-            !body.contains("memory_restore_mode=copy"),
-            "restore_from_snapshot_ch still copies"
+            !body.contains("memory_restore_mode="),
+            "restore_from_snapshot_ch builds its own --restore argument"
         );
         assert!(body.contains("prepare_ch_restore_files(&ch_dir, &clone_ch_dir)"));
+        assert_in_order(
+            "restore_from_snapshot_ch",
+            body,
+            &[
+                ".resume()",
+                "ensure_ch_mapped_the_memory_file(",
+                "save_vm_state_with_network(",
+            ],
+        );
     }
 
     /// `snapshot create --memory-dir`, in create_snapshot_core's order: the directory is made
@@ -8846,6 +11865,590 @@ mod tests {
         );
     }
 
+    /// A source whose reopen fails is asked again until its gate is open, and one that is
+    /// still gated when the bound has passed is reported by name with what it now refuses
+    /// (#2142). A guest that refuses because a restore is under way in it is not asked
+    /// again: its gate is that restore's.
+    ///
+    /// - The VM's state records the closed gate at the first try that fails, and the try
+    ///   that opens the gate clears it. RED WITH THE RECORD WRITTEN WHEN THE LOOP GIVES
+    ///   UP: a create interrupted while it asks leaves a gated source with no record, and
+    ///   the next create prepares it.
+    /// - Every try is cut off at what is left of the bound. RED WITHOUT THE CUT-OFF: a
+    ///   try that never answers holds the create, with its locks, for as long as it
+    ///   likes.
+    ///
+    /// RED BEFORE THE FIX: the resume one-shot ran once, and a source whose reopen failed
+    /// stayed gated with an error that said only that the one-shot had failed.
+    #[tokio::test]
+    async fn a_source_is_asked_to_reopen_until_its_gate_is_open_or_the_bound_has_passed() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Mutex;
+        use std::time::Duration;
+        let spacing = (Duration::from_millis(5), Duration::from_millis(1));
+        let recorded: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+        let record = |closed: bool| {
+            recorded.lock().unwrap().push(closed);
+            async {}
+        };
+        let take = || std::mem::take(&mut *recorded.lock().unwrap());
+
+        // the exec server comes back, or the gate's removal lands, on the third try
+        let tries = AtomicU32::new(0);
+        reopen_until_open(
+            "vm-source",
+            Duration::from_secs(30),
+            spacing,
+            u32::MAX,
+            false,
+            |_| async {
+                // the state holds the closed gate from before the first ask, so a create
+                // interrupted in any try leaves the record
+                assert_eq!(*recorded.lock().unwrap(), vec![true]);
+                match tries.fetch_add(1, Ordering::SeqCst) {
+                    0 | 1 => ReopenTry::Failed(anyhow::anyhow!("exec: connection refused")),
+                    _ => ReopenTry::Open,
+                }
+            },
+            record,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            take(),
+            vec![true, false],
+            "recorded once, and cleared by the open"
+        );
+
+        // a first try that opens the gate leaves the state as it found it
+        let restarted = reopen_until_open(
+            "vm-source",
+            Duration::from_secs(30),
+            spacing,
+            u32::MAX,
+            false,
+            |_| async {
+                assert_eq!(*recorded.lock().unwrap(), vec![true]);
+                ReopenTry::Open
+            },
+            record,
+        )
+        .await
+        .unwrap();
+        assert!(!restarted);
+        assert_eq!(take(), vec![true, false]);
+
+        // open, by a resume that an agent started in the boundary answered: the gate is
+        // recorded open, and the caller is told
+        let restarted = reopen_until_open(
+            "vm-source",
+            Duration::from_secs(30),
+            spacing,
+            u32::MAX,
+            false,
+            |_| async { ReopenTry::OpenAfterAgentRestart },
+            record,
+        )
+        .await
+        .unwrap();
+        assert!(restarted);
+        assert_eq!(take(), vec![true, false]);
+
+        // never: bounded, and loud
+        let tries = AtomicU32::new(0);
+        let started = std::time::Instant::now();
+        let error = reopen_until_open(
+            "vm-source",
+            Duration::from_millis(60),
+            spacing,
+            u32::MAX,
+            false,
+            |_| async {
+                tries.fetch_add(1, Ordering::SeqCst);
+                ReopenTry::Failed(anyhow::anyhow!("nf_tables commit refused"))
+            },
+            record,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ReopenFailure::LeftGated(_)), "{error:?}");
+        let error = format!("{:#}", error.into_error());
+        assert!(
+            tries.load(Ordering::SeqCst) > 2,
+            "tried once and gave up: {error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            error.contains("source VM vm-source is LEFT WITH ITS NETWORK GATE CLOSED")
+                && error.contains("--resume-snapshot-network")
+                && error.contains("the next `fcvm snapshot create` of it asks again")
+                && error.contains("nf_tables commit refused"),
+            "{error}"
+        );
+        assert_eq!(take(), vec![true]);
+
+        // a try that never answers is cut off at what is left of the bound
+        let limits: Mutex<Vec<Duration>> = Mutex::new(Vec::new());
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            reopen_until_open(
+                "vm-source",
+                Duration::from_millis(200),
+                (Duration::from_millis(5), Duration::from_millis(50)),
+                u32::MAX,
+                false,
+                |limit| {
+                    limits.lock().unwrap().push(limit);
+                    async {
+                        let first = limits.lock().unwrap().len() == 1;
+                        if first {
+                            return ReopenTry::Failed(anyhow::anyhow!("no exec server"));
+                        }
+                        std::future::pending::<ReopenTry>().await
+                    }
+                },
+                record,
+            ),
+        )
+        .await
+        .expect("a try that never answers held the loop past its bound")
+        .unwrap_err();
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(190) && took < Duration::from_secs(2),
+            "the loop took {took:?} for a bound of 200 ms"
+        );
+        assert!(format!("{:#}", error.into_error()).contains("did not answer"));
+        let limits = limits.into_inner().unwrap();
+        assert_eq!(limits.len(), 2);
+        assert!(limits[0] <= Duration::from_millis(200) && limits[1] < limits[0]);
+        take();
+
+        // refused: once, and nothing recorded
+        let tries = AtomicU32::new(0);
+        let error = reopen_until_open(
+            "vm-clone",
+            Duration::from_secs(30),
+            spacing,
+            u32::MAX,
+            false,
+            |_| async {
+                tries.fetch_add(1, Ordering::SeqCst);
+                ReopenTry::Refused(anyhow::anyhow!("exit code 3"))
+            },
+            record,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
+        assert!(matches!(error, ReopenFailure::Refused(_)), "{error:?}");
+        assert!(format!("{:#}", error.into_error()).contains("a restore is under way"));
+        assert_eq!(
+            take(),
+            vec![true, false],
+            "the gate of a restoring clone is not this create's to record"
+        );
+
+        // stale (#2159): the guest refused the resume as another boundary's, which says
+        // nothing of the gate. Asked once, and the record written before the ask stays:
+        // the gate can be this source's own, closed. Taken for the restore's refusal, the
+        // record and the token were erased over a gated, frozen source.
+        let tries = AtomicU32::new(0);
+        let error = reopen_until_open(
+            "vm-source",
+            Duration::from_secs(30),
+            spacing,
+            u32::MAX,
+            false,
+            |_| async {
+                tries.fetch_add(1, Ordering::SeqCst);
+                ReopenTry::Stale(anyhow::anyhow!("exit code 5"), Some(Some("9f8e".into())))
+            },
+            record,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(&error, ReopenFailure::Stale(_, Some(Some(owed))) if owed == "9f8e"),
+            "{error:?}"
+        );
+        assert_eq!(
+            take(),
+            vec![true],
+            "the record of a stale refusal was taken back"
+        );
+        // What the operator is told: the one command, with the token the guest's own
+        // refusal reported. A `cat` of the mark would be refused by a restarted agent that
+        // serves the resume alone, so the operator could not learn it.
+        let told = format!(
+            "{:#}",
+            with_the_resume_by_hand(error, Some(4242), Some("0a1b")).into_error()
+        );
+        for part in [
+            "the token this VM's state holds (0a1b) is not the one of the boundary its guest owes",
+            "its guest's owed boundary has the token 9f8e",
+            "`fcvm exec --pid 4242 --vm -- /usr/local/bin/fc-agent --resume-snapshot-network --boundary 9f8e`",
+            "MAY BE LEFT WITH ITS NETWORK GATE CLOSED",
+        ] {
+            assert!(told.contains(part), "{part}\n{told}");
+        }
+        assert!(!told.contains("cat "), "{told}");
+        let stale = |owed| ReopenFailure::Stale(anyhow::anyhow!("exit code 5"), owed);
+        let told = |failure| {
+            format!(
+                "{:#}",
+                with_the_resume_by_hand(failure, Some(4242), None).into_error()
+            )
+        };
+        // a mark with no token: the resume with none
+        let tokenless = told(stale(Some(None)));
+        assert!(
+            tokenless.contains(
+                "`fcvm exec --pid 4242 --vm -- /usr/local/bin/fc-agent --resume-snapshot-network`"
+            ) && tokenless.contains("(none)"),
+            "{tokenless}"
+        );
+        // a guest that did not say: the mark is read, by absolute path
+        let unsaid = told(stale(None));
+        assert!(
+            unsaid.contains(
+                "`fcvm exec --pid 4242 --vm -- /usr/bin/cat /run/fcvm/snapshot-boundary-owed`"
+            ),
+            "{unsaid}"
+        );
+        // the report, as the guest writes it in its refusal
+        let report = |stderr: &str| reported_owed_token(stderr);
+        assert_eq!(
+            report("refused: nothing was changed. owed-boundary-token=9f8e-01\n"),
+            Some(Some("9f8e-01".to_string()))
+        );
+        assert_eq!(report("x owed-boundary-token=none\n"), Some(None));
+        assert_eq!(report("refused, and nothing more"), None);
+        assert_eq!(report("owed-boundary-token=\n"), None);
+        assert_eq!(
+            report(&format!("owed-boundary-token={}", "a".repeat(65))),
+            None
+        );
+        // only what the guest's own argument check takes ends up in a printed command
+        assert_eq!(
+            report("owed-boundary-token=ab`rm -rf`"),
+            Some(Some("ab".to_string()))
+        );
+        let told = format!(
+            "{:#}",
+            with_the_resume_by_hand(
+                ReopenFailure::LeftGated(anyhow::anyhow!("LEFT WITH ITS NETWORK GATE CLOSED")),
+                Some(4242),
+                Some("0a1b")
+            )
+            .into_error()
+        );
+        assert!(
+            told.starts_with(
+                "to open the gate by hand: `fcvm exec --pid 4242 --vm -- /usr/local/bin/fc-agent --resume-snapshot-network --boundary 0a1b`: LEFT WITH"
+            ),
+            "{told}"
+        );
+
+        // What a later create gives a source recorded gated: one ask. Still closed, the
+        // record stays as it is; open, it is cleared.
+        let tries = AtomicU32::new(0);
+        reopen_until_open(
+            "vm-source",
+            Duration::from_secs(30),
+            spacing,
+            1,
+            true,
+            |_| async {
+                tries.fetch_add(1, Ordering::SeqCst);
+                ReopenTry::Failed(anyhow::anyhow!("still closed"))
+            },
+            record,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
+        assert_eq!(take(), Vec::<bool>::new());
+        reopen_until_open(
+            "vm-source",
+            Duration::from_secs(30),
+            spacing,
+            1,
+            true,
+            |_| async { ReopenTry::Open },
+            record,
+        )
+        .await
+        .unwrap();
+        assert_eq!(take(), vec![false]);
+
+        // The create's loop and the later create's one ask, as the creators call them.
+        let source = include_str!("common.rs");
+        assert!(body_of(source, "async fn reopen_source_network(")
+            .contains("SOURCE_REOPEN_BOUND,\n        u32::MAX,\n        false,"));
+        let refuse = body_of(source, "async fn refuse_a_source_left_gated(");
+        assert!(refuse.contains(".is_ok_and(|state| state.network_gate_closed);"));
+        assert!(refuse.contains("SOURCE_REOPEN_ONE_ASK, 1, true)"));
+        let ask = body_of(source, "async fn ask_source_to_reopen(");
+        assert!(ask.contains("|closed| record_source_gate(vm_id, closed),"));
+        // A create whose source's agent died in the boundary fails once the gate is
+        // open, and both creators discard the image on that error.
+        assert!(ask.contains("Ok(output) => reopen_try_of(vm_id, output),"));
+        assert!(body_of(source, "fn reopen_try_of(").contains(
+            "if output.stderr.contains(SOURCE_AGENT_RESTARTED_REPORT) {\n            ReopenTry::OpenAfterAgentRestart"
+        ));
+        let resume = body_of(source, "async fn resume_paused_source(");
+        assert!(resume.contains("if reopen_source_network(vsock_socket, vm_id, true).await? {"));
+        assert!(resume.contains("failed and its image is discarded"));
+        // The refusal is each creator's first step: before the global permit and the
+        // staging directory, and outside the prepare, whose failure runs the whole reopen
+        // loop as its recovery.
+        for creator in [
+            "pub async fn create_snapshot_core(",
+            "pub async fn create_snapshot_ch(",
+        ] {
+            let body = body_of(source, creator);
+            let refusal = body
+                .find("refuse_a_source_left_gated(")
+                .or_else(|| body.find(".refuse_if_left_gated("))
+                .unwrap_or_else(|| panic!("{creator} never refuses a source left gated"));
+            for later in [
+                "snapshot_semaphore()",
+                "snapshot_sibling(snapshot_dir, \"creating\")",
+            ] {
+                assert!(
+                    refusal < body.find(later).unwrap(),
+                    "{creator} refuses after {later}"
+                );
+            }
+            assert_eq!(
+                body.matches("refuse_a_source_left_gated(").count()
+                    + body.matches(".refuse_if_left_gated(").count(),
+                1
+            );
+        }
+        let guest = body_of(source, "impl<'a> ChSnapshotGuest<'a> {");
+        let prepare = &guest[guest.find("async fn prepare(").unwrap()..];
+        assert!(
+            !prepare[..prepare.find("\n    }").unwrap()].contains("refuse_"),
+            "the Cloud Hypervisor prepare refuses from inside itself"
+        );
+        // The state's field: absent while false, kept when true.
+        let mut state = crate::state::VmState::new("vm-source".into(), "alpine".into(), 1, 128);
+        assert!(!serde_json::to_string(&state)
+            .unwrap()
+            .contains("network_gate_closed"));
+        state.network_gate_closed = true;
+        let saved = serde_json::to_string(&state).unwrap();
+        let loaded: crate::state::VmState = serde_json::from_str(&saved).unwrap();
+        assert!(loaded.network_gate_closed);
+        assert!(!saved.contains("boundary_token"));
+
+        // The status the guest refuses with is the one the host reads: fc-agent's
+        // `a_refused_one_shot_exits_with_the_status_the_host_reads` reads this constant.
+        assert_eq!(ONE_SHOT_REFUSED_EXIT, 3);
+        // The bound covers systemd's 90 s stop timeout as well, and the one ask covers
+        // the exec's 54 s of connect retries.
+        assert!(SOURCE_REOPEN_BOUND > Duration::from_secs(90 + 30));
+        assert!(SOURCE_REOPEN_ONE_ASK > Duration::from_secs(54));
+    }
+
+    /// What the host takes a resume one-shot's result for. A resume that opened the gate
+    /// and could not remove the manifest or the mark exits with a status of its own, and
+    /// is an open gate: read as a failed try, it had the host record a closed gate over an
+    /// open one and refuse every later snapshot of the VM.
+    #[test]
+    fn a_resume_that_opened_the_gate_and_could_not_clean_up_is_an_open_gate() {
+        let said = |exit_code: i32, stderr: &str| {
+            reopen_try_of(
+                "vm-source",
+                crate::commands::exec::ExecOutput {
+                    stdout: String::new(),
+                    stderr: stderr.to_string(),
+                    exit_code,
+                },
+            )
+        };
+        assert!(matches!(said(0, "gate=open"), ReopenTry::Open));
+        assert!(matches!(
+            said(0, SOURCE_AGENT_RESTARTED_REPORT),
+            ReopenTry::OpenAfterAgentRestart
+        ));
+        assert!(matches!(
+            said(ONE_SHOT_OPEN_UNCLEAN_EXIT, "the gate is open, and"),
+            ReopenTry::Open
+        ));
+        assert!(matches!(
+            said(ONE_SHOT_OPEN_UNCLEAN_EXIT, SOURCE_AGENT_RESTARTED_REPORT),
+            ReopenTry::OpenAfterAgentRestart
+        ));
+        assert!(matches!(
+            said(ONE_SHOT_REFUSED_EXIT, ""),
+            ReopenTry::Refused(_)
+        ));
+        assert!(matches!(
+            said(ONE_SHOT_STALE_EXIT, "owed-boundary-token=9f8e"),
+            ReopenTry::Stale(_, Some(Some(owed))) if owed == "9f8e"
+        ));
+        assert!(matches!(
+            said(ONE_SHOT_STALE_EXIT, ""),
+            ReopenTry::Stale(_, None)
+        ));
+        assert!(matches!(said(1, ""), ReopenTry::Failed(_)));
+        // the left-gated and stale errors give the commands an operator would run:
+        // `a_source_is_asked_to_reopen_until_its_gate_is_open_or_the_bound_has_passed`
+    }
+
+    /// A snapshot create's boundary has a token, on the VM's state from before its
+    /// prepare until its gate is reported open (#2159).
+    ///
+    /// The prepare sends it to the guest, which writes it into its `owed` mark, and every
+    /// resume reads it from the state and sends it: the reopen after the VMM resume, the
+    /// reopen after a prepare whose reply was lost, and the one ask of a later create to
+    /// a source recorded gated. A resume the host gave up on carries the token it read
+    /// when it was sent, so one delivered into a later create's boundary carries the
+    /// earlier token and the guest does nothing (fc-agent's
+    /// `a_resume_acts_only_on_the_boundary_it_was_sent_for`).
+    ///
+    /// RED BEFORE THE FIX: no one-shot carried anything that said which snapshot it
+    /// belonged to.
+    #[tokio::test]
+    async fn a_boundarys_token_is_on_the_state_from_its_prepare_until_its_gate_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_manager = crate::state::StateManager::new(dir.path().to_path_buf());
+        state_manager.init().await.unwrap();
+        // a VM with no state: no token, for the prepare and so for the resumes
+        assert_eq!(
+            begin_source_boundary(&state_manager, "vm-gone")
+                .await
+                .unwrap(),
+            None
+        );
+        let token_of =
+            |vm: &'static str| async { owed_boundary_token(&state_manager, vm).await.unwrap() };
+        assert_eq!(token_of("vm-gone").await, None);
+        assert_eq!(
+            resume_args(&state_manager, "vm-gone", false).await.unwrap(),
+            ["--resume-snapshot-network"]
+        );
+
+        let state = crate::state::VmState::new("vm-source".into(), "alpine".into(), 1, 128);
+        state_manager.save_state(&state).await.unwrap();
+        assert_eq!(token_of("vm-source").await, None);
+        let first = begin_source_boundary(&state_manager, "vm-source")
+            .await
+            .unwrap()
+            .expect("a VM with a state gets a token");
+        // what fc-agent's `boundary_token` accepts
+        assert!(first.len() == 32 && first.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(token_of("vm-source").await.as_deref(), Some(first.as_str()));
+        // every resume carries it, with the host's clock when a pause preceded it
+        assert_eq!(
+            resume_args(&state_manager, "vm-source", false)
+                .await
+                .unwrap(),
+            ["--resume-snapshot-network", "--boundary", first.as_str()]
+        );
+        let after_pause = resume_args(&state_manager, "vm-source", true)
+            .await
+            .unwrap();
+        assert_eq!(after_pause.len(), 5);
+        assert_eq!(after_pause[1], "--host-time-ns");
+        assert_eq!(after_pause[3..], ["--boundary", first.as_str()]);
+        // left gated: the token stays for the later create's one ask
+        record_source_gate_in(&state_manager, "vm-source", true).await;
+        let gated = state_manager.load_state("vm-source").await.unwrap();
+        assert!(gated.network_gate_closed);
+        assert_eq!(gated.boundary_token.as_deref(), Some(first.as_str()));
+        // open: nothing is owed, and the state is as it was before the create
+        record_source_gate_in(&state_manager, "vm-source", false).await;
+        let open = state_manager.load_state("vm-source").await.unwrap();
+        assert!(!open.network_gate_closed && open.boundary_token.is_none());
+        // the next create's boundary is another one
+        let second = begin_source_boundary(&state_manager, "vm-source")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first, second);
+
+        // A state that is there and cannot be read or written is an error on both
+        // sides, never "no token". Sent without the token its mark holds, the guest
+        // refuses the resume as stale, with the gate closed; a prepare sent tokenless
+        // beside a state that holds an earlier token gets every resume refused.
+        let state_file = state_manager.state_file("vm-source");
+        let good = std::fs::read_to_string(&state_file).unwrap();
+        std::fs::write(&state_file, "{ not a state").unwrap();
+        assert!(owed_boundary_token(&state_manager, "vm-source")
+            .await
+            .is_err());
+        assert!(resume_args(&state_manager, "vm-source", false)
+            .await
+            .is_err());
+        let refused = begin_source_boundary(&state_manager, "vm-source")
+            .await
+            .unwrap_err();
+        assert!(format!("{refused:#}").contains("nothing was sent to its guest"));
+        // A prepare that was never sent has no gate to reopen. Both creators hand the
+        // prepare's error to the reopen, which then asks the guest nothing; asked, it was
+        // asked for the whole bound and the create ended by reporting a gate left closed
+        // that had never been closed. (The socket here leads nowhere: an ask would not
+        // return within the test's five seconds.)
+        assert!(!prepare_was_sent(&refused));
+        let as_the_creators_wrap_it = refused.context("preparing guest network boundary");
+        assert!(!prepare_was_sent(&as_the_creators_wrap_it));
+        assert!(prepare_was_sent(&anyhow::anyhow!("exec: no reply")));
+        let nowhere = dir.path().join("no-vsock.sock");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reopen_source_after_failed_prepare(&nowhere, "vm-source", &as_the_creators_wrap_it),
+        )
+        .await
+        .expect("a reopen was asked of a guest that was sent no prepare")
+        .unwrap();
+        std::fs::write(&state_file, good).unwrap();
+        assert_eq!(
+            token_of("vm-source").await.as_deref(),
+            Some(second.as_str())
+        );
+
+        // The prepare of both creators sends the token, and every resume reads it from
+        // the state at its own try and sends it.
+        let source = include_str!("common.rs");
+        let prepare = body_of(source, "async fn run_snapshot_network_command(");
+        assert!(
+            prepare
+                .find("begin_source_boundary(&state_manager, vm_id)")
+                .unwrap()
+                < prepare
+                    .find("args.extend([\"--boundary\", token]);")
+                    .unwrap()
+        );
+        // The prepare is not sent when the token could not be written, and a try whose
+        // arguments cannot be read from the state is a failed try, which is tried again.
+        assert!(prepare.contains("begin_source_boundary(&state_manager, vm_id).await?;"));
+        assert!(body_of(source, "pub async fn create_snapshot_core(").contains(
+            "reopen_source_after_failed_prepare(\n            vsock_socket_path,\n            &snapshot_config.vm_id,\n            &operation_error,"
+        ));
+        assert!(body_of(source, "pub async fn create_snapshot_ch(")
+            .contains(".reopen_after_failed_prepare(&snapshot_config.vm_id, &operation_error)"));
+        let ask = body_of(source, "async fn ask_source_to_reopen(");
+        assert!(ask.contains(
+            "let args = match resume_args(state_manager, vm_id, pause_preceded).await {\n                Ok(args) => args,\n                Err(error) => return ReopenTry::Failed(error),"
+        ));
+        for creator in [
+            "pub async fn create_snapshot_core(",
+            "async fn prepare(&self, vm_id: &str)",
+        ] {
+            assert!(
+                body_of(source, creator).contains("run_snapshot_network_command("),
+                "{creator} does not prepare through the token"
+            );
+        }
+    }
+
     /// Every reopen of the source's network after a pause has been invoked sets the
     /// source's clock to the host's (`resume_paused_source`), on both backends. Where
     /// the VMM freezes the guest's clock during the pause (the arm64 `nested` profile),
@@ -8862,7 +12465,7 @@ mod tests {
             (
                 "create_snapshot_core",
                 "state: \"Paused\".to_string()",
-                "\"--resume-snapshot-network\"",
+                "reopen_source_after_failed_prepare(",
                 "resume_paused_source(",
             ),
             (
@@ -8883,7 +12486,7 @@ mod tests {
                 "{name}: the reopen after a failed prepare changed"
             );
             assert!(
-                !after.contains("\"--resume-snapshot-network\"")
+                !after.contains("reopen_source_after_failed_prepare(")
                     && !after.contains(".reopen_after_failed_prepare("),
                 "{name} reopens the source after its pause without setting its clock"
             );
@@ -8902,9 +12505,27 @@ mod tests {
             let end = guest[start..].find("\n    }").unwrap();
             &guest[start..start + end]
         };
-        assert!(step("reopen_after_failed_prepare").contains("\"--resume-snapshot-network\""));
+        assert!(step("reopen_after_failed_prepare")
+            .contains("reopen_source_after_failed_prepare(vsock_socket_path"));
         assert!(step("resume").contains("resume_paused_source(vsock_socket_path"));
-        assert!(!step("resume").contains("\"--resume-snapshot-network\""));
+        assert!(!step("resume").contains("reopen_source_after_failed_prepare("));
+        // Both go through the one loop, and only the reopen after a pause sends the clock.
+        assert!(body_of(source, "async fn resume_paused_source(")
+            .contains("reopen_source_network(vsock_socket, vm_id, true)"));
+        assert!(
+            body_of(source, "async fn reopen_source_after_failed_prepare(")
+                .contains("reopen_source_network(vsock_socket, vm_id, false)")
+        );
+        assert!(body_of(source, "async fn reopen_source_network(").contains(
+            "ask_source_to_reopen(\n        vsock_socket,\n        vm_id,\n        pause_preceded,"
+        ));
+        assert!(body_of(source, "async fn ask_source_to_reopen(")
+            .contains("resume_args(state_manager, vm_id, pause_preceded)"));
+        // The clock goes with a resume exactly when a pause preceded it, read at that
+        // try: `a_boundarys_token_is_on_the_state_from_its_prepare_until_its_gate_is_open`
+        // runs `resume_args` both ways.
+        let args = body_of(source, "async fn resume_args(");
+        assert!(args.contains("if pause_preceded {\n        let host_time = crate::utils::host_clock_now().as_nanos().to_string();"));
     }
 
     /// A memory snapshot's balloon record is read from the VMM inside
@@ -9179,7 +12800,9 @@ mod tests {
         assert!(matches!(raw, ChSnapshotGuest::Raw));
         // Nothing to reach: every step succeeds without a socket.
         raw.prepare("vm-raw").await.unwrap();
-        raw.reopen_after_failed_prepare("vm-raw").await.unwrap();
+        raw.reopen_after_failed_prepare("vm-raw", &anyhow::anyhow!("prepare"))
+            .await
+            .unwrap();
         raw.resume("vm-raw").await.unwrap();
 
         // `snapshot create` reads the fc-agent socket only for a guest that runs fc-agent.
@@ -9423,6 +13046,42 @@ mod tests {
         );
     }
 
+    /// What the Firecracker pinned from upstream main says for a snapshot of another layout:
+    /// one an earlier build wrote (no layout mark) and one a build of the chain with another
+    /// layout number wrote. Both are refused before anything is decoded, and both get the
+    /// re-create hint when the binary is not the one the snapshot recorded.
+    #[test]
+    fn a_snapshot_of_another_layout_gets_the_recreate_hint() {
+        let bin = Path::new("/fc/firecracker-default-new.bin");
+        for refusal in [
+            "Invalid data version: the snapshot has no layout mark, so another Firecracker \
+             build wrote it",
+            "Invalid data version: the snapshot's state has layout 2 and this build reads \
+             layout 1",
+        ] {
+            let error = anyhow::anyhow!(
+                "Firecracker API error: 400 Bad Request - {{\"fault_message\":\"Load snapshot \
+                 error: Failed to restore from snapshot: Failed to get snapshot state from \
+                 file: Failed to load snapshot state from file: {refusal}\"}}"
+            )
+            .context("loading snapshot");
+            for choice in [
+                FirecrackerChoice::NotRecorded,
+                FirecrackerChoice::RecordedMissing(PathBuf::from("/fc/older.bin")),
+            ] {
+                let hint = choice
+                    .load_failure_hint(&error, bin)
+                    .unwrap_or_else(|| panic!("no hint for {refusal:?} under {choice:?}"));
+                assert!(hint.contains("re-create the snapshot"), "{hint}");
+                assert!(hint.contains("--firecracker-bin"), "{hint}");
+            }
+            assert_eq!(
+                FirecrackerChoice::Recorded.load_failure_hint(&error, bin),
+                None
+            );
+        }
+    }
+
     #[test]
     fn load_failure_hint_names_the_cause_only_for_a_version_rejection_on_an_unrecorded_binary() {
         let bin = Path::new("/fc/firecracker-default-newer.bin");
@@ -9635,17 +13294,58 @@ mod tests {
     fn snapshot_records_no_firecracker_for_a_cloud_hypervisor_vm() {
         let mut state = make_vm_state("vm-ch", None);
         state.config.hypervisor = crate::hypervisor::Backend::CloudHypervisor;
-        let config = build_snapshot_config(
+        assert_eq!(
+            snapshot_firecracker_bin(&state, Some(std::process::id())),
+            None
+        );
+    }
+
+    /// A snapshot of a Cloud Hypervisor VM records its VMM's build or is not written: one
+    /// with no record is refused by every restore, and `snapshot create --stop` would have
+    /// stopped the VM to write it. The executable replaced under a running VMM (a rebuild of
+    /// the pinned commit) and one that does not answer `--version` both fail the create. A
+    /// Firecracker VM records none and is not asked.
+    #[test]
+    fn a_ch_snapshot_whose_build_cannot_be_named_is_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud-hypervisor-old.bin");
+        let mut vmm = spawn_running_copy_of_sh(&path);
+        std::fs::remove_file(&path).unwrap();
+        let mut state = make_vm_state("vm-ch", None);
+        state.config.hypervisor = crate::hypervisor::Backend::CloudHypervisor;
+        let error = build_snapshot_config(
             &state,
             "key",
             SnapshotType::User,
             Path::new("/tmp/snap"),
             vec![],
             vec![],
-            Some(std::process::id()),
+            Some(vmm.id()),
         )
-        .unwrap();
-        assert_eq!(config.metadata.firecracker_bin, None);
+        .expect_err("a snapshot with no build recorded was configured");
+        vmm.kill().unwrap();
+        vmm.wait().unwrap();
+        assert!(
+            format!("{error:#}").contains("was replaced after it started"),
+            "{error:#}"
+        );
+
+        let bin = Path::new("/assets/cloud-hypervisor/cloud-hypervisor-abc.bin");
+        let silent = ch_version_for_snapshot(bin, None).unwrap_err();
+        assert!(
+            format!("{silent:#}").contains("failed `--version`"),
+            "{silent:#}"
+        );
+        assert_eq!(
+            ch_version_for_snapshot(bin, Some("cloud-hypervisor v1".to_string())).unwrap(),
+            "cloud-hypervisor v1"
+        );
+
+        let firecracker = make_vm_state("vm-fc", None);
+        assert_eq!(
+            snapshot_cloud_hypervisor_version(&firecracker, Some(std::process::id())).unwrap(),
+            None
+        );
     }
 
     /// Copy `sh` to `path`, run the copy, and return once the copy is running.
@@ -9849,6 +13549,55 @@ mod tests {
         assert_eq!(restored_vsock_source_path(None, ancestor), ancestor);
     }
 
+    /// Only an ejc3/firecracker build that says so in its build metadata takes
+    /// `--numa-balancing-after-secs`; an older build or upstream would refuse the flag and
+    /// not start.
+    #[test]
+    fn the_version_says_whether_firecracker_takes_a_write_set() {
+        for takes in [
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set\n",
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set.fuzzing",
+        ] {
+            assert!(
+                parse_firecracker_version(takes).unwrap().write_set,
+                "{takes}"
+            );
+        }
+        for other in [
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window",
+            "Firecracker v1.17.0+other.write-set",
+            "Firecracker v1.17.0",
+        ] {
+            assert!(
+                !parse_firecracker_version(other).unwrap().write_set,
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_version_says_whether_firecracker_takes_the_numa_window() {
+        for takes in [
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window\n",
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window.fuzzing",
+        ] {
+            assert!(
+                parse_firecracker_version(takes).unwrap().numa_window,
+                "{takes}"
+            );
+        }
+        for other in [
+            "Firecracker v1.17.0",
+            "Firecracker v1.17.0+fcvm.drive-overrides",
+            "Firecracker v1.17.0+other.numa-window",
+        ] {
+            assert!(
+                !parse_firecracker_version(other).unwrap().numa_window,
+                "{other}"
+            );
+        }
+    }
+
     /// Only an ejc3/firecracker build that says so in its build metadata takes drive
     /// overrides; upstream 1.17.0 rejects the field.
     #[test]
@@ -9876,6 +13625,148 @@ mod tests {
         assert!(dev.prerelease && dev.drive_overrides);
     }
 
+    /// Only a Firecracker whose version says `tap-fd` is given a pooled namespace: any
+    /// other VMM would attach to the TAP by name, and a pooled TAP is already attached.
+    #[test]
+    fn only_a_vmm_that_takes_a_tap_queue_is_pooled() {
+        use crate::hypervisor::Backend;
+        let version = |output: &str| Some(parse_firecracker_version(output).unwrap());
+        let takes =
+            version("Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set.tap-fd\n");
+        assert!(takes.unwrap().tap_fd && takes.unwrap().drive_overrides);
+        assert!(vmm_takes_a_tap_queue(Backend::Firecracker, takes));
+        assert!(vmm_takes_a_tap_queue(
+            Backend::Firecracker,
+            version("Firecracker v1.17.0+fcvm.drive-overrides.tap-fd.fuzzing")
+        ));
+        for other in [
+            "Firecracker v1.17.0",
+            "Firecracker v1.17.0+fcvm.drive-overrides",
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window",
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set",
+            "Firecracker v1.17.0+other.tap-fd",
+        ] {
+            assert!(
+                !vmm_takes_a_tap_queue(Backend::Firecracker, version(other)),
+                "{other}"
+            );
+        }
+        assert!(!vmm_takes_a_tap_queue(Backend::Firecracker, None));
+        assert!(!vmm_takes_a_tap_queue(Backend::CloudHypervisor, takes));
+    }
+
+    /// A holder that misses its deadline is reported with where its start was, the host's
+    /// load and the holder's own state: enough to tell a holder that never ran from one
+    /// waiting in the kernel. The holder here is a program that never speaks.
+    #[tokio::test]
+    async fn a_holder_that_misses_its_deadline_says_where_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().unwrap();
+        let silent = scratch.path().join("silent-holder");
+        std::fs::write(&silent, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&silent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(400);
+        let error = start_namespace_agent(&silent, deadline, 1)
+            .await
+            .expect_err("a holder that never speaks was called ready");
+        let text = format!("{error:#}");
+        for part in [
+            "namespace not ready within",
+            "waiting for the agent to exec and unshare",
+            "loadavg [",
+            "holder state ",
+            "wchan [",
+            "stack [",
+        ] {
+            assert!(text.contains(part), "no {part:?} in: {text}");
+        }
+        assert!(!text.contains("likely"), "the error guesses: {text}");
+
+        // The diagnosis of each step, and of a holder that is gone.
+        let own = std::process::id();
+        let waited = std::time::Duration::from_millis(5600);
+        let mapping = holder_wait_diagnosis(own, HolderStep::Mapping, waited);
+        assert!(mapping.contains("5600 ms after its spawn"), "{mapping}");
+        assert!(mapping.contains("maps to be written"), "{mapping}");
+        // This process's main thread, which is running or asleep.
+        assert!(
+            mapping.contains("holder state R") || mapping.contains("holder state S"),
+            "{mapping}"
+        );
+        let confirming = holder_wait_diagnosis(own, HolderStep::Confirming, waited);
+        assert!(
+            confirming.contains("the agent to confirm its maps"),
+            "{confirming}"
+        );
+        let gone = holder_wait_diagnosis(2_000_000_003, HolderStep::Unsharing, waited);
+        assert!(
+            gone.contains("holder state unreadable (entity not found)"),
+            "{gone}"
+        );
+    }
+
+    /// The queue is left open in a VMM only together with the lease: the pool lends a
+    /// namespace again when its lease reads end-of-file, so a process that had the queue
+    /// and not the lease would still be on the TAP when the next VM runs. The one place
+    /// that names the queue for the VMM's exec names the lease with it.
+    #[test]
+    fn the_queue_is_kept_open_only_where_the_lease_is() {
+        let all = include_str!("common.rs");
+        let production = &all[..all.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let keeps: Vec<&str> = production
+            .lines()
+            .filter(|line| line.contains("keep_fds") && line.contains("tap_fd()"))
+            .collect();
+        assert_eq!(
+            keeps.iter().map(|line| line.trim()).collect::<Vec<_>>(),
+            ["namespace.keep_fds = vec![lease.fd(), lease.tap_fd()];"]
+        );
+        // Nothing else in this file hands the queue's number to a child.
+        assert_eq!(production.matches(".tap_fd()").count(), 1);
+    }
+
+    /// A queue goes only to a Firecracker that takes one, and the restore asks before it
+    /// starts anything: before the clone's disk and namespace, the VMM and the snapshot load.
+    #[test]
+    fn a_queue_is_refused_before_the_load_when_the_binary_does_not_take_one() {
+        let version = |output: &str| parse_firecracker_version(output).unwrap();
+        let takes =
+            version("Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set.tap-fd");
+        let lacks = version("Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set");
+        assert!(tap_queue_needs_its_capability(Some(7), takes).is_ok());
+        assert!(tap_queue_needs_its_capability(None, lacks).is_ok());
+        let refused = tap_queue_needs_its_capability(Some(7), lacks).unwrap_err();
+        assert!(format!("{refused:#}").contains("no `tap-fd` in its version"));
+
+        let source = include_str!("common.rs");
+        let start = source
+            .find("pub async fn restore_from_snapshot(")
+            .expect("no Firecracker restore");
+        let end = source[start..]
+            .find("pub async fn restore_from_snapshot_ch(")
+            .expect("no Cloud Hypervisor restore after the Firecracker one");
+        let body = &source[start..start + end];
+        let steps = [
+            "restore_firecracker_bin(",
+            "tap_queue_needs_its_capability(network_config.tap_fd, firecracker_version)?",
+            "prepare_clone_substrate(",
+            ".start(&firecracker_bin",
+            ".load_snapshot(",
+            "host_dev_fd: network_config.tap_fd",
+        ];
+        let offsets: Vec<usize> = steps
+            .iter()
+            .map(|step| {
+                body.find(step)
+                    .unwrap_or_else(|| panic!("the restore has no `{step}`"))
+            })
+            .collect();
+        assert!(
+            offsets.windows(2).all(|pair| pair[0] < pair[1]),
+            "the restore's steps are out of order: {steps:?} at {offsets:?}"
+        );
+    }
+
     /// A load overrides the drives only when the binary takes the field, the vsock path is
     /// overridden too, and the vmstate names nothing else under a source directory.
     #[test]
@@ -9884,6 +13775,9 @@ mod tests {
             release: (1, 17, 0),
             prerelease: false,
             drive_overrides: true,
+            numa_window: false,
+            write_set: false,
+            tap_fd: false,
         };
         let source = PathBuf::from("/data/vm-disks/vm-source");
         let sources = vec![source.clone()];
@@ -9938,6 +13832,7 @@ mod tests {
 
         let upstream = FirecrackerVersion {
             drive_overrides: false,
+            numa_window: false,
             ..capable
         };
         assert!(snapshot_load_drive_overrides(
@@ -10066,6 +13961,7 @@ mod tests {
             snapshot_path: "/snap/vmstate.bin".to_string(),
             mem_backend: MemBackend {
                 backend_path: "/snap/memory.bin".to_string(),
+                write_set_path: None,
                 backend_type: "File".to_string(),
             },
             track_dirty_pages: None,
@@ -11467,6 +15363,88 @@ mod tests {
         assert_eq!(ids, vec!["vm-aaa111".to_string(), "vm-bbb222".to_string()]);
 
         assert!(rootfs_disk_vm_ids_in_bytes(&[]).is_empty());
+    }
+
+    /// The scanner reads a rootfs path of the bucketed layout and of the flat one before it.
+    #[test]
+    fn the_rootfs_scanner_reads_both_layouts() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"/data/vm-disks/3c/vm-aaa111/disks/rootfs.raw\x00");
+        buf.extend_from_slice(b"/data/vm-disks/vm-bbb222/disks/rootfs.raw\x00");
+        let mut ids = rootfs_disk_vm_ids_in_bytes(&buf);
+        ids.sort();
+        assert_eq!(ids, ["vm-aaa111", "vm-bbb222"]);
+    }
+
+    /// A restore takes its source directories from the paths the snapshot recorded, so a
+    /// snapshot made with the flat layout (`vm-disks/<id>`) and one made with the bucketed
+    /// layout (`vm-disks/<bucket>/<id>`) pass the coverage check (#608) through the same
+    /// function and come back with the directory each recorded; one whose rootfs is another
+    /// VM's, or under another data directory, is refused.
+    #[test]
+    fn a_snapshot_of_either_layout_restores_from_the_directory_it_recorded() {
+        let id = "vm-0123456789abcdef0123456789abcdef";
+        let vm_disks = paths::vm_disks_dir();
+        let flat = vm_disks.join(id);
+        let bucketed = paths::vm_runtime_dir(id);
+        let dir = tempfile::tempdir().unwrap();
+        let vmstate = dir.path().join("vmstate.bin");
+        let state = |rootfs: &Path, extra: &Path| {
+            let mut bytes = b"\x00\x10".to_vec();
+            bytes.extend_from_slice(rootfs.as_os_str().as_encoded_bytes());
+            bytes.extend_from_slice(b"\x00\x22");
+            bytes.extend_from_slice(extra.as_os_str().as_encoded_bytes());
+            bytes.push(0);
+            bytes
+        };
+        for recorded in [&flat, &bucketed] {
+            std::fs::write(
+                &vmstate,
+                state(
+                    &recorded.join("disks/rootfs.raw"),
+                    &recorded.join("vsock.sock"),
+                ),
+            )
+            .unwrap();
+            let dirs = assert_vmstate_rootfs_covered(&vmstate, id, None).unwrap();
+            assert_eq!(
+                dirs,
+                std::slice::from_ref(recorded),
+                "{}",
+                recorded.display()
+            );
+        }
+        let sibling = paths::vm_runtime_dir("vm-ffffffffffffffffffffffffffffffff");
+        std::fs::write(&vmstate, state(&sibling.join("disks/rootfs.raw"), &sibling)).unwrap();
+        assert!(assert_vmstate_rootfs_covered(&vmstate, id, None).is_err());
+        let elsewhere = Path::new("/other-data/vm-disks").join(id);
+        std::fs::write(
+            &vmstate,
+            state(&elsewhere.join("disks/rootfs.raw"), &elsewhere),
+        )
+        .unwrap();
+        assert!(assert_vmstate_rootfs_covered(&vmstate, id, None).is_err());
+    }
+
+    /// Only directories named by a source id, inside this host's vm-disks, holding the disk
+    /// under `disks/`, are source directories.
+    #[test]
+    fn recorded_source_dirs_are_named_by_a_source_id_inside_vm_disks() {
+        let vm_disks = paths::vm_disks_dir();
+        let (a, b) = ("vm-aaa", "vm-bbb");
+        let paths = [
+            vm_disks.join("3c").join(a).join("disks/rootfs.raw"),
+            vm_disks.join(a).join("disks/data.raw"),
+            vm_disks.join("vm-zzz").join("disks/rootfs.raw"),
+            vm_disks.join(b).join("vsock.sock"),
+            PathBuf::from("/elsewhere/vm-disks")
+                .join(b)
+                .join("disks/rootfs.raw"),
+        ];
+        assert_eq!(
+            recorded_source_dirs(paths.iter().map(PathBuf::as_path), &[a, b]),
+            [vm_disks.join("3c").join(a), vm_disks.join(a)]
+        );
     }
 
     #[test]

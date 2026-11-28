@@ -1,0 +1,1281 @@
+{
+  "config": {
+    "daily_spend_usd": 10.0,
+    "ec2_max": 2,
+    "idle_scale_down_secs": 60,
+    "lambda_max": 1,
+    "power_managed": true,
+    "restart_cooldown_secs": 1,
+    "sleep_without_new_viewer_secs": 0
+  },
+  "description": "Lambda tiles follow the fleet's power: asleep there are none, so the driver deletes their functions, and a wake assigns them again. A race costs one launch per AWS tile whichever its backing, so Lambda tiles taken out of the EC2 tile count leave the viewers' launch budget as it was. The spend ledger keeps each backing's part of the day beside the total; the total trips the ceiling, and the trip takes the Lambda tiles down with everything else.",
+  "events": [
+    {
+      "at": 1000,
+      "client": "192.0.2.10",
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 2000,
+      "type": "viewer_left",
+      "viewer": "v1"
+    },
+    {
+      "at": 62000,
+      "type": "tick"
+    },
+    {
+      "at": 70000,
+      "client": "192.0.2.20",
+      "type": "viewer_joined",
+      "viewer": "v2"
+    },
+    {
+      "at": 71000,
+      "report": {
+        "frame_url": "ws://lam-1.example:443/frames",
+        "generation": 1,
+        "id": "lam-1",
+        "phase": "running",
+        "timings": {},
+        "vm": "environment-1"
+      },
+      "type": "lambda"
+    },
+    {
+      "at": 72000,
+      "report": {
+        "frame_url": "ws://ec2-1.example:443/frames",
+        "generation": 1,
+        "id": "ec2-1",
+        "phase": "running",
+        "timings": {},
+        "vm": "instance-1"
+      },
+      "type": "ec2"
+    },
+    {
+      "args": {},
+      "at": 73000,
+      "client": "192.0.2.20",
+      "id": "r0",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 75000,
+      "client": "192.0.2.20",
+      "id": "r1",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 77000,
+      "client": "192.0.2.20",
+      "id": "r2",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 79000,
+      "client": "192.0.2.20",
+      "id": "r3",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 81000,
+      "client": "192.0.2.20",
+      "id": "r4",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 83000,
+      "client": "192.0.2.20",
+      "id": "r5",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 85000,
+      "client": "192.0.2.20",
+      "id": "r6",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 87000,
+      "client": "192.0.2.20",
+      "id": "r7",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 89000,
+      "client": "192.0.2.20",
+      "id": "r8",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 91000,
+      "client": "192.0.2.20",
+      "id": "r9",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 93000,
+      "client": "192.0.2.20",
+      "id": "r10",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 95000,
+      "client": "192.0.2.20",
+      "id": "r11",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 97000,
+      "client": "192.0.2.20",
+      "id": "r12",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 99000,
+      "client": "192.0.2.20",
+      "id": "r13",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 101000,
+      "client": "192.0.2.20",
+      "id": "r14",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 103000,
+      "client": "192.0.2.20",
+      "id": "r15",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 105000,
+      "client": "192.0.2.20",
+      "id": "r16",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 107000,
+      "client": "192.0.2.20",
+      "id": "r17",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 109000,
+      "client": "192.0.2.20",
+      "id": "r18",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 111000,
+      "client": "192.0.2.20",
+      "id": "r19",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {},
+      "at": 113000,
+      "client": "192.0.2.20",
+      "id": "r20",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "at": 120000,
+      "by_backing": {
+        "ec2": 1.6,
+        "lambda": 2.4
+      },
+      "instances": 2,
+      "type": "burn",
+      "usd_per_hour": 4.0
+    },
+    {
+      "at": 3720000,
+      "by_backing": {
+        "ec2": 16.0,
+        "lambda": 24.0
+      },
+      "instances": 2,
+      "type": "burn",
+      "usd_per_hour": 40.0
+    },
+    {
+      "args": {
+        "tile": "lam-1"
+      },
+      "at": 3721000,
+      "client": "192.0.2.20",
+      "id": "rl",
+      "name": "relaunch",
+      "type": "intent",
+      "viewer": "v2"
+    }
+  ],
+  "expect": [
+    {
+      "after": 0,
+      "checks": {
+        "/ec2_assign/0/id": "ec2-1",
+        "/ec2_assign/1": null,
+        "/lambda_assign/0/id": "lam-1",
+        "/lambda_assign/1": null,
+        "/view/fleet/power/state": "awake"
+      },
+      "note": "two AWS tiles, one of them a Lambda tile"
+    },
+    {
+      "after": 2,
+      "checks": {
+        "/ec2_assign/0": null,
+        "/lambda_assign/0": null,
+        "/view/fleet/lambda_n": null,
+        "/view/fleet/power/state": "asleep",
+        "/view/layout/ec2": null
+      },
+      "note": "asleep, the fleet has no Lambda tile, so the driver deletes its function"
+    },
+    {
+      "after": 3,
+      "checks": {
+        "/lambda_assign/0/generation": 1,
+        "/lambda_assign/0/id": "lam-1",
+        "/view/fleet/power/state": "waking"
+      },
+      "note": "a wake assigns it again, a new launch"
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/view/fleet/power/state": "waking"
+      },
+      "note": "the EC2 tile has not reported yet"
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/view/fleet/power/state": "awake",
+        "/view/fleet/power/wakes/0/gpus": 2
+      },
+      "note": "awake once every AWS tile runs, the Lambda tile counted among the wake's GPUs"
+    },
+    {
+      "after": 25,
+      "checks": {
+        "/receipts/r19/outcome": "committed",
+        "/view/relaunch_all/ec2_gpus": 1,
+        "/view/relaunch_all/lambda_gpus": 1
+      },
+      "note": "each race costs one launch per AWS tile, whichever backing: 20 races of two tiles are the 40 launches the budget allows"
+    },
+    {
+      "after": 26,
+      "checks": {
+        "/receipts/r20/outcome": "refused",
+        "/receipts/r20/reason": "viewers have used this fleet's EC2 launches for now (40 in 10 minutes); try again in 560 s"
+      }
+    },
+    {
+      "after": 27,
+      "checks": {
+        "/view/fleet/spend/by_backing/ec2/usd_per_hour": 1.6,
+        "/view/fleet/spend/by_backing/lambda/usd_per_hour": 2.4,
+        "/view/fleet/spend/by_backing/lambda/usd_today": 0.0,
+        "/view/fleet/spend/usd_per_hour": 4.0
+      }
+    },
+    {
+      "after": 28,
+      "checks": {
+        "/lambda_assign/0": null,
+        "/view/fleet/power/state": "asleep",
+        "/view/fleet/spend/by_backing/ec2/usd_today": 1.6,
+        "/view/fleet/spend/by_backing/lambda/usd_per_hour": 24.0,
+        "/view/fleet/spend/by_backing/lambda/usd_today": 2.4,
+        "/view/fleet/spend/reason": "budget",
+        "/view/fleet/spend/usd_today": 4.0
+      },
+      "note": "each backing keeps its own part of the day; the total trips the ceiling, and the trip deletes the Lambda tile's function with the rest"
+    },
+    {
+      "after": 29,
+      "checks": {
+        "/receipts/rl/outcome": "refused",
+        "/receipts/rl/reason": "no GPU behind lam-1"
+      }
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {},
+        "at": 73000,
+        "id": "r0",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 1",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 75000,
+        "id": "r1",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 2",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 77000,
+        "id": "r2",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 3",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 79000,
+        "id": "r3",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 4",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 81000,
+        "id": "r4",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 5",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 83000,
+        "id": "r5",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 6",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 85000,
+        "id": "r6",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 7",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 87000,
+        "id": "r7",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 8",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 89000,
+        "id": "r8",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 9",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 91000,
+        "id": "r9",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 10",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 93000,
+        "id": "r10",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 11",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 95000,
+        "id": "r11",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 12",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 97000,
+        "id": "r12",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 13",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 99000,
+        "id": "r13",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 14",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 101000,
+        "id": "r14",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 15",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 103000,
+        "id": "r15",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 16",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 105000,
+        "id": "r16",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 17",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 107000,
+        "id": "r17",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 18",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 109000,
+        "id": "r18",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 19",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 111000,
+        "id": "r19",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 20",
+        "viewer": "v2"
+      },
+      {
+        "args": {},
+        "at": 113000,
+        "id": "r20",
+        "name": "restart_now",
+        "outcome": "refused",
+        "summary": "viewers have used this fleet's EC2 launches for now (40 in 10 minutes); try again in 560 s",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "tile": "lam-1"
+        },
+        "at": 3721000,
+        "id": "rl",
+        "name": "relaunch",
+        "outcome": "refused",
+        "summary": "no GPU behind lam-1",
+        "viewer": "v2"
+      }
+    ],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": 112000,
+    "counters": {
+      "restores": 0,
+      "restores_last_hour": 0,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "agents": {
+        "hosts": [],
+        "since": 0
+      },
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 0,
+      "gpus": 0,
+      "hosts": [],
+      "max_tiles": 100,
+      "n": 0,
+      "power": {
+        "asleep_since": 3720000,
+        "hosts": [],
+        "idle_since": null,
+        "last_arrival_at": 70000,
+        "last_wake": {
+          "awake_at": 72000,
+          "gpus": 2,
+          "ms": 2000,
+          "started_at": 70000
+        },
+        "reason": "budget",
+        "sleep_without_arrival_at": null,
+        "state": "asleep",
+        "wakes": [
+          {
+            "awake_at": 72000,
+            "gpus": 2,
+            "ms": 2000,
+            "started_at": 70000
+          }
+        ],
+        "woke_at": null
+      },
+      "spend": {
+        "at": 3720000,
+        "by_backing": {
+          "ec2": {
+            "usd_per_hour": 16.0,
+            "usd_today": 1.6
+          },
+          "lambda": {
+            "usd_per_hour": 24.0,
+            "usd_today": 2.4
+          }
+        },
+        "ceiling_usd": 10.0,
+        "day_start": 0,
+        "instances": 2,
+        "reason": "budget",
+        "resets_at": 86400000,
+        "usd_per_hour": 40.0,
+        "usd_today": 4.0
+      },
+      "standby": [],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 111645,
+      "from_t": 3721.5,
+      "generation": 4
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "closes_at": 69000,
+      "holding": "peak-close",
+      "holding_label": "Circling the peak",
+      "leading": "ridgeline",
+      "next": null,
+      "next_hold_at": 71000,
+      "next_label": null,
+      "opened_at": 62000,
+      "targets": [
+        {
+          "arrive_at": 95000,
+          "id": "ridgeline",
+          "label": "Along the ridgeline",
+          "votes": 0
+        },
+        {
+          "arrive_at": 81000,
+          "id": "peak-lake",
+          "label": "The peak over the lake",
+          "votes": 0
+        },
+        {
+          "arrive_at": 95000,
+          "id": "horizon",
+          "label": "High above: the curve of the horizon",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [
+      {
+        "by": "viewer:v2",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "id": 11,
+        "lambda": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "started_at": 93000
+      },
+      {
+        "by": "viewer:v2",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "id": 12,
+        "lambda": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "started_at": 95000
+      },
+      {
+        "by": "viewer:v2",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "id": 13,
+        "lambda": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "started_at": 97000
+      },
+      {
+        "by": "viewer:v2",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "id": 14,
+        "lambda": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "started_at": 99000
+      },
+      {
+        "by": "viewer:v2",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "id": 15,
+        "lambda": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "started_at": 101000
+      },
+      {
+        "by": "viewer:v2",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "id": 16,
+        "lambda": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "started_at": 103000
+      },
+      {
+        "by": "viewer:v2",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "id": 17,
+        "lambda": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "started_at": 105000
+      },
+      {
+        "by": "viewer:v2",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "id": 18,
+        "lambda": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "started_at": 107000
+      },
+      {
+        "by": "viewer:v2",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "id": 19,
+        "lambda": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "started_at": 109000
+      },
+      {
+        "by": "viewer:v2",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "id": 20,
+        "lambda": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 1,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "started_at": 111000
+      }
+    ],
+    "relaunch_all": {
+      "by": "viewer:v2",
+      "ec2_capacity_wait_ms": 0,
+      "ec2_done_at": 111000,
+      "ec2_gpus": 0,
+      "ec2_ms": null,
+      "ec2_pending": 0,
+      "ec2_waiting_since": null,
+      "fcvm_done_at": 111000,
+      "fcvm_gpus": 0,
+      "fcvm_ms": null,
+      "fcvm_pending": 0,
+      "race": 20,
+      "started_at": 111000
+    },
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 56.0625,
+          "look": [
+            -60.797082,
+            2.518092,
+            -118.40086
+          ],
+          "pos": [
+            -65.242659,
+            3.328125,
+            -99.268816
+          ],
+          "t": 57.0
+        },
+        {
+          "fov_deg": 53.893555,
+          "look": [
+            -58.688704,
+            2.677338,
+            -117.369439
+          ],
+          "pos": [
+            -65.472783,
+            3.398486,
+            -102.561635
+          ],
+          "t": 58.0
+        },
+        {
+          "fov_deg": 51.960938,
+          "look": [
+            -57.17625,
+            2.797557,
+            -116.165962
+          ],
+          "pos": [
+            -65.319886,
+            3.452734,
+            -105.146875
+          ],
+          "t": 59.0
+        },
+        {
+          "fov_deg": 50.551758,
+          "look": [
+            -56.363585,
+            2.874714,
+            -115.206179
+          ],
+          "pos": [
+            -64.92142,
+            3.487646,
+            -106.740885
+          ],
+          "t": 60.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -64.455034,
+            3.5,
+            -107.031523
+          ],
+          "t": 61.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -64.010994,
+            3.5,
+            -106.571585
+          ],
+          "t": 62.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -63.541972,
+            3.5,
+            -106.137151
+          ],
+          "t": 63.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -63.04943,
+            3.5,
+            -105.729576
+          ],
+          "t": 64.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -62.534904,
+            3.5,
+            -105.350132
+          ],
+          "t": 65.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -62.0,
+            3.5,
+            -105.0
+          ],
+          "t": 66.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -61.446385,
+            3.5,
+            -104.680274
+          ],
+          "t": 67.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -60.875785,
+            3.5,
+            -104.391949
+          ],
+          "t": 68.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -60.289981,
+            3.5,
+            -104.135926
+          ],
+          "t": 69.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -59.690798,
+            3.5,
+            -103.913003
+          ],
+          "t": 70.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -59.080106,
+            3.5,
+            -103.723874
+          ],
+          "t": 71.0
+        },
+        {
+          "fov_deg": 50.0,
+          "look": [
+            -56.0,
+            2.9,
+            -114.75
+          ],
+          "pos": [
+            -58.464291,
+            3.5,
+            -103.551849
+          ],
+          "t": 72.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.755,
+      "weather": [
+        {
+          "cover": 0.6,
+          "rays": 1.0,
+          "snow_line_km": 0.7482,
+          "t": 61.0,
+          "towers": 0.0
+        }
+      ],
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 1,
+      "count": 1
+    }
+  }
+}

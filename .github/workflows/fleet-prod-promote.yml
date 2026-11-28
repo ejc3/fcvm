@@ -89,11 +89,16 @@ jobs:
       image: ${{ steps.decide.outputs.image }}
       coordinator: ${{ steps.decide.outputs.coordinator }}
       web: ${{ steps.decide.outputs.web }}
+      lane: ${{ steps.decide.outputs.lane }}
+      prior_lane: ${{ steps.decide.outputs.prior_lane }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          sparse-checkout: fleet/coord
+          # decide reads staging's lane selection through fleet/lambda/release.py when the prod lane is on.
+          sparse-checkout: |
+            fleet/coord
+            fleet/lambda
       - id: role
         env:
           ROLE: ${{ secrets.AWS_ROLE_ARN }}
@@ -117,6 +122,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
           IMAGE_RELEASE: ${{ vars.IMAGE_RELEASE }}
+          # With the prod lane on (repository variable), the set carries staging's lane image.
+          FLEET_LAMBDA_LANE_PROD: ${{ vars.FLEET_LAMBDA_LANE_PROD }}
+          LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
         run: python3 -B fleet/coord/prod_release.py decide
 
   hold:
@@ -201,6 +209,19 @@ jobs:
           aws-region: us-west-1
           role-session-name: fcvm-prod-release-${{ github.run_id }}
           mask-aws-account-id: true
+      # The lane image staging tested reaches prod's own lane repository only as a copy of that digest, on prod's
+      # credentials, before anything prod runs moves: a failed copy changes nothing, and a copy no release selects
+      # carries no keep- tag and expires on its own. The Coordinator step then selects it there.
+      - name: Copy the lane image into prod's repository
+        env:
+          TARGET: ${{ needs.candidate.outputs.target }}
+          LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
+        run: |
+          lane=$(jq -r '.lambda_digest // empty' <<<"$TARGET")
+          if [ -z "$lane" ]; then exit 0; fi
+          if ! command -v skopeo >/dev/null; then sudo apt-get update && sudo apt-get install -y skopeo; fi
+          command -v skopeo >/dev/null || { echo "::error::skopeo is not installed: the lane image cannot be copied"; exit 1; }
+          python3 -B fcvm/fleet/lambda/release.py copy --digest "$lane"
       # Asleep only (the function checks again under Terraform's lock). Held here: nothing has changed.
       - name: Host and tile images
         id: image
@@ -211,16 +232,20 @@ jobs:
         run: |
           rc=0
           python3 -B fcvm/fleet/coord/prod_release.py image-promote "$TARGET" || rc=$?
-          if [ "$rc" = 3 ]; then echo "::notice::prod woke before its images moved: nothing changed"; echo "held=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ "$rc" = 3 ]; then echo "::notice::the image release was held (prod woke, or Terraform's lock stayed held) before prod's images moved: nothing changed"; echo "held=true" >> "$GITHUB_OUTPUT"; exit 0; fi
           exit "$rc"
+      # The set's lane image, when it carries one, is selected for prod and released with the coordinator.
       - name: Coordinator
-        if: needs.candidate.outputs.coordinator == 'true' && steps.image.outputs.held != 'true'
+        if: (needs.candidate.outputs.coordinator == 'true' || needs.candidate.outputs.lane == 'true') && steps.image.outputs.held != 'true'
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
           TARGET: ${{ needs.candidate.outputs.target }}
+          LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
         run: |
+          lane=$(jq -r '.lambda_digest // empty' <<<"$TARGET")
           python3 -B fcvm/fleet/coord/publish.py --stack prod \
-            --commit "$(jq -r .coordinator.commit <<<"$TARGET")" --digest "$(jq -r .coordinator.digest <<<"$TARGET")"
+            --commit "$(jq -r .coordinator.commit <<<"$TARGET")" --digest "$(jq -r .coordinator.digest <<<"$TARGET")" \
+            ${lane:+--lambda-digest "$lane"}
       - name: Worker
         id: worker
         if: needs.candidate.outputs.web == 'true' && steps.image.outputs.held != 'true'
@@ -330,6 +355,7 @@ jobs:
           role-duration-seconds: 21600
           mask-aws-account-id: true
       - name: Worker
+        id: worker
         if: ${{ !cancelled() && needs.candidate.outputs.web == 'true' }}
         working-directory: fleet/web
         env:
@@ -346,10 +372,14 @@ jobs:
           pnpm install --frozen-lockfile
           WRANGLER_SEND_METRICS=false pnpm exec wrangler versions deploy "$previous@100%" --env production --yes --message "fcvm:rollback"
       - name: Coordinator
-        if: ${{ !cancelled() && needs.candidate.outputs.coordinator == 'true' }}
+        id: coordinator
+        if: ${{ !cancelled() && (needs.candidate.outputs.coordinator == 'true' || needs.candidate.outputs.lane == 'true') }}
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
           PRIOR: ${{ needs.candidate.outputs.prior }}
+          TARGET: ${{ needs.candidate.outputs.target }}
+          PRIOR_LANE: ${{ needs.candidate.outputs.prior_lane }}
+          LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
         run: |
           set -euo pipefail
           commit=$(jq -r '.coordinator.commit // empty' <<<"$PRIOR")
@@ -357,17 +387,42 @@ jobs:
             echo "::error::prod's previous coordinator image has no commit tag, so the release function cannot return to it"
             exit 1
           fi
-          python3 -B fleet/coord/publish.py --stack prod --force --commit "$commit" --digest "$(jq -r .coordinator.digest <<<"$PRIOR")"
+          # Leaving a set with a lane image: return to the lane image prod ran before it (read from prod's task
+          # by decide), or, when it ran none, to none (the function removes FLEET_LAMBDA_IMAGE).
+          lane=
+          if [ -n "$(jq -r '.lambda_digest // empty' <<<"$TARGET")" ]; then lane="${PRIOR_LANE:-none}"; fi
+          python3 -B fleet/coord/publish.py --stack prod --force --commit "$commit" --digest "$(jq -r .coordinator.digest <<<"$PRIOR")" \
+            ${lane:+--lambda-digest "$lane"}
       # Waits for prod to sleep: its templates change only then.
       - name: Host and tile images
+        id: images
         if: ${{ !cancelled() && needs.candidate.outputs.image == 'true' }}
         env:
           IMAGE_RELEASE: ${{ vars.IMAGE_RELEASE }}
           TARGET: ${{ needs.candidate.outputs.target }}
           PRIOR: ${{ needs.candidate.outputs.prior }}
         run: python3 -B fleet/coord/prod_release.py image-rollback "$TARGET" "$PRIOR"
+      # Says prod was returned to its previous set only when every return that ran succeeded and the job was not
+      # cancelled: a return step the cancellation kept from starting reports skipped, like one whose condition was false.
       - name: The promotion failed
         if: ${{ always() }}
+        env:
+          WORKER: ${{ steps.worker.outcome }}
+          COORDINATOR: ${{ steps.coordinator.outcome }}
+          IMAGES: ${{ steps.images.outcome }}
+          CANCELLED: ${{ job.status == 'cancelled' }}
         run: |
-          echo "::error::the promotion failed; prod was returned to its previous set"
+          if [ "$CANCELLED" = true ]; then
+            echo "::error::the promotion failed, and returning prod to its previous set was cancelled (Worker $WORKER, Coordinator $COORDINATOR, Host and tile images $IMAGES): prod may run parts of both sets"
+            exit 1
+          fi
+          failed=
+          [ "$WORKER" = success ] || [ "$WORKER" = skipped ] || failed="${failed:+$failed, }Worker"
+          [ "$COORDINATOR" = success ] || [ "$COORDINATOR" = skipped ] || failed="${failed:+$failed, }Coordinator"
+          [ "$IMAGES" = success ] || [ "$IMAGES" = skipped ] || failed="${failed:+$failed, }Host and tile images"
+          if [ -z "$failed" ]; then
+            echo "::error::the promotion failed; prod was returned to its previous set"
+          else
+            echo "::error::the promotion failed, and returning prod to its previous set did not complete ($failed): prod may run parts of both sets"
+          fi
           exit 1

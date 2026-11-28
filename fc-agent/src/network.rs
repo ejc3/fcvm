@@ -1680,7 +1680,7 @@ fn bind_loopback_listeners(port: u16) -> Vec<std::net::TcpListener> {
 const LOCALHOST_RELAY_TARGETS: [&str; 2] = ["10.0.2.2", "[fd00::2]"];
 
 /// Proxy a single TCP connection from localhost to the gateway.
-async fn proxy_connection(mut client: tokio::net::TcpStream, port: u16) {
+async fn proxy_connection(client: tokio::net::TcpStream, port: u16) {
     let mut upstream = None;
     for target in LOCALHOST_RELAY_TARGETS {
         match tokio::net::TcpStream::connect(format!("{target}:{port}")).await {
@@ -1695,13 +1695,41 @@ async fn proxy_connection(mut client: tokio::net::TcpStream, port: u16) {
             }
         }
     }
-    let Some(mut upstream) = upstream else {
+    let Some(upstream) = upstream else {
         eprintln!(
             "[fc-agent] WARNING: the host refused localhost port {port} on 127.0.0.1 and ::1"
         );
         return;
     };
-    if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+    relay_localhost_connection(client, upstream, port).await;
+}
+
+/// Copy one relayed connection both ways until both directions have ended.
+///
+/// Both sockets get TCP_NODELAY (`relay_socket`). The buffers are 64 KiB each way, so a
+/// bulk transfer still leaves the relay in large writes.
+async fn relay_localhost_connection(
+    mut client: tokio::net::TcpStream,
+    mut upstream: tokio::net::TcpStream,
+    port: u16,
+) {
+    for (side, stream) in [("client", &client), ("upstream", &upstream)] {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        crate::relay_socket::set_relay_nodelay(
+            stream,
+            &WARNED,
+            format_args!("localhost proxy port {port}, {side} socket"),
+        );
+    }
+    const RELAY_BUFFER: usize = 64 * 1024;
+    if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
+        &mut client,
+        &mut upstream,
+        RELAY_BUFFER,
+        RELAY_BUFFER,
+    )
+    .await
+    {
         if e.kind() != std::io::ErrorKind::ConnectionReset
             && e.kind() != std::io::ErrorKind::BrokenPipe
         {
@@ -1869,7 +1897,23 @@ pub fn publish_to_loopback(ports: &[String]) {
 ///
 /// A failure is logged and the port keeps working with the relay's address as client.
 pub fn publish_as_loopback_client(ports: &[String]) {
-    for port in wanted_ports(ports) {
+    let wanted = wanted_ports(ports);
+    if wanted.is_empty() {
+        return;
+    }
+    // The record first: the snapshot boundary tells these ports' clients from connections
+    // inside the guest by it, so a rewrite that is not recorded is not installed.
+    if let Err(e) =
+        record_loopback_client_ports(std::path::Path::new(LOOPBACK_CLIENT_PORTS_RECORD), &wanted)
+    {
+        eprintln!(
+            "[fc-agent] WARNING: recording the loopback-client ports in \
+             {LOOPBACK_CLIENT_PORTS_RECORD} failed: {e}. Their clients reach the service with \
+             the relay's address."
+        );
+        return;
+    }
+    for port in wanted {
         match run_iptables(&loopback_client_snat_args("-A", port)) {
             Ok(()) => eprintln!(
                 "[fc-agent] published port {port} reaches its service as a loopback client"
@@ -1882,9 +1926,62 @@ pub fn publish_as_loopback_client(ports: &[String]) {
     }
 }
 
+/// The source ports a `/loopback` port's clients are given, and nobody else: above the
+/// guest's ephemeral range (`ip_local_port_range`, 32768 to 60999), so no connection the
+/// guest makes to itself has one unless a process binds it on purpose.
+///
+/// The snapshot boundary reads the port to tell such a client from a connection inside
+/// the guest (`snapshot_network::sockets_leaving_the_guest`). Both are a socket with a
+/// 127.0.0.1 peer, and with the client's own port kept a client could make its socket
+/// look like the second: from source port P to guest port P it is its own mirror image
+/// (#2152). At most 4,536 clients of one `/loopback` port are connected at a time.
+pub const LOOPBACK_CLIENT_PORTS: std::ops::RangeInclusive<u16> = 61000..=65535;
+
+/// Where the guest ports published with `/loopback` are recorded, one a line. Under
+/// `/run`, so in a snapshot's image: a clone reads its source's.
+const LOOPBACK_CLIENT_PORTS_RECORD: &str = "/run/fcvm/loopback-client-ports";
+
+fn record_loopback_client_ports(record: &std::path::Path, ports: &[u16]) -> std::io::Result<()> {
+    if let Some(parent) = record.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lines: String = ports.iter().map(|port| format!("{port}\n")).collect();
+    // Written beside the record and renamed over it: a write that fails leaves the record
+    // that names the rewrites still installed.
+    let staged = record.with_extension("staged");
+    std::fs::write(&staged, lines)?;
+    std::fs::rename(&staged, record)
+}
+
+/// The guest ports published with `/loopback`: none when the agent recorded none.
+pub fn loopback_client_guest_ports() -> std::io::Result<std::collections::HashSet<u16>> {
+    read_loopback_client_ports(std::path::Path::new(LOOPBACK_CLIENT_PORTS_RECORD))
+}
+
+fn read_loopback_client_ports(
+    record: &std::path::Path,
+) -> std::io::Result<std::collections::HashSet<u16>> {
+    let text = match std::fs::read_to_string(record) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(error) => return Err(error),
+    };
+    text.lines()
+        .map(|line| {
+            line.trim().parse::<u16>().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{}: {line:?}: {error}", record.display()),
+                )
+            })
+        })
+        .collect()
+}
+
 /// `iptables -w -t nat <op> INPUT -i eth0 -p tcp -d 127.0.0.1 --dport P -j SNAT
-/// --to-source 127.0.0.1`: the connections `loopback_dnat_args` rewrote, arriving from
-/// the host side, take loopback as their source as well.
+/// --to-source 127.0.0.1:61000-65535`: the connections `loopback_dnat_args` rewrote,
+/// arriving from the host side, take loopback as their source as well, from a port in
+/// `LOOPBACK_CLIENT_PORTS`.
 fn loopback_client_snat_args(op: &str, port: u16) -> Vec<String> {
     [
         "-w",
@@ -1903,11 +2000,12 @@ fn loopback_client_snat_args(op: &str, port: u16) -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .chain([port.to_string()])
-    .chain(
-        ["-j", "SNAT", "--to-source", "127.0.0.1"]
-            .iter()
-            .map(|s| s.to_string()),
-    )
+    .chain(["-j", "SNAT", "--to-source"].iter().map(|s| s.to_string()))
+    .chain([format!(
+        "127.0.0.1:{}-{}",
+        LOOPBACK_CLIENT_PORTS.start(),
+        LOOPBACK_CLIENT_PORTS.end()
+    )])
     .collect()
 }
 
@@ -2227,12 +2325,51 @@ mod loopback_publish_tests {
     }
 
     /// A loopback-client port's SNAT matches only the DNAT'd connections from eth0, and
-    /// rewrites their source to loopback (#1034).
+    /// rewrites their source to loopback (#1034), from a port of the range reserved for
+    /// them (#2152), which is above the ports the guest gives its own connections.
     #[test]
     fn loopback_client_snat_rewrites_the_source_of_dnatd_connections_from_eth0() {
         assert_eq!(
             loopback_client_snat_args("-A", 8097).join(" "),
-            "-w -t nat -A INPUT -i eth0 -p tcp -d 127.0.0.1 --dport 8097 -j SNAT --to-source 127.0.0.1"
+            "-w -t nat -A INPUT -i eth0 -p tcp -d 127.0.0.1 --dport 8097 -j SNAT --to-source 127.0.0.1:61000-65535"
+        );
+        // The kernel's default ephemeral range ends at 60999.
+        assert!(*LOOPBACK_CLIENT_PORTS.start() > 60999);
+    }
+
+    /// The `/loopback` guest ports are recorded for the snapshot boundary and read back;
+    /// no record is no such port, and a record that does not parse is an error, not none.
+    #[test]
+    fn the_loopback_client_ports_are_recorded_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("run").join("ports");
+        assert!(read_loopback_client_ports(&record).unwrap().is_empty());
+        record_loopback_client_ports(&record, &[8097, 61000]).unwrap();
+        // A write that fails keeps the record of the rewrites still installed: the new
+        // content is staged beside the record and renamed over it. (Written in place, the
+        // record was truncated first.)
+        let staged = record.with_extension("staged");
+        std::fs::create_dir(&staged).unwrap();
+        assert!(record_loopback_client_ports(&record, &[9000]).is_err());
+        assert_eq!(
+            read_loopback_client_ports(&record).unwrap(),
+            [8097, 61000].into_iter().collect()
+        );
+        std::fs::remove_dir(&staged).unwrap();
+        assert_eq!(
+            read_loopback_client_ports(&record).unwrap(),
+            [8097, 61000].into_iter().collect()
+        );
+        std::fs::write(&record, "8097\nnot a port\n").unwrap();
+        assert!(read_loopback_client_ports(&record).is_err());
+        // The rewrite is installed only once the ports are recorded.
+        let source = include_str!("network.rs");
+        let publish = &source[source.find("pub fn publish_as_loopback_client(").unwrap()..];
+        assert!(
+            publish.find("record_loopback_client_ports(").unwrap()
+                < publish
+                    .find("loopback_client_snat_args(\"-A\", port)")
+                    .unwrap()
         );
     }
 
@@ -2462,7 +2599,7 @@ mod resolv_conf_tests {
 
 #[cfg(test)]
 mod forward_localhost_tests {
-    use super::bind_loopback_listeners;
+    use super::{bind_loopback_listeners, relay_localhost_connection};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 
     /// A client that resolves `localhost` to ::1 first must reach the relay, like one that
@@ -2489,6 +2626,75 @@ mod forward_localhost_tests {
         for addr in &addrs {
             TcpStream::connect(addr).unwrap_or_else(|e| panic!("connecting to {addr}: {e}"));
         }
+    }
+
+    /// The median time for a message written in two parts (28 bytes, then 1,300) to cross
+    /// the relay, toward the guest client or toward the host service. The receiver reads
+    /// the first part before the sender writes the second, so the relay always writes the
+    /// two parts separately; and the receiver's quick-ACK mode is off, so it acknowledges
+    /// the first part only when its delayed-ACK timer fires (40 ms). A relay socket without
+    /// TCP_NODELAY holds the second part until then.
+    async fn two_part_message_median(toward_client: bool) -> std::time::Duration {
+        use crate::relay_socket::two_part::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let service = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let service_addr = service.local_addr().unwrap();
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (client, _) = relay.accept().await.unwrap();
+            let upstream = tokio::net::TcpStream::connect(service_addr).await.unwrap();
+            relay_localhost_connection(client, upstream, service_addr.port()).await;
+        });
+        let client = tokio::net::TcpStream::connect(relay_addr).await.unwrap();
+        let (server, _) = service.accept().await.unwrap();
+        // Both ends set TCP_NODELAY on their own sockets, as RPC clients and servers do, so
+        // only the relay's sockets can hold a part back.
+        client.set_nodelay(true).unwrap();
+        server.set_nodelay(true).unwrap();
+        let (mut writer, mut reader) = if toward_client {
+            (server, client)
+        } else {
+            (client, server)
+        };
+        let mut took = Vec::with_capacity(ROUNDS);
+        let mut buf = vec![0u8; SECOND];
+        for _ in 0..ROUNDS {
+            quickack_off(&reader);
+            let started = std::time::Instant::now();
+            writer.write_all(&[1u8; FIRST]).await.unwrap();
+            reader.read_exact(&mut buf[..FIRST]).await.unwrap();
+            writer.write_all(&[2u8; SECOND]).await.unwrap();
+            reader.read_exact(&mut buf[..SECOND]).await.unwrap();
+            took.push(started.elapsed());
+            tokio::time::sleep(BETWEEN_ROUNDS).await;
+        }
+        drop(writer);
+        drop(reader);
+        relay_task.await.unwrap();
+        median(took)
+    }
+
+    /// A reply the host service writes in two parts reaches the guest client without
+    /// waiting for the client to acknowledge the first part (the relay's client socket).
+    #[tokio::test]
+    async fn a_reply_written_in_two_parts_crosses_the_relay_without_waiting_for_an_ack() {
+        let median = two_part_message_median(true).await;
+        assert!(
+            median < crate::relay_socket::two_part::LIMIT,
+            "median {median:?} for a reply in two parts through the relay"
+        );
+    }
+
+    /// A request the guest client writes in two parts reaches the host service without
+    /// waiting for the service to acknowledge the first part (the relay's upstream socket).
+    #[tokio::test]
+    async fn a_request_written_in_two_parts_crosses_the_relay_without_waiting_for_an_ack() {
+        let median = two_part_message_median(false).await;
+        assert!(
+            median < crate::relay_socket::two_part::LIMIT,
+            "median {median:?} for a request in two parts through the relay"
+        );
     }
 }
 

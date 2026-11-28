@@ -1,0 +1,25 @@
+Overall:
+    Device size:		       25769803776
+    Device allocated:		       24184356864
+    Device unallocated:		        1585446912
+    Device missing:		                 0
+    Device slack:		                 0
+    Used:			       19272003584
+    Free (estimated):		        6276222976	(min: 5483499520)
+    Free (statfs, df):		        6275174400
+    Data ratio:			              1.00
+    Metadata ratio:		              2.00
+    Global reserve:		          76349440	(used: 0)
+    Multiple profiles:		                no
+
+Data,single: Size:23630708736, Used:18939932672 (80.15%)
+   /dev/loop3	23630708736
+
+Metadata,DUP: Size:268435456, Used:166019072 (61.85%)
+   /dev/loop3	 536870912
+
+System,DUP: Size:8388608, Used:16384 (0.20%)
+   /dev/loop3	  16777216
+
+Unallocated:
+   /dev/loop3	1585446912

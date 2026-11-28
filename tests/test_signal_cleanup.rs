@@ -281,6 +281,42 @@ fn exit_diagnostics(pid: u32) -> String {
 /// TAP fd for up to 4.55 s and namespace creations for up to 6.34 s.
 const EXIT_BOUND: Duration = Duration::from_secs(30);
 
+/// A `sleep` that joins the process group `pid` leads, killed and reaped when dropped.
+struct Anchor(std::process::Child);
+
+impl Drop for Anchor {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Put a child of this test into the process group of `pid`, which must lead a group of its
+/// own in this test's session. With a member whose parent is outside the group, the group
+/// is not orphaned when `pid`'s parent dies.
+fn anchor_process_group(pid: u32) -> Result<Anchor> {
+    use std::os::unix::process::CommandExt;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .with_context(|| format!("reading /proc/{pid}/stat"))?;
+    // After the command name, which may hold spaces: state, ppid, pgrp.
+    let pgid: i32 = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(2))
+        .and_then(|field| field.parse().ok())
+        .with_context(|| format!("no process group in /proc/{pid}/stat"))?;
+    anyhow::ensure!(
+        pgid == pid as i32,
+        "PID {pid} is in process group {pgid}, not one of its own"
+    );
+    let mut command = Command::new("sleep");
+    command.arg("600").process_group(pgid);
+    common::set_test_pdeathsig_std(&mut command);
+    let anchor = command
+        .spawn()
+        .with_context(|| format!("starting an anchor in process group {pgid}"))?;
+    Ok(Anchor(anchor))
+}
+
 /// SIGKILLs every tracked process when dropped, on unwinding as well as on return.
 struct KillOnDrop<const N: usize>([Tracked; N]);
 
@@ -882,6 +918,23 @@ fn test_sigkill_reaps_rootless_vm_tree() -> Result<()> {
         let _ = fcvm.wait();
     };
 
+    // Each child is the only member of its own process group, so fcvm's death would orphan
+    // that group, and the kernel sends a stopped member of a newly orphaned group SIGHUP and
+    // SIGCONT. Continued, the holder reads end-of-file on its channel and exits by itself
+    // (and so would anything SIGHUP ends), with no parent-death signal involved. An anchor
+    // in each group, whose parent is this test, keeps the group from being orphaned: the
+    // stopped child then stays stopped unless the kernel kills it.
+    let mut anchors = Vec::new();
+    for (role, t) in &tree {
+        match anchor_process_group(t.pid) {
+            Ok(anchor) => anchors.push(anchor),
+            Err(e) => {
+                abandon(&mut fcvm);
+                return Err(e).with_context(|| format!("anchoring the {role}'s process group"));
+            }
+        }
+    }
+
     // Stop all three first. A stopped process runs none of its own code, so passt's PID watch
     // (pasta exits once the holder's PID is gone) cannot end pasta, and the only thing that
     // can end any of them is a SIGKILL from the kernel: the parent-death signal its hop armed.
@@ -912,6 +965,9 @@ fn test_sigkill_reaps_rootless_vm_tree() -> Result<()> {
     let _ = fcvm.wait();
     let killed = std::time::Instant::now();
     println!("fcvm process reaped");
+    // The anchors outlive fcvm: that is what kept each group from being orphaned by its
+    // death. They go when this test returns.
+    let _anchors = anchors;
 
     // 1. Delivery. fcvm's exit sent each child its parent-death signal before wait() returned,
     // so each one already has SIGKILL pending or is inside do_exit(). A child without it is
@@ -998,6 +1054,143 @@ fn test_sigkill_reaps_rootless_vm_tree() -> Result<()> {
     println!("firecracker, holder and pasta were all killed by the kernel and have exited");
 
     println!("test_sigkill_reaps_rootless_vm_tree PASSED");
+    Ok(())
+}
+
+/// A namespace pool's holders and pastas die with the pool (`fcvm netpool serve`), each by
+/// its own parent-death signal.
+///
+/// Same method as [`test_sigkill_reaps_rootless_vm_tree`]: every child is stopped before the
+/// pool is killed, so a holder cannot exit on its owner's closed channel and passt's PID
+/// watch cannot end a pasta, and each child's process group is anchored, so the kernel
+/// does not continue it. Only a SIGKILL from the kernel ends a child then. A pooled
+/// namespace has no VM's fcvm above it; the pool is the hop.
+#[test]
+fn test_sigkill_reaps_a_namespace_pools_holders_and_pastas() -> Result<()> {
+    const SLOTS: usize = 2;
+    let fcvm_path = common::find_fcvm_binary()?;
+    let data_dir = std::path::PathBuf::from(format!(
+        "/mnt/fcvm-btrfs/netpool-sigkill-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&data_dir)?;
+    let mut cmd = Command::new(&fcvm_path);
+    cmd.args(["netpool", "serve", "--slots", &SLOTS.to_string()])
+        .env("FCVM_DATA_DIR", &data_dir);
+    common::set_test_pdeathsig_std(&mut cmd);
+    let mut pool = cmd.spawn().context("starting the pool")?;
+    let pool_pid = pool.id();
+    let abandon = |pool: &mut std::process::Child| {
+        let _ = pool.kill();
+        let _ = pool.wait();
+        let _ = std::fs::remove_dir_all(&data_dir);
+    };
+
+    // Every namespace built: the pool says so, and it has a holder and a pasta for each.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let stats = Command::new(&fcvm_path)
+            .args(["netpool", "stats"])
+            .env("FCVM_DATA_DIR", &data_dir)
+            .output()?;
+        let ready = serde_json::from_slice::<serde_json::Value>(&stats.stdout)
+            .ok()
+            .and_then(|stats| stats["ready"].as_u64());
+        if ready == Some(SLOTS as u64) {
+            break;
+        }
+        if std::time::Instant::now() > deadline || pool.try_wait()?.is_some() {
+            abandon(&mut pool);
+            anyhow::bail!("the pool did not build its namespaces (ready: {ready:?})");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut children: Vec<(String, Tracked)> = Vec::new();
+    for task in std::fs::read_dir(format!("/proc/{pool_pid}/task"))?.flatten() {
+        let list = std::fs::read_to_string(task.path().join("children")).unwrap_or_default();
+        for pid in list.split_whitespace().filter_map(|pid| pid.parse().ok()) {
+            if let Some(tracked) = Tracked::capture(pid) {
+                children.push((proc_comm(pid).unwrap_or_default(), tracked));
+            }
+        }
+    }
+    let holders = children
+        .iter()
+        .filter(|(comm, _)| comm == "fcvm-netns")
+        .count();
+    let pastas = children
+        .iter()
+        .filter(|(comm, _)| comm.starts_with("pasta"))
+        .count();
+    if (children.len(), holders, pastas) != (2 * SLOTS, SLOTS, SLOTS) {
+        let found: Vec<&String> = children.iter().map(|(comm, _)| comm).collect();
+        abandon(&mut pool);
+        anyhow::bail!("the pool's children are {found:?}, not {SLOTS} holders and {SLOTS} pastas");
+    }
+    let tree: [(String, Tracked); 2 * SLOTS] = children
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("counted above"));
+    let _children = KillOnDrop([tree[0].1, tree[1].1, tree[2].1, tree[3].1]);
+
+    let mut anchors = Vec::new();
+    for (role, t) in &tree {
+        match anchor_process_group(t.pid) {
+            Ok(anchor) => anchors.push(anchor),
+            Err(e) => {
+                abandon(&mut pool);
+                return Err(e).with_context(|| format!("anchoring the group of {role}"));
+            }
+        }
+    }
+    for (role, t) in &tree {
+        if let Err(e) = t.signal(libc::SIGSTOP) {
+            abandon(&mut pool);
+            anyhow::bail!("SIGSTOP to {role} (PID {}): {e}", t.pid);
+        }
+    }
+    let stop_deadline = std::time::Instant::now() + EXIT_BOUND;
+    while !tree
+        .iter()
+        .all(|(_, t)| matches!(proc_sample(t.pid), Some(s) if s.start == t.start && s.state == 'T'))
+    {
+        if std::time::Instant::now() > stop_deadline {
+            abandon(&mut pool);
+            anyhow::bail!("the pool's children did not reach the stopped state");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    send_signal(pool_pid, "KILL").context("sending SIGKILL to the pool")?;
+    let _ = pool.wait();
+    let killed = std::time::Instant::now();
+    let _anchors = anchors;
+
+    let signalled = seen_signalled::<4>(|i| tree[i].1.fate(), Duration::from_secs(10));
+    let unsignalled: Vec<String> = tree
+        .iter()
+        .zip(signalled)
+        .filter(|(_, s)| !s)
+        .map(|((role, t), _)| format!("{role} (PID {})", t.pid))
+        .collect();
+    assert!(
+        unsignalled.is_empty(),
+        "the pool was SIGKILLed and these children were never sent SIGKILL: {unsignalled:?}. \
+         Each was stopped first, so only the kernel could end it: its hop did not arm \
+         PR_SET_PDEATHSIG, or it was not forked from a thread that lives as long as the pool."
+    );
+    while killed.elapsed() < EXIT_BOUND && tree.iter().any(|(_, t)| t.fate() != Fate::Dead) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let stuck: Vec<String> = tree
+        .iter()
+        .filter(|(_, t)| t.fate() != Fate::Dead)
+        .map(|(role, t)| format!("{role} (PID {}): {}", t.pid, exit_diagnostics(t.pid)))
+        .collect();
+    assert!(
+        stuck.is_empty(),
+        "sent SIGKILL but not gone {EXIT_BOUND:?} later: {stuck:?}"
+    );
+    let _ = std::fs::remove_dir_all(&data_dir);
     Ok(())
 }
 
@@ -1304,33 +1497,13 @@ fn find_pasta_for_fcvm(fcvm_pid: u32) -> Option<Tracked> {
     None
 }
 
-/// Holder discovery is coupled to production by a literal string. Pin it.
-///
-/// `find_holder_for_fcvm` pgreps for `sleep infinity`, which is what
-/// `PastaNetwork::build_holder_command` emits. Nothing enforces that agreement, and
-/// when it broke (verified by changing the argv to `sleep 2147483647`) discovery
-/// returned `None`, the leak assertions in the two teardown tests silently stopped
-/// checking anything, and both tests still passed while a real orphan sat on the box.
-///
-/// Honest scope: this is GREEN today. It is a drift alarm, not a regression test for
-/// a present defect — it fires the moment someone changes the holder's argv, which is
-/// the one change that would re-disarm those assertions without any other symptom.
-#[test]
-fn holder_discovery_pattern_tracks_production_holder_argv() {
-    let argv = fcvm::network::PastaNetwork::new("t".into(), "tap-t".into(), vec![])
-        .build_holder_command()
-        .join(" ");
-    assert!(
-        argv.contains("sleep infinity"),
-        "find_holder_for_fcvm() pgreps for `sleep infinity`, but the production holder \
-         argv is `{argv}`. Holder discovery would silently return None and every \
-         holder-leak assertion in this file would stop checking anything. Update BOTH."
-    );
-}
-
+/// The namespace holder under `fcvm_pid`. Discovery uses the holder's own constants: the
+/// argument its command line starts with and the `comm` it gives itself
+/// (`fcvm::network::netns_agent`), so a change to either cannot leave this looking for a
+/// process that no longer exists while the leak assertions pass on `None`.
 fn find_holder_for_fcvm(fcvm_pid: u32) -> Option<Tracked> {
     let output = Command::new("pgrep")
-        .args(["-f", "sleep infinity"])
+        .args(["-f", fcvm::network::netns_agent::SUBCOMMAND])
         .output()
         .ok()?;
 
@@ -1342,8 +1515,8 @@ fn find_holder_for_fcvm(fcvm_pid: u32) -> Option<Tracked> {
     for line in stdout.lines() {
         if let Ok(pid) = line.trim().parse::<u32>() {
             if is_descendant_of(pid, fcvm_pid) {
-                // The holder is `sleep infinity`, whose comm is "sleep".
-                if let Some(t) = capture_descendant(pid, fcvm_pid, "sleep") {
+                let comm = fcvm::network::netns_agent::COMM.to_str().unwrap();
+                if let Some(t) = capture_descendant(pid, fcvm_pid, comm) {
                     return Some(t);
                 }
             }
@@ -2068,11 +2241,10 @@ fn test_start_time_identity_defeats_pid_reuse_628() {
 /// skipped assertion. Until 2026-08-08 the holder was captured as a bare `Option` and the
 /// leak assertion read `assert!(!holder.as_ref().is_some_and(|h| h.running()))` — which is
 /// `assert!(!false)` when discovery returns `None`, i.e. an assertion that CANNOT FAIL when
-/// the thing it checks is absent. Discovery is coupled to production by string
-/// (`find_holder_for_fcvm` pgreps for the literal `sleep infinity` that
-/// `PastaNetwork::build_holder_command` emits), so any drift in that argv silently converted
+/// the thing it checks is absent. Discovery was coupled to production by a literal string
+/// (a pgrep for the holder's argv), so any drift in that argv silently converted
 /// this test into coverage-shaped nothing. Verified by fault injection: with the holder argv
-/// changed to `sleep 2147483647` the OLD test still passed while a real `sleep` orphan sat on
+/// changed the OLD test still passed while a real orphan sat on
 /// the box; with this `.context(...)?` it fails at discovery. Same reasoning applies to pasta,
 /// which the old version did not look for at all.
 ///
@@ -2159,9 +2331,8 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
                 find_firecracker_for_fcvm(clone_pid).context("clone has no firecracker child")?;
             let holder = find_holder_for_fcvm(clone_pid).context(
                 "clone has no namespace holder child — the rootless restore path spawns \
-                 `unshare --user --net -- sleep infinity`, and find_holder_for_fcvm pgreps for \
-                 that exact argv. If discovery drifts, the holder-leak assertion below checks \
-                 nothing at all",
+                 `fcvm __netns-agent`, and find_holder_for_fcvm looks for that. If discovery \
+                 drifts, the holder-leak assertion below checks nothing at all",
             )?;
             let pasta = find_pasta_for_fcvm(clone_pid)
                 .context("clone has no pasta child — rootless networking always spawns one")?;
@@ -2204,11 +2375,7 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         let artifacts_for =
             |want_pid: u32| -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>> {
                 let dir = fcvm::paths::state_dir();
-                for entry in std::fs::read_dir(&dir).context("reading state dir")? {
-                    let path = entry?.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                        continue;
-                    }
+                for path in fcvm::state::StateManager::new(dir).state_files()? {
                     let Ok(text) = std::fs::read_to_string(&path) else {
                         continue;
                     };
@@ -2216,10 +2383,10 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
                         continue;
                     };
                     if v.get("pid").and_then(|p| p.as_u64()) == Some(want_pid as u64) {
-                        // NEVER default this. `vm_runtime_dir("")` is `<data_dir>/vm-disks`
-                        // ITSELF, and this test later calls `remove_dir_all` on that path — so
-                        // a state file missing `vm_id` would delete every VM's disks on the
-                        // machine, including those of tests running concurrently in CI. A
+                        // NEVER default this. `vm_runtime_dir("")` is a bucket of
+                        // `<data_dir>/vm-disks` ITSELF, and this test later calls
+                        // `remove_dir_all` on that path — so a state file missing `vm_id`
+                        // would delete every disk in that bucket on the machine, including those of tests running concurrently in CI. A
                         // missing id means the state file is not what we think it is; fail
                         // loudly instead of computing a path that is catastrophic when wrong.
                         let vm_id = v
@@ -2237,8 +2404,8 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
                             .to_string();
                         let dir = fcvm::paths::vm_runtime_dir(&vm_id);
                         anyhow::ensure!(
-                            dir.starts_with(fcvm::paths::data_dir().join("vm-disks"))
-                                && dir != fcvm::paths::data_dir().join("vm-disks"),
+                            dir.parent().and_then(|bucket| bucket.parent())
+                                == Some(fcvm::paths::vm_disks_dir().as_path()),
                             "refusing to treat {} as a per-VM runtime directory",
                             dir.display()
                         );
@@ -2253,7 +2420,10 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         // The BASELINE's pair, captured now so the fixture's own teardown can be
         // held to the same standard. It is torn down gracefully, so fcvm's
         // `cleanup_vm` runs and BOTH of these must be GONE afterwards.
-        let base_artifacts = artifacts_for(base_pid)?;
+        // Required, and asserted after the teardown below with the other verdicts: an
+        // early return here would skip the baseline's and the serve's shutdown.
+        let base_artifacts = artifacts_for(base_pid)
+            .and_then(|found| found.context("no state file recorded for the baseline"));
 
         // THE FAST TEARDOWN: one signal to fcvm. Nothing else is signalled by us.
         send_signal(clone_pid, "KILL").context("SIGKILL to clone fcvm")?;
@@ -2348,8 +2518,9 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
 
         let base_leak = base_artifacts
             .as_ref()
+            .ok()
             .map(|(s, d)| (s.exists(), d.is_dir()));
-        if let Some((s, d)) = &base_artifacts {
+        if let Ok((s, d)) = &base_artifacts {
             std::fs::remove_file(s).ok();
             std::fs::remove_dir_all(d).ok();
         }
@@ -2436,7 +2607,11 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         // its artifacts must be gone. With the old `Child::kill()` teardown they
         // both survived — by this test's own state_survived/data_survived logic —
         // and every run leaked a state file plus a multi-GB reflinked rootfs.
-        if let (Some((s, d)), Some((s_left, d_left))) = (&base_artifacts, base_leak) {
+        {
+            let (s, d) = base_artifacts
+                .as_ref()
+                .unwrap_or_else(|error| panic!("the baseline's artifacts: {error:#}"));
+            let (s_left, d_left) = base_leak.expect("measured whenever the artifacts were found");
             assert!(
                 !s_left && !d_left,
                 "the BASELINE VM's teardown leaked: state_file_left={} ({}) \
@@ -2486,30 +2661,33 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
     })
 }
 
-/// `vm_runtime_dir("")` is the shared `vm-disks` directory, not a per-VM one.
+/// `vm_runtime_dir("")` is a shared bucket of `vm-disks`, not a per-VM directory.
 ///
 /// A test that derives a runtime directory from a state file and then `remove_dir_all`s it
-/// must never accept an empty id: doing so deletes EVERY VM's disks on the machine,
+/// must never accept an empty id: doing so deletes every VM's disks in that bucket,
 /// including those of tests running concurrently in CI. This pins the arithmetic so the
 /// guard above cannot be simplified away by someone who has not thought about it.
 #[test]
-fn an_empty_vm_id_resolves_to_the_shared_disk_root_and_must_be_rejected() {
-    let shared = fcvm::paths::data_dir().join("vm-disks");
+fn an_empty_vm_id_resolves_to_a_shared_bucket_and_must_be_rejected() {
+    let shared = fcvm::paths::vm_disks_dir();
+    let bucket = shared.join(fcvm::paths::vm_bucket(""));
 
     assert_eq!(
         fcvm::paths::vm_runtime_dir(""),
-        shared,
-        "an empty vm_id collapses to the SHARED vm-disks root. Any caller that deletes its \
-         computed runtime directory would wipe every VM on the host — which is why the \
-         lookup rejects an empty id rather than defaulting it."
+        bucket,
+        "an empty vm_id collapses to a SHARED bucket of vm-disks, not a VM directory. Any \
+         caller that deletes its computed runtime directory would wipe every VM in that \
+         bucket, which is why the lookup rejects an empty id rather than defaulting it."
     );
+    assert_eq!(bucket.parent(), Some(shared.as_path()));
+    let dir = fcvm::paths::vm_runtime_dir("vm-abc123");
     assert_ne!(
-        fcvm::paths::vm_runtime_dir("vm-abc123"),
-        shared,
-        "a real vm_id must resolve BELOW the shared root, never to it"
+        dir, bucket,
+        "a real vm_id must resolve BELOW its bucket, never to the shared bucket"
     );
-    assert!(
-        fcvm::paths::vm_runtime_dir("vm-abc123").starts_with(&shared),
-        "a per-VM directory must still live under the shared root"
+    assert_eq!(
+        dir.parent().and_then(|b| b.parent()),
+        Some(shared.as_path()),
+        "a per-VM directory lives one bucket below the shared root"
     );
 }

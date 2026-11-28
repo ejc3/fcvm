@@ -64,6 +64,13 @@ fn raise_resource_limits() {
 }
 
 fn main() -> Result<()> {
+    // A rootless namespace holder is this binary started as `fcvm __netns-agent`. It must
+    // stay on one thread (it unshares its user namespace), so it runs before anything else
+    // here and never reaches the runtime.
+    if let Some(result) = fcvm::network::netns_agent::main_if_agent() {
+        return result;
+    }
+
     // Everything that mutates PROCESS-WIDE state runs here, on the one thread
     // that exists, before the tokio runtime is built.
     //
@@ -81,19 +88,20 @@ fn main() -> Result<()> {
     // break with a bare ENOENT that names no tool.
     fcvm::utils::ensure_sbin_on_path();
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run())
+    // Parsed before the runtime exists, because the command decides the runtime's size.
+    let cli = cli::Cli::parse();
+
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    if let Some(workers) = fcvm::cli::runtime_workers(&cli.cmd) {
+        runtime.worker_threads(workers);
+    }
+    runtime.enable_all().build()?.block_on(run(cli))
 }
 
-async fn run() -> Result<()> {
+async fn run(cli: cli::Cli) -> Result<()> {
     // Arm deterministic lifecycle failpoints from FCVM_FAILPOINT (test-only
     // instrumentation; no-op when unset). Once, before any command runs.
     failpoint::arm_from_env();
-
-    // Parse CLI arguments
-    let cli = cli::Cli::parse();
 
     // A value of FCVM_FIRECRACKER_LOG_LEVEL that names no level stops the command here, before
     // it prepares a disk or a namespace for a VM that could not start.
@@ -117,7 +125,7 @@ async fn run() -> Result<()> {
         }
         _ => {
             // All other commands require config
-            paths::init_from_config();
+            paths::init_from_config()?;
         }
     }
 
@@ -164,6 +172,8 @@ async fn run() -> Result<()> {
     // This must be done AFTER setting up the tracing subscriber
     let _ = LogTracer::init();
 
+    fcvm::sweep::warn_about_unknown_names();
+
     // A command that starts a VMM or a memory server moves this process into the VM's own
     // cgroup before it starts anything, so what its children allocate is charged there and
     // not to the caller's session (#1028, `fcvm::cgroup`).
@@ -182,6 +192,7 @@ async fn run() -> Result<()> {
     // Dispatch to appropriate command handler
     let result = match cli.cmd {
         Commands::Ls(args) => commands::cmd_ls(args).await,
+        Commands::Paths(args) => commands::cmd_paths(args),
         Commands::Podman(args) => commands::cmd_podman(*args).await,
         Commands::Snapshot(args) => commands::cmd_snapshot(args).await,
         Commands::Snapshots(args) => commands::cmd_snapshots(args).await,
@@ -196,6 +207,10 @@ async fn run() -> Result<()> {
         }
         Commands::Fleet(args) => fcvm::fleet::cmd_fleet(args).await,
         Commands::Vm(args) => commands::cmd_vm(args).await,
+        Commands::Netpool(args) => match args.cmd {
+            cli::NetpoolCommands::Serve(serve) => fcvm::netpool::server::serve(serve.slots).await,
+            cli::NetpoolCommands::Stats => fcvm::netpool::client::print_stats().await,
+        },
     };
 
     if let Some(scope) = scope {

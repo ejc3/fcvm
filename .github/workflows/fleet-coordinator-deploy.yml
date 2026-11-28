@@ -17,18 +17,41 @@ on:
       - 'build.rs'
       - 'rootfs-config.toml'
       - '.github/workflows/fleet-coordinator-deploy.yml'
+      # With the Lambda lane on, the deploy job runs these (publish.py selects the lane image).
+      - 'fleet/lambda/release.py'
+      - '.github/workflows/fleet-lambda-image.yml'
+  # With the Lambda lane on (the repository variable FLEET_LAMBDA_LANE), a lane image main's lane workflow
+  # published starts a staging release at main's head, so a push that changes only the lane image's inputs
+  # reaches staging (fleet/PROTOCOL.md, "Which lane image a stack runs"). Releases are ordered where they
+  # happen: publish.py, under the deploy job's fleet-viewer-smoke group, skips a commit that is an ancestor
+  # of the one staging runs.
+  workflow_run:
+    workflows: ["Fleet Lambda lane image"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: fleet-coordinator-stage
+  # A run the lane build starts has a group of its own (one per lane run): GitHub keeps one pending run per
+  # group and a newer one cancels it, and such a run (lane off, a failed lane run) can skip every job, so it
+  # must never displace a push's pending deploy. Releases queue in the deploy job's fleet-viewer-smoke group.
+  group: ${{ github.event_name == 'workflow_run' && format('fleet-coordinator-stage-lane-{0}', github.event.workflow_run.id) || 'fleet-coordinator-stage' }}
   cancel-in-progress: false
 
 jobs:
   build:
-    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    # A workflow_run start only for a successful push run on main of this repository, with the lane on.
+    if: >-
+      github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_run' ||
+       (vars.FLEET_LAMBDA_LANE == 'on' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
@@ -63,6 +86,9 @@ jobs:
             sleep 1
           done
           test "$ready" = true
+          # The image reports the commit it was built from (GET /version), which the smoke compares
+          # with its run's commit.
+          test "$(curl --fail --silent http://127.0.0.1:24120/version)" = "{\"commit\":\"$GITHUB_SHA\"}"
           docker save -o "$RUNNER_TEMP/coordinator-image.tar" "fcvm-fleet-coordinator:$GITHUB_SHA"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -73,10 +99,19 @@ jobs:
 
   deploy:
     needs: build
-    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    # A workflow_run start only for a successful push run on main of this repository, with the lane on.
+    if: >-
+      github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_run' ||
+       (vars.FLEET_LAMBDA_LANE == 'on' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-24.04-arm
     environment: fleet-stage-deploy
-    timeout-minutes: 45
+    # With the lane on, publish.py may wait up to 25 minutes for this commit's lane build.
+    timeout-minutes: 75
     # The release replaces the one coordinator task, and a smoke that reads /live meanwhile
     # fails: a web deploy's IPv6 smoke got "WebSocket upgrade refused" while this job replaced
     # the task. The smokes' group (fleet-viewer-smoke.yml) holds the release until
@@ -89,10 +124,15 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    # Whether the order step skipped the release: the smoke then says it follows no release of this run.
+    outputs:
+      skip: ${{ steps.order.outputs.skip }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          # The lane pairing compares this commit with the lane build's (git merge-base, git diff).
+          fetch-depth: 0
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: fleet-coordinator-arm64
@@ -109,10 +149,25 @@ jobs:
           aws-region: us-west-1
           role-session-name: fcvm-stage-${{ github.run_id }}
           mask-aws-account-id: true
+      # Invariant 1, decided before any release call: with the lane on, a commit that is a strict ancestor
+      # of one staging runs is not released. The release step below then concludes "skipped", which prod's
+      # release discovery (fleet/coord/prod_release.py released) does not take for what staging runs.
+      - name: Order the release (an ancestor of what staging runs is skipped)
+        id: order
+        env:
+          COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+          FLEET_LAMBDA_LANE: ${{ vars.FLEET_LAMBDA_LANE }}
+        run: python3 -B fleet/coord/publish.py --order
       - name: Publish and release the staging coordinator
+        if: steps.order.outputs.skip == 'false'
+        # FLEET_LAMBDA_LANE (a repository variable) on: the release also selects the lane build paired
+        # with this commit for staging and passes it to the release function (fleet/coord/publish.py).
+        # Unset: as before.
         env:
           COORDINATOR_REPO: ${{ secrets.COORDINATOR_REPO }}
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+          FLEET_LAMBDA_LANE: ${{ vars.FLEET_LAMBDA_LANE }}
+          LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
         run: python3 -B fleet/coord/publish.py
 
   # The viewer-path smoke against the new coordinator: every mode's tiles from an IPv4-only
@@ -125,6 +180,10 @@ jobs:
       contents: read
       issues: write
     uses: ./.github/workflows/fleet-viewer-smoke.yml
+    with:
+      # The smoke follows this run's release unless the order step skipped it; then a different commit
+      # under test is no surprise and the smoke prints the attribution alone.
+      released: ${{ needs.deploy.outputs.skip == 'false' }}
     # The smoke's jobs read the Access token from the fleet-stage-deploy environment; a called
     # workflow sees secrets only when its caller passes them.
     secrets: inherit

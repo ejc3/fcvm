@@ -15,12 +15,21 @@ pub struct Config {
     /// Potato mode's game (docs/fleet/ARCHITECTURE.md, "Potato mode").
     #[serde(default)]
     pub potato: crate::potato::PotatoConfig,
+    /// Pages mode's overlay limits.
+    #[serde(default)]
+    pub renders: crate::renders::RendersConfig,
     /// Width / height of the whole image (both halves).
     pub image_aspect: f64,
     /// Width / height the tiling aims for.
     pub tile_aspect: f64,
     /// The most EC2 tiles the coordinator asks for. 0 runs the EC2 half dark.
     pub ec2_max: usize,
+    /// Lambda tiles (`--lambda-tiles`): how many of the AWS half's `ec2_max` tiles are Lambda
+    /// Managed Instances execution environments (one function per tile) instead of EC2
+    /// instances. The half keeps `ec2_max` tiles; at most all of them are Lambda tiles. 0: every
+    /// AWS tile is an EC2 instance.
+    #[serde(default)]
+    pub lambda_max: usize,
     /// Places on the fcvm side: with fewer live fcvm GPUs the rest are dark tiles, with
     /// more the side has one place per GPU. 0: one place per live fcvm GPU. GPUs that
     /// connected hosts run phones on are not wall places and come off this count, and so do
@@ -78,6 +87,13 @@ pub struct Config {
     /// long (`Power::last_arrival_at`), even while viewers stay connected. 0: never.
     #[serde(default = "one_hour")]
     pub sleep_without_new_viewer_secs: u64,
+    /// Asleep, a connected page that becomes active (shown again, or reconnecting) wakes
+    /// the fleet only while at least this much of `sleep_without_new_viewer_secs` remains,
+    /// so a wake is never for less; with less left the page's Wake button wakes it. Such a
+    /// wake is no arrival. An arrival has the whole limit ahead and always wakes; a limit
+    /// shorter than this leaves only arrivals (`crate::view::page_wakes`).
+    #[serde(default = "ten_minutes")]
+    pub min_wake_remaining_secs: u64,
     /// The most the fleet may spend in one UTC day, in USD: at it the fleet sleeps until
     /// 00:00 UTC (`crate::spend`). `None`: no ceiling.
     #[serde(default)]
@@ -242,10 +258,12 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             potato: Default::default(),
+            renders: Default::default(),
             max_tiles: 100,
             image_aspect: 16.0 / 9.0,
             tile_aspect: 16.0 / 9.0,
             ec2_max: 0,
+            lambda_max: 0,
             fcvm_tiles: 0,
             fill_from_serving_hosts: false,
             word_interval_ms: 5_000,
@@ -265,6 +283,7 @@ impl Default for Config {
             power_managed: false,
             idle_scale_down_secs: 600,
             sleep_without_new_viewer_secs: 3600,
+            min_wake_remaining_secs: 600,
             daily_spend_usd: None,
             warm_hours: Vec::new(),
             names_published: false,
@@ -344,6 +363,9 @@ pub struct Observed {
     pub error: Option<String>,
     pub fps: Option<f64>,
     pub gpu_stats: Option<serde_json::Value>,
+    /// The VM's CPU use, stamped with the coordinator's receipt time.
+    #[serde(default)]
+    pub vm_stats: Option<crate::protocol::VmStats>,
     /// From the renderer's health: its budget fit and newest frame's scene time.
     #[serde(default)]
     pub budget_fit: Option<f64>,
@@ -408,7 +430,8 @@ pub struct Relaunch {
     pub phases: BTreeMap<String, u64>,
 }
 
-/// A rendering unit: an fcvm slot (one GPU on a host) or an EC2 tile (one instance).
+/// A rendering unit: an fcvm slot (one GPU on a host), an EC2 tile (one instance) or a
+/// Lambda tile (one execution environment).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Slot {
     pub id: String,
@@ -509,7 +532,8 @@ pub struct RaceTile {
     /// When the coordinator saw that first frame reported.
     pub first_frame_at: Option<u64>,
     pub phases: BTreeMap<String, u64>,
-    /// Time spent waiting for EC2 spot capacity, kept out of the half's time.
+    /// Time spent waiting for EC2 spot capacity (or Lambda capacity, as the coordinator names
+    /// it), kept out of the half's time.
     pub capacity_wait_ms: u64,
     /// While EC2 refuses capacity for it: since when.
     #[serde(default)]
@@ -536,6 +560,13 @@ pub struct HalfRace {
     pub sitting_out: Vec<String>,
 }
 
+impl HalfRace {
+    /// A half with nothing in it: a race of a fleet that has no tile on that side.
+    pub fn is_unused(&self) -> bool {
+        *self == HalfRace::default()
+    }
+}
+
 /// A relaunch of every tile, timed for both halves by the coordinator's clock.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Race {
@@ -545,6 +576,25 @@ pub struct Race {
     pub by: String,
     pub fcvm: HalfRace,
     pub ec2: HalfRace,
+    /// The Lambda tiles' part, timed apart from the EC2 tiles' so each backing has its own
+    /// race number; absent (unused) when the fleet has no Lambda tile.
+    #[serde(default, skip_serializing_if = "HalfRace::is_unused")]
+    pub lambda: HalfRace,
+}
+
+impl Race {
+    /// Its three halves, fcvm, EC2 and Lambda.
+    pub fn halves_mut(&mut self) -> [&mut HalfRace; 3] {
+        [&mut self.fcvm, &mut self.ec2, &mut self.lambda]
+    }
+
+    pub fn half_mut(&mut self, half: Half) -> &mut HalfRace {
+        match half {
+            Half::Fcvm => &mut self.fcvm,
+            Half::Ec2 => &mut self.ec2,
+            Half::Lambda => &mut self.lambda,
+        }
+    }
 }
 
 pub const MAX_RACES: usize = 50;
@@ -670,14 +720,21 @@ pub struct Fleet {
     pub slots: BTreeMap<u32, Slot>,
     /// EC2 tiles by number (`ec2-<n>`).
     pub ec2: BTreeMap<u32, Slot>,
+    /// Lambda tiles by number (`lam-<n>`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lambda: BTreeMap<u32, Slot>,
     /// Live fcvm GPUs on the wall (at most `max_tiles`), at places `0..n`.
     pub n: usize,
     /// The fcvm side's places with no GPU (dark tiles), at places `n..`, in order.
     #[serde(default)]
     pub fcvm_dark: Vec<Rect>,
-    /// Places on the EC2 side: one per EC2 tile, with an instance or not.
+    /// Places of EC2 tiles on the AWS half: one per EC2 tile, with an instance or not.
     #[serde(default)]
     pub ec2_n: usize,
+    /// Places of Lambda tiles on the AWS half, after its `ec2_n` EC2 tiles: one per Lambda
+    /// tile, with an environment or not.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub lambda_n: usize,
     /// The current layout: its generation, the frame it takes effect at, the two sides.
     #[serde(default)]
     pub layout: LayoutGen,
@@ -699,9 +756,9 @@ pub struct Fleet {
     pub last_word_at: BTreeMap<String, u64>,
     pub last_light_at: BTreeMap<String, u64>,
     pub last_relaunch_at: BTreeMap<String, u64>,
-    /// When each EC2 instance launch a viewer asked for was committed (a `relaunch` of an EC2
-    /// tile, and one per EC2 tile of a `restart_now` race), oldest first, for the last
-    /// `apply::EC2_LAUNCH_WINDOW_MS`.
+    /// When each launch a viewer asked for was committed (a `relaunch` of an EC2 or a Lambda
+    /// tile, and one per EC2 and Lambda tile of a `restart_now` race), oldest first, for the
+    /// last `apply::EC2_LAUNCH_WINDOW_MS`. EC2 and Lambda launches share the one budget.
     #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
     pub ec2_viewer_launches: VecDeque<u64>,
     pub last_claim_end: BTreeMap<String, u64>,
@@ -805,6 +862,9 @@ pub struct Fleet {
     /// Potato mode's game.
     #[serde(default)]
     pub potato: crate::potato::Potato,
+    /// Pages mode: its hosts' reports and the overlay viewers set.
+    #[serde(default)]
+    pub renders: crate::renders::Renders,
     /// The GPU hosts the launcher keeps, by instance id (`Event::HostsExpected`); `None`
     /// when it cannot say, or the coordinator launches none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -881,9 +941,11 @@ impl State {
                 hosts: BTreeMap::new(),
                 slots: BTreeMap::new(),
                 ec2: BTreeMap::new(),
+                lambda: BTreeMap::new(),
                 n: 0,
                 fcvm_dark: Vec::new(),
                 ec2_n: 0,
+                lambda_n: 0,
                 layout: LayoutGen::default(),
                 scene,
                 director,
@@ -940,6 +1002,7 @@ impl State {
                 last_minecraft_fork: None,
                 minecraft_to_reset: BTreeMap::new(),
                 potato: Default::default(),
+                renders: Default::default(),
                 expected_hosts: None,
                 registrations: Registrations {
                     since: now_ms,
@@ -967,6 +1030,8 @@ impl State {
         let f = &mut self.fleet;
         // the ladder and the records stay; the round and the players went with the agent
         f.potato.resumed();
+        // the overlay stays and ends at its time; the hosts went with their connections
+        f.renders.resumed();
         // Registrations it had not stored are lost, and agents reconnect only once it is back.
         f.registrations = Registrations {
             since: now_ms,
@@ -1020,10 +1085,12 @@ impl State {
         // running the borrower's world.
         crate::apply::forget_minecraft(f, |_| true, now_ms);
         f.ec2.clear();
+        f.lambda.clear();
         f.n = 0;
         f.fcvm_dark.clear();
         f.layout = LayoutGen::default();
         f.ec2_n = 0;
+        f.lambda_n = 0;
         // Viewer ids restart with the process, so which were hidden means nothing now.
         f.viewers.clear();
         f.hidden.clear();
@@ -1038,7 +1105,8 @@ impl State {
         // never finish with a true time (and its slots come back at generation 1), on either
         // half. Its tiles keep running.
         let finished = |h: &HalfRace| h.done_at.is_some() || h.tiles.is_empty();
-        f.races.retain(|r| finished(&r.fcvm) && finished(&r.ec2));
+        f.races
+            .retain(|r| finished(&r.fcvm) && finished(&r.ec2) && finished(&r.lambda));
         f.next_race_at = config.race_interval_secs.map(|s| now_ms + s * 1000);
         // Restored: the open stop vote, when the stored votes are for the round still open
         // (a vote is answered only once a stored state holds it). A stored vote whose offer is
@@ -1054,8 +1122,8 @@ impl State {
         self.receipts.get(id)
     }
 
-    /// Find a slot by its id (`slot-3`, `ec2-2`) or by the tile it holds (`fcvm:1`,
-    /// `ec2:4`, 1-based).
+    /// Find a slot by its id (`slot-3`, `ec2-2`, `lam-1`) or by the tile it holds (`fcvm:1`,
+    /// `ec2:4`, `lambda:2`, 1-based).
     pub fn find_slot(&self, name: &str) -> Option<(Half, u32)> {
         if let Some(k) = name.strip_prefix("fcvm:") {
             let pos = k.parse::<usize>().ok()?.checked_sub(1)?;
@@ -1075,11 +1143,27 @@ impl State {
                 .find(|(_, s)| s.position == Some(pos))
                 .map(|(n, _)| (Half::Ec2, *n));
         }
+        if let Some(k) = name.strip_prefix("lambda:") {
+            let pos = k.parse::<usize>().ok()?.checked_sub(1)?;
+            return self
+                .fleet
+                .lambda
+                .iter()
+                .find(|(_, s)| s.position == Some(pos))
+                .map(|(n, _)| (Half::Lambda, *n));
+        }
         if let Some(n) = name.strip_prefix("slot-").and_then(|n| n.parse().ok()) {
             return self.fleet.slots.contains_key(&n).then_some((Half::Fcvm, n));
         }
         if let Some(n) = name.strip_prefix("ec2-").and_then(|n| n.parse().ok()) {
             return self.fleet.ec2.contains_key(&n).then_some((Half::Ec2, n));
+        }
+        if let Some(n) = lambda_number(name) {
+            return self
+                .fleet
+                .lambda
+                .contains_key(&n)
+                .then_some((Half::Lambda, n));
         }
         None
     }
@@ -1093,19 +1177,33 @@ pub fn ec2_name(n: u32) -> String {
     format!("ec2-{n}")
 }
 
+pub fn lambda_name(n: u32) -> String {
+    format!("lam-{n}")
+}
+
 /// The id a host's aggregator is named under in DNS, `agg-<host>`, when the host's name can
 /// be part of a DNS label: lowercase letters, digits and inner hyphens, at most 40
 /// characters (an EC2 instance id is 19), and not `ec2`, kept for the EC2 half's aggregator.
 pub fn aggregate_id(host: &str) -> Option<String> {
-    let ok = !host.is_empty()
+    (host != "ec2" && host_label(host)).then(|| format!("agg-{host}"))
+}
+
+/// Whether a host's name can be part of a DNS label: lowercase letters, digits and inner
+/// hyphens, at most 40 characters (an EC2 instance id is 19).
+fn host_label(host: &str) -> bool {
+    !host.is_empty()
         && host.len() <= 40
-        && host != "ec2"
         && !host.starts_with('-')
         && !host.ends_with('-')
         && host
             .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    ok.then(|| format!("agg-{host}"))
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The id pages mode's host's frame socket is named under in DNS, `renders-<host>`, when the
+/// host's name can be part of a DNS label (as for [`aggregate_id`]).
+pub fn renders_id(host: &str) -> Option<String> {
+    host_label(host).then(|| format!("renders-{host}"))
 }
 
 /// The id the EC2 half's aggregator is named under in DNS.
@@ -1135,6 +1233,14 @@ pub fn slot_number(id: &str) -> Option<u32> {
 
 pub fn ec2_number(id: &str) -> Option<u32> {
     id.strip_prefix("ec2-")?.parse().ok()
+}
+
+pub fn lambda_number(id: &str) -> Option<u32> {
+    id.strip_prefix("lam-")?.parse().ok()
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 pub fn phone_name(n: u32) -> String {
@@ -1287,7 +1393,8 @@ mod tests {
     }
 
     /// A race the restart interrupted cannot finish (its slots come back at generation 1),
-    /// so it is dropped whichever half was unfinished; a finished race is kept.
+    /// so it is dropped whichever half was unfinished, the Lambda side's too; a finished race
+    /// is kept.
     #[test]
     fn a_resumed_coordinator_drops_a_race_with_either_half_unfinished() {
         let tile = |tile: &str| RaceTile {
@@ -1303,18 +1410,40 @@ mod tests {
             done_at: done,
             ..Default::default()
         };
-        let race = |id, fcvm, ec2| Race {
+        let race = |id, fcvm, ec2, lambda| Race {
             id,
             started_at: 100,
             by: "schedule".into(),
             fcvm,
             ec2,
+            lambda,
         };
         let mut s = State::new(Config::default(), 1000);
         s.fleet.races.extend([
-            race(1, half("slot-1", Some(200)), half("ec2-1", Some(300))),
-            race(2, half("slot-1", Some(200)), half("ec2-1", None)),
-            race(3, half("slot-1", None), half("ec2-1", Some(300))),
+            race(
+                1,
+                half("slot-1", Some(200)),
+                half("ec2-1", Some(300)),
+                half("lam-1", Some(400)),
+            ),
+            race(
+                2,
+                half("slot-1", Some(200)),
+                half("ec2-1", None),
+                HalfRace::default(),
+            ),
+            race(
+                3,
+                half("slot-1", None),
+                half("ec2-1", Some(300)),
+                HalfRace::default(),
+            ),
+            race(
+                4,
+                half("slot-1", Some(200)),
+                half("ec2-1", Some(300)),
+                half("lam-1", None),
+            ),
         ]);
         let resumed = s.resumed(Config::default(), 2000);
         let kept: Vec<u64> = resumed.fleet.races.iter().map(|r| r.id).collect();

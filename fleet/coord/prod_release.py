@@ -195,6 +195,31 @@ def decide():
     smoke = max(covering, key=lambda s: s["end"])
     target = {"coordinator": {"commit": coordinator, "digest": candidate["stage"]["digest"]}, "web_commit": web,
               "generation": verified["generation"], "build_id": verified["build_id"], "smoke_run": smoke["run"]}
+    # With the prod lane on, the set carries the lane image staging runs. What a stack runs comes from its
+    # release function (the running task's FLEET_LAMBDA_IMAGE); the lane repository's tags only protect images,
+    # and stay moved after a cancelled deploy or a hand selection. The candidate is read again here, after the
+    # in-progress and smoke checks above, so it describes the staging those checks saw.
+    lane = publish.lane_setting("FLEET_LAMBDA_LANE_PROD")
+    prior_lane = None
+    if lane:
+        now = lambda_result("COORDINATOR_RELEASE", {"action": "candidate"})
+        if now.get("status") != "ok":
+            raise RuntimeError("a release function refused to describe the releases")
+        if now["stage"]["digest"] != candidate["stage"]["digest"]:
+            raise Skip("staging's coordinator changed while the promotion was deciding")
+        for stack in ("stage", "prod"):
+            if now[stack].get("lane_error"):
+                raise Skip(f"the release function could not read the lane image {stack} runs "
+                           f"({now[stack]['lane_error']})")
+        staged = now["stage"].get("lambda_digest")
+        if not staged:
+            raise Skip("staging runs no lane image")
+        lane_module, ecr = publish.staging_lane()
+        selection = ecr.tagged(lane_module.current("stage"))
+        if selection is None or selection.digest != staged:
+            raise Skip("staging's lane selection (keep-stage-current) is not the lane image it runs")
+        target["lambda_digest"] = staged
+        prior_lane = now["prod"].get("lambda_digest") or ""
 
     record = candidate.get("release")
     prod_receipt = status["prod"]
@@ -202,6 +227,10 @@ def decide():
         if record["coordinator"]["digest"] != candidate["prod"]["digest"] \
                 or {"generation": record["generation"], "build_id": record["build_id"]} != prod_receipt:
             raise Skip("prod changed outside a promotion: its release record does not describe it")
+        # With the lane on, an entry without lambda_digest names no lane image ("").
+        if lane and record.get("lambda_digest", "") != prior_lane:
+            raise Skip("prod changed outside a promotion: its record names another lane image than it runs")
+        # Passed back byte for byte: the record's compare-and-swap takes it as the record it replaces.
         prior = entry(record)
     else:
         commits = candidate["prod"]["commits"]
@@ -211,9 +240,12 @@ def decide():
     changes = {"image": {"generation": target["generation"], "build_id": target["build_id"]} != prod_receipt,
                "coordinator": target["coordinator"]["digest"] != prior["coordinator"]["digest"],
                "web": prior["web_commit"] != web}
+    if lane:
+        # Against what prod runs (empty before its first lane image), never a value written into `prior`.
+        changes["lane"] = target["lambda_digest"] != prior_lane
     if not any(changes.values()):
         raise Skip("prod already runs the staging set")
-    return target, prior, changes
+    return target, prior, changes, prior_lane
 
 
 def hold(image, deadline=None, clock=time.time, sleep=time.sleep):
@@ -243,8 +275,58 @@ def receipt_of(value):
     return receipt
 
 
-def image_promote(receipt):
-    result = lambda_result("IMAGE_RELEASE", {"action": "promote-prod", "receipt": receipt})
+# The image release function takes Terraform's backend lock, as the coordinator release does (publish.release). With
+# ejc3/aws#1014 applied it answers busy while someone else holds the lock (an apply, a plan, another release), and the
+# call is made again a minute later; until then a held lock is still a function error, as in run 45149811634.
+BUSY_ATTEMPTS = 11
+
+
+class LockHeld(RuntimeError):
+    """The image release answered busy every time: Terraform's lock stayed held, and nothing ran."""
+
+
+def image_call(payload, sleep=None, deadline=None, clock=time.time):
+    """One image release call, made again while the function answers busy: at most BUSY_ATTEMPTS calls, and none
+    after `deadline`."""
+    sleep = sleep or time.sleep
+    for attempt in range(BUSY_ATTEMPTS):
+        result = lambda_result("IMAGE_RELEASE", payload)
+        if result.get("status") != "busy":
+            return result
+        if attempt == BUSY_ATTEMPTS - 1:
+            break
+        if deadline is not None and clock() >= deadline:
+            raise LockHeld("Terraform's lock stayed held until the deadline: the image release did not run")
+        print(f"Terraform's lock is held; asking the image release again in {POLL_SECONDS} seconds", flush=True)
+        sleep(POLL_SECONDS)
+    raise LockHeld("Terraform's lock stayed held: the image release did not run")
+
+
+def image_prod():
+    """The receipt prod's image pointer names (prod-status takes no lock)."""
+    return lambda_result("IMAGE_RELEASE", {"action": "prod-status"}).get("prod")
+
+
+def image_promote(receipt, sleep=None):
+    before = image_prod()
+    try:
+        result = image_call({"action": "promote-prod", "receipt": receipt}, sleep)
+    except LockHeld:
+        # Busy every time is not proof that nothing moved: publish.invoke retries a call that ended without a result
+        # while the function went on, and that first call may have completed (or been killed holding the lock).
+        # The function writes prod's pointer last, after every template moved (ProdPublisher.move), and a later
+        # promote-prod answers "unchanged" for exactly that state, so a pointer naming the receipt is the completed
+        # promotion (checked first: a rerun can find prod on the receipt before and after). A pointer still naming
+        # what prod ran before the call is held: no rollback, and the next promotion tries again. Anything else is
+        # a failure, and the rollback runs; that includes a prod-status that named no receipt (refused), because
+        # two unreadable answers are not "nothing moved".
+        now = image_prod()
+        if now is not None and now == receipt:
+            return "unchanged"
+        if before is not None and now == before:
+            raise publish.Held("Terraform's lock stayed held before prod's images moved") from None
+        raise RuntimeError("Terraform's lock stayed held, and prod's images name neither the release it ran nor the "
+                           "promoted one") from None
     status = result.get("status")
     if status == "held":
         raise publish.Held("prod woke before its images moved")
@@ -253,17 +335,26 @@ def image_promote(receipt):
     return status
 
 
-def image_rollback(receipt, want, deadline=None, clock=time.time, sleep=time.sleep):
+def image_rollback(receipt, want, deadline=None, clock=time.time, sleep=None):
     """Return prod's images from `receipt` to their previous release, which must be `want`; waits for
     prod to sleep (the templates change only then) until the deadline."""
+    sleep = sleep or time.sleep
     deadline = deadline or clock() + HOLD_SECONDS
-    current = lambda_result("IMAGE_RELEASE", {"action": "prod-status"}).get("prod")
+    current = image_prod()
     if current == want:
         return "unchanged"  # the promotion never moved them
     if current != receipt:
         raise RuntimeError("prod's images are neither the promoted release nor the previous one")
     while True:
-        result = lambda_result("IMAGE_RELEASE", {"action": "rollback-prod", "receipt": receipt})
+        # Terraform's lock held: keep asking every minute until the rollback's own deadline, as for a prod that is
+        # awake. A rollback that could not run by then fails (LockHeld is a RuntimeError, never held).
+        try:
+            result = image_call({"action": "rollback-prod", "receipt": receipt}, sleep, deadline, clock)
+        except LockHeld:
+            if clock() >= deadline:
+                raise
+            sleep(POLL_SECONDS)
+            continue
         status = result.get("status")
         if status in ("rolled_back", "unchanged"):
             if receipt_of(result) != want:
@@ -301,13 +392,16 @@ def main(argv):
             output(run="true" if enabled() else "false")
         elif action == "decide":
             try:
-                target, prior, changes = decide()
+                target, prior, changes, prior_lane = decide()
             except Skip as skip:
                 notice(f"nothing promoted: {skip}")
                 output(promote="false")
                 return 0
             output(promote="true", target=target, prior=prior, image=str(changes["image"]).lower(),
-                   coordinator=str(changes["coordinator"]).lower(), web=str(changes["web"]).lower())
+                   coordinator=str(changes["coordinator"]).lower(), web=str(changes["web"]).lower(),
+                   lane=str(changes.get("lane", False)).lower(),
+                   # The lane image prod ran before (empty: none), for a rollback; set only with the prod lane on.
+                   **({"prior_lane": prior_lane} if prior_lane is not None else {}))
         elif action == "hold":
             if rest[:1] != ["--image"] or rest[1:] not in (["true"], ["false"]):
                 raise ValueError("hold --image true|false")
@@ -319,10 +413,30 @@ def main(argv):
         elif action == "record":
             output(record=record(json.loads(rest[0]), rest[1] or None, json.loads(rest[2])))
         elif action == "current":
-            release = lambda_result("COORDINATOR_RELEASE", {"action": "candidate"}).get("release")
+            answer = lambda_result("COORDINATOR_RELEASE", {"action": "candidate"})
+            release = answer.get("release")
             if not release or not release.get("previous"):
                 raise RuntimeError("prod has no recorded previous release to roll back to")
-            output(current=entry(release), previous=release["previous"])
+            # The lane flag comes from both entries: the previous set's lane image when it names one, else none
+            # when the set being left names one, else no flag (today's release, which leaves FLEET_LAMBDA_IMAGE
+            # alone and so needs no lane read).
+            previous = release["previous"]
+            back = previous.get("lambda_digest")
+            lane = back if back else "none" if release.get("lambda_digest") else ""
+            if back or release.get("lambda_digest"):
+                # What prod runs must be what the record's current entry names (an entry without lambda_digest names
+                # none), or what its previous one names with its coordinator: a rollback whose Coordinator step
+                # applied and whose later step failed, so the record job did not run. A rerun finishes it.
+                runs = answer.get("prod") or {}
+                if runs.get("lane_error"):
+                    raise RuntimeError(f"the release function could not read the lane image prod runs ({runs['lane_error']})")
+                running = runs.get("lambda_digest") or ""
+                resumed = runs.get("digest") == previous["coordinator"]["digest"] and running == (back or "")
+                if running != release.get("lambda_digest", "") and not resumed:
+                    raise RuntimeError("prod runs another lane image than its release record names; recover by hand: "
+                                       "publish.py --stack prod --force --commit C --digest D --lambda-digest <the "
+                                       "lane digest to run, or none>, then prod_release.py record")
+            output(current=entry(release), previous=release["previous"], lane=lane)
         else:
             raise ValueError("unknown action")
     except publish.Held:

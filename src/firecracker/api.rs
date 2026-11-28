@@ -358,6 +358,10 @@ pub struct DrivePatch {
 pub struct NetworkInterface {
     pub iface_id: String,
     pub host_dev_name: String,
+    /// A queue of `host_dev_name` the VMM inherited, to use instead of attaching by name
+    /// (ejc3/firecracker builds whose version says `tap-fd`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_dev_fd: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guest_mac: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -455,6 +459,10 @@ impl DevicePassthrough {
 pub struct NetworkOverride {
     pub iface_id: String,
     pub host_dev_name: String,
+    /// A queue of `host_dev_name` the VMM inherited, to use instead of attaching by name
+    /// (ejc3/firecracker builds whose version says `tap-fd`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_dev_fd: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -474,6 +482,10 @@ pub struct DriveOverride {
 pub struct MemBackend {
     pub backend_path: String,
     pub backend_type: String, // "File" or "Uffd"
+    /// File backend: the recorded write set Firecracker populates writable before the VM runs
+    /// (`crate::storage::write_set`). Left out of the request when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_set_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

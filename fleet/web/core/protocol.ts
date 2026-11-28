@@ -4,7 +4,19 @@
 // browser's reading of them. core/test/contract.test.ts parses the coordinator's own
 // snapshot states (#1146, fleet/core/tests/vectors) with it.
 
+/** A side of the image: fcvm's GPUs on the left, AWS's on the right. */
 export type Half = "fcvm" | "ec2";
+
+/**
+ * What a tile runs on: an fcvm VM, an EC2 instance, or a Lambda execution environment. The
+ * AWS half holds both its EC2 tiles and its Lambda tiles, each timed apart in a race.
+ */
+export type Backing = Half | "lambda";
+
+/** The side of the image a tile of that backing is on. */
+export function sideOf(b: Backing): Half {
+  return b === "fcvm" ? "fcvm" : "ec2";
+}
 
 /** A rectangle of the whole image, in fractions of its width and height (0..1). */
 export interface Rect {
@@ -27,6 +39,18 @@ export interface GpuInfo {
   temp_c: number | null;
   power_w: number | null;
   util_pct: number | null;
+  /** GPU memory in use and its size, in MB, when the renderer reports them. */
+  mem_used_mb: number | null;
+  mem_total_mb: number | null;
+  /** Unix ms the readings were taken, when the coordinator says; null from one that does not. */
+  at: number | null;
+}
+
+/** A phone VM's CPU use (percent of its vCPUs), read on its host; `at` is the coordinator's receipt time. */
+export interface VmStats {
+  cpu_pct: number;
+  vcpus: number;
+  at: number | null;
 }
 
 /** Why a tile is not running when that is a fault: `relaunch_failed` (the VM did not come back; the agent retries at `retry_at`). */
@@ -37,9 +61,12 @@ export interface Failure {
 }
 
 export interface Tile {
-  /** The tile's place, as the coordinator names it (`fcvm:3`). */
+  /** The tile's place, as the coordinator names it (`fcvm:3`, `ec2:2`, `lambda:1`). */
   id: string;
-  half: Half;
+  /** What it runs on, the coordinator's `half`. */
+  half: Backing;
+  /** The side of the image it is on (`sideOf(half)`), the page's reading. */
+  side: Half;
   rect: Rect;
   phase: string;
   /** The slot behind the place (`slot-3`, `ec2-2`), when the coordinator names one. */
@@ -60,6 +87,8 @@ export interface Tile {
   /** The same renderer over IPv4 (`wss://<label>-v4.<zone>[:port]/frames`), null alike. */
   frame_url_v4: string | null;
   gpu: GpuInfo | null;
+  /** The phone VM's CPU use; null from a coordinator or agent that does not report them. */
+  vm_stats: VmStats | null;
   host: string | null;
   /** Where the tile runs, worded for a viewer (`EC2 in us-east-1`); null until the slot reports it. */
   place: string | null;
@@ -131,6 +160,17 @@ export interface RelaunchAll {
   /** Each half's measured time once it is back (the coordinator's, capacity waits excluded per tile), or null. */
   fcvm_ms: number | null;
   ec2_ms: number | null;
+  /**
+   * The AWS half's Lambda tiles, timed apart from its EC2 tiles, in the same shape; all null
+   * (the wait 0) in a race without Lambda tiles. The capacity wait is a GPU instance Lambda
+   * had to launch, kept out of `lambda_ms` as EC2's spot wait is out of `ec2_ms`.
+   */
+  lambda_done_at?: number | null;
+  lambda_pending?: number | null;
+  lambda_gpus?: number | null;
+  lambda_capacity_wait_ms?: number;
+  lambda_waiting_since?: number | null;
+  lambda_ms?: number | null;
 }
 
 /** One half's measured restart times. Every number is the coordinator's. */
@@ -150,6 +190,8 @@ export interface HalfScore {
 export interface Scoreboard {
   fcvm: HalfScore | null;
   ec2: HalfScore | null;
+  /** The Lambda tiles' own row; null (or absent) until a race with Lambda tiles has timed them. */
+  lambda?: HalfScore | null;
 }
 
 /** A stop the open vote is among, with its votes. */
@@ -239,6 +281,7 @@ export interface RaceRecord {
   by: string;
   fcvm: RaceHalf | null;
   ec2: RaceHalf | null;
+  lambda?: RaceHalf | null;
 }
 
 function parseWake(v: unknown, where: string): Wake | null {
@@ -267,6 +310,7 @@ function parseRaces(v: unknown): RaceRecord[] {
         by: strOrNull(r, "by", where) ?? "",
         fcvm: parseRaceHalf(r["fcvm"], `${where}.fcvm`),
         ec2: parseRaceHalf(r["ec2"], `${where}.ec2`),
+        lambda: parseRaceHalf(r["lambda"], `${where}.lambda`),
       },
     ];
   });
@@ -456,6 +500,10 @@ export interface MinecraftResetAll {
   /** `viewer:<id>`, or whatever else the coordinator names. */
   by: string;
   servers: number;
+  /** How many of those servers are back from this reset; absent from a coordinator that does not count them. */
+  back?: number;
+  /** The click to the last of them back, ms; null while none is. */
+  took_ms?: number | null;
 }
 
 /** The last fork that reached `running`, with the agent's times. */
@@ -486,7 +534,44 @@ export interface Minecraft {
   borrow: Borrow;
   last_reset_all: MinecraftResetAll | null;
   last_fork: MinecraftFork | null;
+  /** Every server of a small fleet; of a large one, the first 16 and every lent one. */
   tiles: MinecraftTile[];
+  /** With more servers than are listed as tiles: every server, by host (PROTOCOL.md, "Many servers"). */
+  field: MinecraftField | null;
+}
+
+/** One host's servers, in the order of its status rows. */
+export interface MinecraftFieldHost {
+  /** `minecraft_status.host`. */
+  key: string;
+  /** The servers' numbers (`mc-<n>`). */
+  servers: number[];
+  /** Each one's view URL, and its IPv4 one; null for a server with none now. */
+  frames: (string | null)[];
+  frames_v4: (string | null)[];
+}
+
+export interface MinecraftField {
+  servers: number;
+  hosts: MinecraftFieldHost[];
+}
+
+/**
+ * A host's Minecraft servers as its agent last read them (PROTOCOL.md, "Many servers"): sent
+ * about once a second to a page whose `visibility` said `minecraft`. `rows` is base64, 8 bytes a
+ * server (core/minecraft-field.ts reads them).
+ */
+export interface MinecraftStatusMsg {
+  type: "minecraft_status";
+  host: string;
+  /** The coordinator's clock when the report reached it; null from a coordinator that does not say. */
+  received_at: number | null;
+  t: number;
+  rows: string;
+  cpus: number | null;
+  busy: number | null;
+  mem_total_mib: number | null;
+  mem_used_mib: number | null;
 }
 
 /**
@@ -731,7 +816,7 @@ export interface ErrorMsg {
   reason: string;
 }
 
-export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMsg | VerifiedMsg | ClaimMsg | AdmissionMsg;
+export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMsg | VerifiedMsg | ClaimMsg | AdmissionMsg | MinecraftStatusMsg;
 
 export const DEFAULT_IMAGE_ASPECT = 16 / 9;
 
@@ -872,14 +957,35 @@ function reading(o: Obj | null, k: string): number | null {
 function parseGpu(v: unknown, stats: unknown, where: string): GpuInfo | null {
   if (v === null || v === undefined) return null;
   const st = isObj(stats) ? stats : null;
-  if (typeof v === "string") return { name: v, temp_c: reading(st, "temp_c"), power_w: reading(st, "power_w"), util_pct: reading(st, "util_pct") };
+  if (typeof v === "string") {
+    return {
+      name: v,
+      temp_c: reading(st, "temp_c"),
+      power_w: reading(st, "power_w"),
+      util_pct: reading(st, "util_pct"),
+      mem_used_mb: reading(st, "mem_used_mb"),
+      mem_total_mb: reading(st, "mem_total_mb"),
+      at: reading(st, "at"),
+    };
+  }
   if (!isObj(v)) throw new ProtocolError(`${where} is neither a name nor an object`);
   return {
     name: str(v, "name", where),
     temp_c: reading(st, "temp_c") ?? reading(v, "temp_c"),
     power_w: reading(st, "power_w") ?? reading(v, "power_w"),
     util_pct: reading(st, "util_pct") ?? reading(v, "util_pct"),
+    mem_used_mb: reading(st, "mem_used_mb") ?? reading(v, "mem_used_mb"),
+    mem_total_mb: reading(st, "mem_total_mb") ?? reading(v, "mem_total_mb"),
+    at: reading(st, "at") ?? reading(v, "at"),
   };
+}
+
+function parseVmStats(v: unknown): VmStats | null {
+  if (!isObj(v)) return null;
+  const cpu = reading(v, "cpu_pct");
+  const vcpus = reading(v, "vcpus");
+  if (cpu === null || vcpus === null || vcpus < 1) return null;
+  return { cpu_pct: cpu, vcpus: Math.round(vcpus), at: reading(v, "at") };
 }
 
 function parseLastRelaunch(v: unknown, where: string): LastRelaunch | null {
@@ -899,10 +1005,11 @@ function parseTile(v: unknown, i: number): Tile {
   const where = `tiles[${i}]`;
   if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
   const half = str(v, "half", where);
-  if (half !== "fcvm" && half !== "ec2") throw new ProtocolError(`${where}.half is ${half}`);
+  if (half !== "fcvm" && half !== "ec2" && half !== "lambda") throw new ProtocolError(`${where}.half is ${half}`);
   return {
     id: str(v, "id", where),
     half,
+    side: sideOf(half),
     rect: parseRect(obj(v, "rect", where), `${where}.rect`),
     phase: str(v, "phase", where),
     slot: strOrNull(v, "slot", where),
@@ -914,6 +1021,7 @@ function parseTile(v: unknown, i: number): Tile {
     frame_url: strOrNull(v, "frame_url", where),
     frame_url_v4: strOrNull(v, "frame_url_v4", where),
     gpu: parseGpu(v["gpu"], v["gpu_stats"], `${where}.gpu`),
+    vm_stats: parseVmStats(v["vm_stats"]),
     host: strOrNull(v, "host", where),
     place: strOrNull(v, "place", where),
     last_relaunch: parseLastRelaunch(v["last_relaunch"], `${where}.last_relaunch`),
@@ -1017,7 +1125,12 @@ function parseWindows(v: unknown): Windows | null {
 function parseMinecraftResetAll(v: unknown, where: string): MinecraftResetAll | null {
   if (v === null || v === undefined) return null;
   if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
-  return { clicked_at: num(v, "clicked_at", where), by: str(v, "by", where), servers: num(v, "servers", where) };
+  const r: MinecraftResetAll = { clicked_at: num(v, "clicked_at", where), by: str(v, "by", where), servers: num(v, "servers", where) };
+  if (v["back"] !== undefined && v["back"] !== null) {
+    r.back = num(v, "back", where);
+    r.took_ms = numOrNull(v, "took_ms", where);
+  }
+  return r;
 }
 
 function parseMinecraftFork(v: unknown, where: string): MinecraftFork | null {
@@ -1060,7 +1173,45 @@ function parseMinecraft(v: unknown): Minecraft | null {
     last_reset_all: parseMinecraftResetAll(v["last_reset_all"], `${w}.last_reset_all`),
     last_fork: parseMinecraftFork(v["last_fork"], `${w}.last_fork`),
     tiles,
+    field: parseMinecraftField(v["field"]),
   };
+}
+
+/** `prefix + name + suffix` for each name; null stays null. */
+function unsqueeze(v: unknown, count: number, where: string): (string | null)[] {
+  if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
+  const prefix = str(v, "prefix", where);
+  const suffix = str(v, "suffix", where);
+  const names = arr(v, "names", where);
+  if (names.length !== count) throw new ProtocolError(`${where}.names holds ${names.length} names for ${count} servers`);
+  return names.map((n, i) => {
+    if (n === null) return null;
+    if (typeof n !== "string") throw new ProtocolError(`${where}.names[${i}] is not a string`);
+    return prefix + n + suffix;
+  });
+}
+
+export function parseMinecraftField(v: unknown): MinecraftField | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw new ProtocolError("minecraft.field is not an object");
+  const w = "minecraft.field";
+  const seen = new Set<number>();
+  const hosts = arr(v, "hosts", w).map((h, i) => {
+    const hw = `${w}.hosts[${i}]`;
+    if (!isObj(h)) throw new ProtocolError(`${hw} is not an object`);
+    const servers = arr(h, "servers", hw).map((n) => {
+      if (typeof n !== "number" || !Number.isInteger(n) || n < 1 || seen.has(n)) throw new ProtocolError(`${hw}.servers is not a list of distinct server numbers`);
+      seen.add(n);
+      return n;
+    });
+    return {
+      key: str(h, "key", hw),
+      servers,
+      frames: unsqueeze(h["frames"], servers.length, `${hw}.frames`),
+      frames_v4: h["frames_v4"] === null || h["frames_v4"] === undefined ? servers.map(() => null) : unsqueeze(h["frames_v4"], servers.length, `${hw}.frames_v4`),
+    };
+  });
+  return { servers: num(v, "servers", w), hosts };
 }
 
 function msMap(v: unknown, where: string): Record<string, number> {
@@ -1288,6 +1439,12 @@ function parseRelaunchAll(ra: unknown): RelaunchAll | null {
     ec2_waiting_since: numOrNull(ra, "ec2_waiting_since", w),
     fcvm_ms: numOrNull(ra, "fcvm_ms", w),
     ec2_ms: numOrNull(ra, "ec2_ms", w),
+    lambda_done_at: numOrNull(ra, "lambda_done_at", w),
+    lambda_pending: numOrNull(ra, "lambda_pending", w),
+    lambda_gpus: numOrNull(ra, "lambda_gpus", w),
+    lambda_capacity_wait_ms: numOrNull(ra, "lambda_capacity_wait_ms", w) ?? 0,
+    lambda_waiting_since: numOrNull(ra, "lambda_waiting_since", w),
+    lambda_ms: numOrNull(ra, "lambda_ms", w),
   };
 }
 
@@ -1363,7 +1520,11 @@ function parseState(o: Obj): FleetState {
     races: parseRaces(o["races"]),
     next_race_at: numOrNull(o, "next_race_at", "state"),
     cooldown_until: numOrNull(o, "cooldown_until", "state"),
-    scoreboard: { fcvm: parseHalfScore(sb["fcvm"], "scoreboard.fcvm"), ec2: parseHalfScore(sb["ec2"], "scoreboard.ec2") },
+    scoreboard: {
+      fcvm: parseHalfScore(sb["fcvm"], "scoreboard.fcvm"),
+      ec2: parseHalfScore(sb["ec2"], "scoreboard.ec2"),
+      lambda: parseHalfScore(sb["lambda"], "scoreboard.lambda"),
+    },
     nudges: parseNudges(o["nudges"]),
     viewers: {
       count: typeof viewers["count"] === "number" ? viewers["count"] : 0,
@@ -1479,6 +1640,18 @@ export function parseServerMsg(text: string): ServerMsg {
     }
     case "error":
       return { type: "error", reason: typeof v["reason"] === "string" ? v["reason"] : "" };
+    case "minecraft_status":
+      return {
+        type: "minecraft_status",
+        host: str(v, "host", "minecraft_status"),
+        received_at: numOrNull(v, "received_at", "minecraft_status"),
+        t: num(v, "t", "minecraft_status"),
+        rows: str(v, "rows", "minecraft_status"),
+        cpus: numOrNull(v, "cpus", "minecraft_status"),
+        busy: numOrNull(v, "busy", "minecraft_status"),
+        mem_total_mib: numOrNull(v, "mem_total_mib", "minecraft_status"),
+        mem_used_mib: numOrNull(v, "mem_used_mib", "minecraft_status"),
+      };
     default:
       throw new ProtocolError(`unknown message type ${String(v["type"])}`);
   }

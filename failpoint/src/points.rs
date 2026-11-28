@@ -14,6 +14,9 @@ pub const HOST_POINTS: &[&str] = &[
     "fleet.agent.slot_running",
     "health.pre_persist_healthy",
     "lifecycle.before_ready_claim",
+    "pool.post_claim",
+    "pool.pre_reset",
+    "restore.acked_pre_verify",
     "restore.locked",
     "restore.post_clone_disk",
     "restore.pre_spawn_vmm",
@@ -28,11 +31,13 @@ pub const HOST_POINTS: &[&str] = &[
     "snapshot.install.pre_rename",
     "snapshot.install.post_rename",
     "snapshot.post_balloon_read_pre_save",
+    "snapshot.post_resume_pre_reopen",
     "snapshot.post_save_pre_resume",
     "snapshot.pre_pause",
     "snapshot.startup.pre_create",
     "teardown.pre_kill",
     "teardown.pre_remove_data_dir",
+    "uffd.refusal.pre_record",
     "working_set.pre_persist",
 ];
 
@@ -43,5 +48,6 @@ pub const GUEST_POINTS: &[&str] = &[
     "exec.post_ack_pre_go",
     "restore.post_epoch_read",
     "restore.pre_ack_connect",
+    "restore.pre_boundary",
     "restore.pre_gate_verify",
 ];

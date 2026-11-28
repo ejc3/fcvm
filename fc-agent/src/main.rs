@@ -27,6 +27,7 @@ mod nftables;
 mod output;
 mod payload_freeze;
 mod proxy;
+mod relay_socket;
 mod restore;
 mod retired_address;
 mod snapshot_network;
@@ -44,11 +45,18 @@ use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::EnvFilter;
 
-/// Format tracing events as `[fc-agent] message` — no timestamp, level, or target.
+/// Format tracing events as `[fc-agent] message`: no timestamp or target, and no level
+/// below ERROR.
 ///
 /// The host reads these lines from Firecracker's serial console and adds its own
 /// timestamp and level. Including `[fc-agent]` ensures the host logs them at INFO
 /// (the host checks `contains("fc-agent")` to distinguish important lines).
+///
+/// An ERROR event is `[fc-agent] ERROR: message`, the form of fc-agent's own error
+/// lines: the console writer puts such a line on the console at once during a restore
+/// (`console::classify`), and the host logs it at WARN. WARN events keep the plain form:
+/// the FUSE client logs at WARN that its connection was reset, which every restore of a
+/// VM with a `--map` volume does.
 struct FcAgentFormat;
 
 impl<S, N> FormatEvent<S, N> for FcAgentFormat
@@ -62,11 +70,65 @@ where
         mut writer: Writer<'_>,
         event: &tracing::Event<'_>,
     ) -> fmt::Result {
-        write!(writer, "[fc-agent] ")?;
+        write!(writer, "{}", event_prefix(event.metadata().level()))?;
         ctx.format_fields(writer.by_ref(), event)?;
         writeln!(writer)
     }
 }
+
+/// What a tracing event's console line starts with (see [`FcAgentFormat`]).
+fn event_prefix(level: &tracing::Level) -> &'static str {
+    if *level == tracing::Level::ERROR {
+        "[fc-agent] ERROR: "
+    } else {
+        "[fc-agent] "
+    }
+}
+
+/// The exit status of a boundary one-shot that was refused because a restore is under
+/// way in the guest: the gate is the restore's. The host reads it
+/// (`ONE_SHOT_REFUSED_EXIT` in src/commands/common.rs) and does not try again.
+const REFUSED_EXIT: i32 = 3;
+
+/// The exit status of a resume that was refused because its token is not the one of the
+/// boundary owed in this guest (#2159). The gate may be this source's own, and closed:
+/// the host keeps its record of it (`ONE_SHOT_STALE_EXIT` in src/commands/common.rs).
+const STALE_RESUME_EXIT: i32 = 5;
+
+/// The status a boundary one-shot that failed exits with.
+fn failed_one_shot_exit(error: &anyhow::Error) -> i32 {
+    if error
+        .downcast_ref::<snapshot_network::RestoreUnderWay>()
+        .is_some()
+    {
+        REFUSED_EXIT
+    } else if error
+        .downcast_ref::<snapshot_network::StaleResume>()
+        .is_some()
+    {
+        STALE_RESUME_EXIT
+    } else {
+        1
+    }
+}
+
+/// The status of a resume that opened the gate: 0, or `OPEN_UNCLEAN_EXIT` when the
+/// manifest or the mark could not be removed afterwards. None when the gate is not open.
+fn open_gate_exit(resumed: &snapshot_network::SourceResume) -> Option<i32> {
+    resumed.gate_open.then(|| {
+        if resumed.result.is_ok() {
+            0
+        } else {
+            OPEN_UNCLEAN_EXIT
+        }
+    })
+}
+
+/// The exit status of a resume that opened the gate and then could not retire the
+/// manifest or the `owed` mark. The gate is open and the source is back in service; the
+/// host must not record it closed (`ONE_SHOT_OPEN_UNCLEAN_EXIT` in
+/// src/commands/common.rs).
+const OPEN_UNCLEAN_EXIT: i32 = 4;
 
 #[tokio::main]
 async fn main() {
@@ -88,31 +150,65 @@ async fn main() {
     let one_shot = std::env::args().nth(1);
     let one_shot_result = match one_shot.as_deref() {
         Some("--prepare-snapshot-network") => {
-            // The container is frozen first, so it opens no socket and faults no page
-            // while the boundary closes, and a restored clone starts with it frozen
-            // (payload_freeze). A failed prepare thaws it again: the host resumes the
-            // source on its own when the prepare fails.
-            payload_freeze::freeze();
-            let prepared = snapshot_network::prepare_snapshot_network().await;
-            if prepared.is_err() {
-                payload_freeze::thaw();
-            }
-            Some(prepared)
+            // The prepare freezes the container itself, once it has refused a guest whose
+            // restore is under way and before it closes the gate: frozen, the container
+            // opens no socket and faults no page while the boundary closes, and a
+            // restored clone starts with it frozen (payload_freeze). A prepare that froze
+            // and then failed thaws it again when the gate is open again, as the resume
+            // does: the host resumes the source on its own when the prepare fails. One
+            // that was refused froze nothing and thaws nothing, because the freeze it
+            // would undo is a restore's.
+            let args: Vec<String> = std::env::args().collect();
+            Some(match snapshot_network::boundary_token(&args) {
+                Err(error) => Err(error),
+                Ok(token) => {
+                    snapshot_network::prepare_snapshot_network(token, payload_freeze::freeze)
+                        .await
+                        .map_err(|failure| {
+                            if failure.thaw {
+                                payload_freeze::thaw();
+                            }
+                            failure.error
+                        })
+                }
+            })
         }
         Some("--resume-snapshot-network") => {
             let args: Vec<String> = std::env::args().collect();
-            let resumed =
-                snapshot_network::resume_source_network(snapshot_network::resume_host_time(&args))
+            Some(match snapshot_network::boundary_token(&args) {
+                Err(error) => Err(error),
+                Ok(token) => {
+                    let resumed = snapshot_network::resume_source_network(
+                        snapshot_network::resume_host_time(&args),
+                        token,
+                    )
                     .await;
-            payload_freeze::thaw();
-            Some(resumed)
+                    // Only behind an open gate. A resume that could not open it, or that
+                    // was another snapshot's, leaves the boundary owed and the container
+                    // frozen for the resume that does.
+                    if resumed.gate_open {
+                        payload_freeze::thaw();
+                    }
+                    if let (Some(OPEN_UNCLEAN_EXIT), Err(error)) =
+                        (open_gate_exit(&resumed), &resumed.result)
+                    {
+                        eprintln!(
+                            "[fc-agent] the gate is open, and the boundary's manifest or mark \
+                             could not be removed: {error:#}"
+                        );
+                        std::process::exit(OPEN_UNCLEAN_EXIT);
+                    }
+                    resumed.result
+                }
+            })
         }
         _ => None,
     };
     if let Some(result) = one_shot_result {
         if let Err(error) = result {
             eprintln!("[fc-agent] snapshot network boundary failed: {error:#}");
-            std::process::exit(1);
+            // The host does not run a refused one-shot again.
+            std::process::exit(failed_one_shot_exit(&error));
         }
         return;
     }
@@ -160,6 +256,9 @@ async fn main() {
         .init();
 
     eprintln!("[fc-agent] starting");
+
+    // A receive barrier that was killed with `rcu_expedited` on (#2141).
+    snapshot_network::put_back_rcu_expedited_after_a_kill();
 
     // Thaws a snapshot boundary's container freeze whose deadline passed with no thaw: a
     // resume that never reached the guest, an fcvm that died mid-snapshot (payload_freeze).
@@ -216,10 +315,16 @@ fn fatal_error_line(error: &anyhow::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// The container is frozen before the boundary's prepare and thawed when the prepare
-    /// fails and when the source resumes; a restored clone thaws it before publication
-    /// (payload_freeze). A freeze with no thaw on one of those paths would leave the
-    /// container stopped, so each is pinned.
+    /// The container is frozen by the boundary's prepare and thawed when a prepare that
+    /// froze it fails with the gate open again and when the source's resume has opened
+    /// the gate; a restored clone
+    /// thaws it before publication (payload_freeze). A freeze with no thaw on one of those
+    /// paths would leave the container stopped, so each is pinned.
+    ///
+    /// Two ways out thaw nothing, on purpose. A prepare that was refused because a
+    /// restore is under way froze nothing: the freeze it would undo is the restore's
+    /// (#2138). A resume that could not open the gate leaves the container frozen for the
+    /// resume that does (#2142).
     #[test]
     fn the_container_is_frozen_across_the_boundary_and_thawed_on_every_way_out() {
         let main = include_str!("main.rs");
@@ -228,15 +333,34 @@ mod tests {
         let prepare = squeezed
             .find("Some(\"--prepare-snapshot-network\")=>{")
             .expect("no prepare one-shot");
-        let freeze = squeezed[prepare..]
-            .contains("payload_freeze::freeze();letprepared=snapshot_network::prepare_snapshot_network().await;ifprepared.is_err(){payload_freeze::thaw();}");
-        assert!(
-            freeze,
-            "the prepare does not freeze first and thaw on failure"
+        let freeze = squeezed[prepare..].contains(
+            "snapshot_network::prepare_snapshot_network(token,payload_freeze::freeze).await\
+             .map_err(|failure|{iffailure.thaw{payload_freeze::thaw();}failure.error})",
         );
         assert!(
-            squeezed.contains(".await;payload_freeze::thaw();Some(resumed)"),
-            "the source resume does not thaw"
+            freeze,
+            "the prepare is not handed the freeze, or does not thaw exactly when it is told to"
+        );
+        assert!(
+            squeezed.contains("ifresumed.gate_open{payload_freeze::thaw();}iflet(Some(OPEN_UNCLEAN_EXIT),Err(error))=(open_gate_exit(&resumed),&resumed.result){")
+                && squeezed.contains("std::process::exit(OPEN_UNCLEAN_EXIT);}resumed.result"),
+            "the source resume does not thaw exactly when the gate is open"
+        );
+        // Inside the prepare: refused before the freeze, and frozen before the gate.
+        let network = include_str!("snapshot_network.rs");
+        let start = network
+            .find("async fn prepare_snapshot_network_in<")
+            .expect("no prepare");
+        let body = &network[start..start + network[start..].find("\n}\n").unwrap()];
+        let refuse = body
+            .rfind("RestoreUnderWay(")
+            .expect("a prepare never refuses");
+        let owed = body.find(".mark_owed(token)").expect("no owed mark");
+        let froze = body.find("freeze();").expect("the prepare never freezes");
+        let boundary = body.find("boundary()").expect("no boundary");
+        assert!(
+            refuse < owed && owed < froze && froze < boundary,
+            "refuse={refuse} owed={owed} freeze={froze} boundary={boundary}"
         );
 
         let restore: String = crate::restore::handle_clone_restore_source()
@@ -260,8 +384,72 @@ mod tests {
         assert!(watchdog < agent && prepare < watchdog);
     }
 
+    /// A boundary one-shot that is refused because a restore is under way exits with the
+    /// status the host reads as "do not ask again" (`reopen_source_network`).
+    #[test]
+    fn a_refused_one_shot_exits_with_the_status_the_host_reads() {
+        use super::snapshot_network::{RestoreUnderWay, SourceResume, StaleResume};
+        // What each way out of a one-shot exits with, from the errors themselves.
+        let restore: anyhow::Error = RestoreUnderWay::of("a source's resume").into();
+        assert_eq!(super::failed_one_shot_exit(&restore), super::REFUSED_EXIT);
+        assert_eq!(
+            super::failed_one_shot_exit(&restore.context("reopening")),
+            super::REFUSED_EXIT
+        );
+        let stale: anyhow::Error = StaleResume { owed: None }.into();
+        assert_eq!(
+            super::failed_one_shot_exit(&stale),
+            super::STALE_RESUME_EXIT
+        );
+        assert_eq!(
+            super::failed_one_shot_exit(&anyhow::anyhow!("nf_tables")),
+            1
+        );
+        let resumed = |gate_open, result| SourceResume { gate_open, result };
+        assert_eq!(super::open_gate_exit(&resumed(true, Ok(()))), Some(0));
+        assert_eq!(
+            super::open_gate_exit(&resumed(true, Err(anyhow::anyhow!("manifest")))),
+            Some(super::OPEN_UNCLEAN_EXIT)
+        );
+        assert_eq!(super::open_gate_exit(&resumed(false, Err(stale))), None);
+        // Three statuses besides 0 and 1, all different, each the one the host reads.
+        let statuses = [
+            ("ONE_SHOT_REFUSED_EXIT", super::REFUSED_EXIT),
+            ("ONE_SHOT_OPEN_UNCLEAN_EXIT", super::OPEN_UNCLEAN_EXIT),
+            ("ONE_SHOT_STALE_EXIT", super::STALE_RESUME_EXIT),
+        ];
+        let host = include_str!("../../src/commands/common.rs");
+        for (name, status) in statuses {
+            assert!(
+                host.contains(&format!("const {name}: i32 = {status};")),
+                "{name}"
+            );
+            assert!(status > 1);
+        }
+        assert!(statuses[0].1 != statuses[1].1 && statuses[1].1 != statuses[2].1);
+        assert_ne!(statuses[0].1, statuses[2].1);
+    }
+
     use super::fatal_error_line;
     use anyhow::Context;
+
+    /// An ERROR event from a library (the FUSE client) is an `ERROR:` line, which the
+    /// console writer never holds back during a restore and the host logs at WARN. The
+    /// other levels keep the plain prefix.
+    #[test]
+    fn an_error_event_is_an_error_line() {
+        assert_eq!(
+            super::event_prefix(&tracing::Level::ERROR),
+            "[fc-agent] ERROR: "
+        );
+        for level in [
+            tracing::Level::WARN,
+            tracing::Level::INFO,
+            tracing::Level::DEBUG,
+        ] {
+            assert_eq!(super::event_prefix(&level), "[fc-agent] ");
+        }
+    }
 
     /// The line names every cause, innermost last, and is one line even when
     /// a cause is a command's multi-line stderr.

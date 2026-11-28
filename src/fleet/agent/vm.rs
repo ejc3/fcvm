@@ -431,12 +431,24 @@ impl Vm {
 
     /// `fcvm <args>` as a supervised VM process, `slot` naming it in the logs.
     pub fn spawn_args(fcvm: &std::path::Path, args: &[String], slot: &str) -> Result<Vm> {
+        Self::spawn_args_in(fcvm, args, slot, |_| {})
+    }
+
+    /// As [`Vm::spawn_args`], with `prepare` given the command before it starts (the potato
+    /// ring puts its VMs in a cgroup that way).
+    pub fn spawn_args_in(
+        fcvm: &std::path::Path,
+        args: &[String],
+        slot: &str,
+        prepare: impl FnOnce(&mut std::process::Command),
+    ) -> Result<Vm> {
         let mut cmd = Command::new(fcvm);
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         arm_pdeathsig(cmd.as_std_mut());
+        prepare(cmd.as_std_mut());
         let mut child = cmd
             .spawn()
             .with_context(|| format!("starting {}", fcvm.display()))?;
@@ -500,6 +512,11 @@ impl Vm {
         };
         self.exit = Some(s);
         s
+    }
+
+    /// Whether fcvm has printed anything yet.
+    pub fn has_tail(&self) -> bool {
+        !self.tail.lock().unwrap().is_empty()
     }
 
     /// The last lines fcvm printed, for a failure report.

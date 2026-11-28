@@ -179,6 +179,12 @@ pub struct LatestMetadata {
     /// (`Plan::guest_mtu`); none keeps what the snapshot's guest had.
     #[serde(rename = "guest-mtu", default)]
     pub guest_mtu: Option<u32>,
+    /// The restoring fcvm takes fc-agent's own lines on the output connection (the `agent`
+    /// stream) and logs them. Absent, as from an fcvm older than the stream, means the
+    /// host would print them as the container's stderr, so this restore's lines all go
+    /// to the serial console (`console::begin_restore`).
+    #[serde(rename = "agent-log", default)]
+    pub agent_log: bool,
     /// The restoring host's identity, which replaces the preparing host's.
     #[serde(flatten)]
     pub identity: RestoreIdentity,
@@ -242,6 +248,21 @@ mod tests {
         assert_eq!(metadata.guest_mtu, Some(65520));
         let metadata: LatestMetadata = serde_json::from_str(r#"{"host-time-ns": "1"}"#).unwrap();
         assert_eq!(metadata.guest_mtu, None);
+    }
+
+    /// `agent-log` as fcvm's `RestoreIdentity::write_into` writes it, and absent, which is
+    /// how a document from an fcvm older than the `agent` stream reads: that host does not
+    /// take fc-agent's lines on the output connection.
+    #[test]
+    fn a_restore_document_without_agent_log_is_a_host_that_does_not_take_the_lines() {
+        let metadata: LatestMetadata =
+            serde_json::from_str(r#"{"host-time-ns": "1", "restore-epoch": "e"}"#).unwrap();
+        assert!(!metadata.agent_log);
+        let metadata: LatestMetadata = serde_json::from_str(
+            r#"{"host-time-ns": "1", "restore-epoch": "e", "agent-log": true}"#,
+        )
+        .unwrap();
+        assert!(metadata.agent_log);
     }
 
     /// The restore document's identity fields, in the shape fcvm's

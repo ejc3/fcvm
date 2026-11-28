@@ -286,3 +286,53 @@ fn config_schema_check_reads_the_active_xdg_path() {
         "XDG_CONFIG_HOME must resolve to its fcvm/rootfs-config.toml child"
     );
 }
+
+/// The counter check compares a vDSO reading with the bracket of two syscall reads, not
+/// with their midpoint: a deschedule between the reads must not fail a healthy clock,
+/// and a real gap (one jump of 2^33 ns, or the 2125 s measured in L2) must still fail.
+/// The script's own `--self-test` holds the cases; it needs no clock and no VM. With
+/// the midpoint comparison the two delayed cases fail.
+#[test]
+fn the_counter_check_passes_a_delayed_reading_and_fails_a_real_gap() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/nested/counter_check.py");
+    let output = std::process::Command::new("python3")
+        .arg(&script)
+        .arg("--self-test")
+        .output()
+        .expect("python3 is needed to run counter_check.py --self-test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("counter_check self-test ok: "),
+        "counter_check.py --self-test failed ({}): {stdout}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `test_nested_l2_user_space_reads_the_kernels_counter` runs as root and runs the
+/// counter check on the host. It must hand the script to python3 on stdin: a file named
+/// `counter_check-<pid>.py` in the shared temp directory could be made first, or
+/// replaced before python3 read it, by any local user.
+#[test]
+fn the_host_counter_check_reaches_python_on_stdin_not_through_a_shared_directory() {
+    let source = nested_test_source();
+    let start = source
+        .find("async fn test_nested_l2_user_space_reads_the_kernels_counter()")
+        .expect("the nested counter test is missing");
+    let end = source[start..]
+        .find("\n}\n")
+        .map(|offset| start + offset)
+        .expect("the nested counter test has no end");
+    let body = &source[start..end];
+    for forbidden in ["temp_dir", "fs::write", "File::create", "/tmp"] {
+        assert!(
+            !body.contains(forbidden),
+            "the nested counter test uses `{forbidden}`: the host's check must not be a file \
+             another user could reach"
+        );
+    }
+    assert!(
+        body.contains(r#".args(["-", "0"])"#) && body.contains("Stdio::piped()"),
+        "the nested counter test no longer pipes counter_check.py to `python3 - 0`"
+    );
+}

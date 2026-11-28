@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Offline checks for publishing and the live IPv4/name-regression probe."""
+import subprocess
+import textwrap
 import importlib.util
 import contextlib
 import fnmatch
@@ -8,9 +10,11 @@ import copy
 import errno
 import ipaddress
 import json
+import types
 import re
 import os
 import socket
+import ssl
 import struct
 import base64
 import hashlib
@@ -35,10 +39,43 @@ smoke, publish = load("smoke", "stage-smoke.py"), load("publish", "publish.py")
 prod = load("prod_release", "prod_release.py")
 
 
+def ssl_context_raising(error):
+    """A TLS context whose handshake raises `error`."""
+    class Context:
+        def wrap_socket(self, raw, server_hostname=None):
+            raise error
+    return Context()
+
+
 class ProbeTests(unittest.TestCase):
     def tile(self):
         return dict(id="fcvm:1", half="fcvm", slot="slot-1", generation=1, phase="running",
                     frame_url="wss://old.fcvm.dev/frames", frame_url_v4="wss://old-v4.fcvm.dev:20200/frames")
+
+    def test_an_unreachable_endpoint_says_whether_tcp_or_tls_failed(self):
+        # Run 45032617135: a relaunched EC2 tile's IPv4 frame socket failed after about 20 s with
+        # "no reachable public endpoint in this family", which said nothing of whether TCP was
+        # refused, TCP timed out or TLS failed. The probe opener (`opener`) re-raises its last
+        # error; the relaunch checks' `public` must too.
+        host = "x-v4.tiles.fcvm.dev"
+        found = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.0.0.1", 443))]
+        with patch.object(smoke.socket, "getaddrinfo", return_value=found):
+            for error in (TimeoutError("timed out"), ConnectionRefusedError(errno.ECONNREFUSED, "refused")):
+                with self.subTest(error=type(error).__name__), \
+                        patch.object(smoke.socket, "create_connection", side_effect=error), \
+                        self.assertRaises(type(error)) as caught:
+                    smoke.public(host, 443, "v4")
+                self.assertIn(smoke.fixed(caught.exception)[1], ("timed out", "ECONNREFUSED"))
+            # TCP answered and the TLS handshake did not finish.
+            near, far = socket.socketpair()
+            self.addCleanup(far.close)
+            context = ssl_context_raising(socket.timeout("_ssl.c: The handshake operation timed out"))
+            with patch.object(smoke.socket, "create_connection", return_value=near), \
+                    patch.object(smoke.ssl, "create_default_context", return_value=context), \
+                    self.assertRaises(RuntimeError) as caught:
+                smoke.public(host, 443, "v4")
+            self.assertEqual(smoke.describe(caught.exception), "the TLS handshake did not finish in time")
+            self.assertEqual(near.fileno(), -1, "the TCP socket is closed")
 
     def test_a_running_tile_without_ipv4_never_passes(self):
         tile = self.tile()
@@ -339,9 +376,9 @@ class FailureTests(unittest.TestCase):
 
 
 class ReconnectTests(unittest.TestCase):
-    def run_probe(self, at, *, failures=1, wire="eof", advance=0):
+    def run_probe(self, at, *, failures=1, wire="eof", advance=0, open_cost=0):
         clock, connections, intents, frames, seats, deadlines = [100.0], [], [], [], [], []
-        closed = [0]
+        closed, attempts, applied = [0], [], set()
         def tile(half, generation=1):
             name = f"{half}-{generation}"
             return {"id": half + ":1", "half": half, "slot": half + "-1", "generation": generation,
@@ -367,6 +404,8 @@ class ReconnectTests(unittest.TestCase):
             def __init__(self, *args):
                 self.number, self.closed = len(connections), False
                 connections.append(self)
+                if self.number:
+                    clock[0] += open_cost
                 admission = {"type": "admission", "seat": "synthetic-seat", "locked": False,
                              "capacity": 500, "direct": {"value": f"token-{self.number}"}}
                 snapshot = {"type": "snapshot", "state": copy.deepcopy(state)}
@@ -381,11 +420,25 @@ class ReconnectTests(unittest.TestCase):
                     return
                 if not hasattr(self, "first"):
                     raise AssertionError("an intent preceded the seat message")
+                attempts.append(message["id"])
+                if at == "send_eof" and self.number == 0:
+                    # The connection died while the probe was not reading: the intent never
+                    # leaves (run 44764745380).
+                    raise ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
                 intents.append(message)
+                if message["id"] in applied and at == "receipt_always":
+                    self.queue.append(None)
+                    return
+                if message["id"] in applied:
+                    # A repeated id gets its first receipt and changes nothing.
+                    self.queue.append({"type": "receipt", "id": message["id"], "outcome": "committed"})
+                    self.queue.append({"type": "snapshot", "state": copy.deepcopy(state)})
+                    return
+                applied.add(message["id"])
                 half = message["args"]["tile"].split(":")[0]
                 state["tiles"] = [tile(t["half"], 2 if t["half"] == half else t["generation"])
                                   for t in state["tiles"]]
-                if at == "receipt":
+                if (at == "receipt" and self.number == 0) or at == "receipt_always":
                     self.queue.append(None)
                     return
                 self.queue.append({"type": "receipt", "id": message["id"], "outcome": "committed"})
@@ -424,7 +477,10 @@ class ReconnectTests(unittest.TestCase):
             except Exception as caught:
                 error = caught
         return dict(error=error, connections=connections, intents=intents, frames=frames,
-                    seats=seats, deadlines=deadlines, output=output.getvalue())
+                    seats=seats, deadlines=deadlines, attempts=attempts,
+                    # Without the commit attribution lines (SmokeCommitTests covers them).
+                    output="".join(line for line in output.getvalue().splitlines(keepends=True)
+                                   if '"tested_commit"' not in line and "not this run's" not in line))
 
     def test_cold_readiness_eof_reuses_the_seat_and_waits_for_a_new_token(self):
         result = self.run_probe("cold")
@@ -465,11 +521,42 @@ class ReconnectTests(unittest.TestCase):
         self.assertEqual(str(result["error"]), "masked server frame")
         self.assertEqual(len(result["connections"]), 1)
 
-    def test_a_close_before_the_receipt_fails_without_replaying_the_intent(self):
+    def test_a_close_before_the_receipt_reconnects_and_sends_the_same_intent_id(self):
+        # fleet/PROTOCOL.md: a page sends an intent again after it reconnects, and the coordinator
+        # answers an id it has seen with that id's first receipt and changes nothing.
         result = self.run_probe("receipt")
-        self.assertIsInstance(result["error"], RuntimeError)
-        self.assertEqual(len(result["connections"]), 1)
-        self.assertEqual(len(result["intents"]), 1)
+        self.assertIsNone(result["error"])
+        self.assertEqual(len(result["connections"]), 2)
+        self.assertEqual(result["seats"], [None, "synthetic-seat"])
+        fcvm = [i["id"] for i in result["intents"] if i["args"]["tile"] == "fcvm:1"]
+        self.assertEqual(len(fcvm), 2)
+        self.assertEqual(len(set(fcvm)), 1, "the replay reuses the intent's id")
+        self.assertEqual(json.loads(result["output"].splitlines()[0]), {"reconnect": 1})
+        self.assertTrue(all(c.closed for c in result["connections"]))
+
+    def test_an_intent_sent_on_a_dead_connection_is_sent_again_on_a_new_one(self):
+        # Run 44764745380: the probe sent the EC2 relaunch onto a /live connection that had
+        # closed while it was not reading, and stopped with SSLEOFError.
+        result = self.run_probe("send_eof")
+        self.assertIsNone(result["error"])
+        self.assertEqual(len(result["connections"]), 2)
+        self.assertEqual(result["attempts"][0], result["attempts"][1], "the same intent id, sent again")
+        self.assertEqual([i["args"]["tile"] for i in result["intents"]], ["fcvm:1", "ec2:1"])
+        self.assertEqual(json.loads(result["output"].splitlines()[0]), {"reconnect": 1})
+
+    def test_no_intent_is_sent_once_its_wait_has_run_out(self):
+        # Greptile on #2003: opening the replacement connection can use the rest of the wait,
+        # and the intent must not go out after it.
+        result = self.run_probe("receipt", open_cost=1000)
+        self.assertIsInstance(result["error"], TimeoutError)
+        self.assertEqual(len(result["connections"]), 2)
+        self.assertEqual(len(result["attempts"]), 1, "the intent was sent after its wait ran out")
+
+    def test_intent_replays_share_the_three_reconnects(self):
+        result = self.run_probe("receipt_always")
+        self.assertIsInstance(result["error"], smoke.WebSocketClosed)
+        self.assertEqual(len(result["connections"]), 4)
+        self.assertEqual(len(set(result["attempts"])), 1)
 
     def test_a_renderer_close_is_not_a_coordinator_reconnect(self):
         result = self.run_probe("renderer")
@@ -899,25 +986,43 @@ class ViewerPathFlowTests(unittest.TestCase):
     """main() with modes: it waits for every mode to settle, probes every tile, borrows a
     Minecraft server and gives it back, and needs a potato catch it saw."""
 
-    def run_flow(self, claim="committed", catch=True):
-        clock, sent, probed = [100.0], [], []
+    def run_flow(self, claim="committed", catch=True, drop_claim=False, claims=None, claimed_at=None):
+        """`claims`: the receipts the claims get in turn, as (outcome, reason); after them every
+        claim gets `claim`. `claimed_at` collects the clock at each claim sent."""
+        clock, sent, probed, opened = [100.0], [], [], []
+        claims = list(claims or [])
         tile = lambda i, **k: {"id": f"t:{i}", "slot": f"s-{i}", "half": "fcvm", "phase": "running",
                                "frame_url": "wss://x.tiles.fcvm.dev/frames", "frame_url_v4": None, **k}
         state = {"tiles": [tile(1)], "phones": {"tiles": [tile(2)]}, "windows": {"tiles": [tile(3, phase="restoring")]},
                  "minecraft": {"tiles": [tile(4)]}, "potato": {"capacity": 4, "round": {"seq": 7}}}
         class Live:
             def __init__(self, *a, **k):
-                self.queue = [{"type": "hello", "viewer": "v-1"},
-                              {"type": "admission", "capacity": 500, "direct": {"value": "tok"}},
+                opened.append(self)
+                # Each connection is its own viewer with its own direct token.
+                self.viewer = "v-1" if len(opened) == 1 else f"v-{len(opened)}"
+                token = "tok" if len(opened) == 1 else f"tok-{len(opened)}"
+                self.queue = [{"type": "hello", "viewer": self.viewer},
+                              {"type": "admission", "capacity": 500, "direct": {"value": token}},
                               {"type": "snapshot", "state": copy.deepcopy(state)}]
             def send(self, m):
                 if m.get("type") != "intent":
                     return
+                if drop_claim and m["name"] == "claim_minecraft" and len(opened) == 1:
+                    # The connection closed while the probe was not reading: the claim never
+                    # leaves, and the probe claims again on a new connection.
+                    raise ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
                 sent.append(m["name"])
-                self.queue.append({"type": "receipt", "id": m["id"],
-                                   "outcome": claim if m["name"] == "claim_minecraft" else "committed"})
-                if m["name"] == "claim_minecraft" and claim == "committed":
-                    state["minecraft"]["tiles"][0]["borrowed"] = {"viewer": "v-1"}
+                outcome, reason = "committed", None
+                if m["name"] == "claim_minecraft":
+                    outcome, reason = claims.pop(0) if claims else (claim, None)
+                    if claimed_at is not None:
+                        claimed_at.append(clock[0])
+                receipt = {"type": "receipt", "id": m["id"], "outcome": outcome}
+                if reason is not None:
+                    receipt["reason"] = reason
+                self.queue.append(receipt)
+                if m["name"] == "claim_minecraft" and outcome == "committed":
+                    state["minecraft"]["tiles"][0]["borrowed"] = {"viewer": self.viewer}
                     self.queue.append({"type": "snapshot", "state": copy.deepcopy(state)})
             def message(self, deadline):
                 clock[0] += 1
@@ -945,6 +1050,14 @@ class ViewerPathFlowTests(unittest.TestCase):
             failed = smoke.main(family="v6", modes=smoke.MODES, relaunch=False, takeover=True)
         return failed, sent, probed, [json.loads(l) for l in out.getvalue().splitlines()]
 
+    def test_a_take_over_claimed_on_a_new_connection_is_that_connections(self):
+        # Greptile on #2003: a claim sent again on a new connection belongs to that connection's
+        # viewer, so the take-over must look for that viewer and stream with that token.
+        failed, sent, probed, lines = self.run_flow(drop_claim=True)
+        self.assertEqual(failed, 0, lines)
+        self.assertEqual(sent, ["claim_minecraft", "release_minecraft"])
+        self.assertEqual([(m, i, a) for m, i, a, t in probed if t], [("minecraft", "t:4", "tok-2")])
+
     def test_every_mode_is_probed_after_it_settles_and_the_borrow_is_returned(self):
         failed, sent, probed, lines = self.run_flow()
         self.assertEqual(failed, 0, lines)
@@ -958,7 +1071,122 @@ class ViewerPathFlowTests(unittest.TestCase):
         self.assertEqual(failed, 2)
         self.assertEqual(sent, ["claim_minecraft"], "nothing was lent, so nothing is given back")
         errors = {l.get("error") for l in lines if l.get("ok") is False}
-        self.assertEqual(errors, {"the coordinator refused the take-over", "no verified catch while the smoke watched"})
+        self.assertEqual(errors, {"the coordinator refused the take-over: an unlisted reason",
+                                  "no verified catch while the smoke watched"})
+
+    def test_a_take_over_refused_for_the_borrow_cooldown_waits_it_out_and_claims_again(self):
+        # 45149219637 (2026-11-23): the IPv6 viewer claimed 49 s after the previous run's IPv6
+        # viewer, from another runner in the same /64, gave its server back. The coordinator's
+        # per-client cooldown refused it, and the smoke failed on its own previous run.
+        claimed_at = []
+        failed, sent, probed, lines = self.run_flow(
+            claims=[("refused", "your last server was returned 49 s ago; borrow again in 11 s")],
+            claimed_at=claimed_at)
+        self.assertEqual(failed, 0, lines)
+        self.assertEqual(sent, ["claim_minecraft", "claim_minecraft", "release_minecraft"])
+        # What the receipt said was left, plus the clock skew; and the passing line says so.
+        self.assertGreaterEqual(claimed_at[1] - claimed_at[0], 11 + smoke.CLOCK_SKEW_SECONDS)
+        self.assertLess(claimed_at[1] - claimed_at[0], smoke.minecraft_claim_cooldown_seconds())
+        self.assertEqual([(m, i) for m, i, a, t in probed if t], [("minecraft", "t:4")])
+        self.assertEqual([l.get("claimWaitedS") for l in lines if l.get("tile") == "t:4 take-over"],
+                         [11 + smoke.CLOCK_SKEW_SECONDS])
+
+    def test_a_cooldown_refusal_that_names_no_time_waits_the_whole_cooldown(self):
+        claimed_at = []
+        failed, sent, _, lines = self.run_flow(
+            claims=[("refused", "your last server was returned recently; borrow again in a while")],
+            claimed_at=claimed_at)
+        self.assertEqual(failed, 0, lines)
+        self.assertEqual(sent, ["claim_minecraft", "claim_minecraft", "release_minecraft"])
+        self.assertGreaterEqual(claimed_at[1] - claimed_at[0],
+                                smoke.minecraft_claim_cooldown_seconds() + smoke.CLOCK_SKEW_SECONDS)
+
+    def test_a_refused_take_over_says_why_and_claims_once_for_anything_but_the_cooldown(self):
+        failed, sent, _, lines = self.run_flow(
+            claims=[("refused", "1 of 1 servers are already lent; the next comes back in 40 s")])
+        self.assertEqual(failed, 1, lines)
+        self.assertEqual(sent, ["claim_minecraft"])
+        self.assertIn("the coordinator refused the take-over: every server that may be lent is lent",
+                      {l.get("error") for l in lines if l.get("ok") is False})
+
+    def test_a_take_over_still_refused_after_the_cooldown_fails_with_the_second_reason(self):
+        failed, sent, _, lines = self.run_flow(
+            claims=[("refused", "your last server was returned 49 s ago; borrow again in 11 s"),
+                    ("refused", "no server can be lent now: none is running and free")])
+        self.assertEqual(failed, 1, lines)
+        self.assertEqual(sent, ["claim_minecraft", "claim_minecraft"])
+        self.assertIn("the coordinator refused the take-over: no server is running and free",
+                      {l.get("error") for l in lines if l.get("ok") is False})
+
+    def test_every_claim_refusal_category_is_still_a_core_refusal(self):
+        # Each matched text is still what claim_minecraft, the asleep gate of the claims or
+        # spend::SPENT says; a text the core stopped using would fall to "an unlisted reason".
+        source = (Path(smoke.__file__).resolve().parent.parent / "core/src/apply.rs").read_text()
+        body = source.split("fn claim_minecraft(", 1)[1].split("\n}\n", 1)[0]
+        gate = source.split("| Intent::ClaimMinecraft { .. }\n            if state.fleet.power.state == \"asleep\" =>", 1)[1][:200]
+        spend = (Path(smoke.__file__).resolve().parent.parent / "core/src/spend.rs").read_text()
+        where = {"GPUs are asleep": gate, "budget is spent": spend}
+        for text, _ in smoke.CLAIM_REFUSALS:
+            self.assertIn(text, where.get(text, body), f"{text!r} is no longer a refusal of a claim")
+
+
+class FleetCauseTests(unittest.TestCase):
+    """A tile that is not running, or a mode with no tiles, carries the fleet-level cause its
+    snapshot names. On 2026-11-23 (45259946877) every fcvm tile failed "the tile is not
+    running" for 11 minutes while EC2 refused the staging GPU host for the account's G vCPU
+    quota, and on 2026-11-21 (44943869756) every prod mode reported no tiles while the spend
+    ceiling held the fleet asleep; both causes were in the snapshot and only the coordinator's
+    log said so."""
+
+    def lines(self, state):
+        _, failed = smoke.sweep_jobs(state, ("wall", "phones"), "v4", None, "v-1", [])
+        return [p.line() for p in failed]
+
+    def test_a_quota_refused_host_launch_is_the_cause_of_tiles_not_running(self):
+        state = {"tiles": [{"id": "fcvm:1", "half": "fcvm", "phase": "restoring"}],
+                 "fleet": {"power": {"state": "waking"}},
+                 "failures": [{"kind": "coordinator_degraded", "component": "scale", "since": 1,
+                               "reason": "us-east-1 on-demand: VcpuLimitExceeded: You have requested more vCPU capacity"}]}
+        lines = self.lines(state)
+        self.assertEqual({(l["tile"], l["error"]) for l in lines},
+                         {("fcvm:1", "the tile is not running"), (None, "the coordinator reports no tiles of this mode")})
+        self.assertEqual({l.get("cause") for l in lines}, {"EC2 refused a GPU host launch for the account's quota"})
+
+    def test_the_spend_ceiling_is_the_cause_of_no_tiles(self):
+        lines = self.lines({"fleet": {"power": {"state": "asleep", "reason": "budget"}}})
+        self.assertEqual(len(lines), 2)
+        self.assertEqual({l.get("cause") for l in lines}, {"the day's spend ceiling holds the fleet asleep"})
+
+    def test_another_scale_failure_and_none_are_told_apart(self):
+        other = {"tiles": [{"id": "fcvm:1", "half": "fcvm", "phase": "restoring"}],
+                 "failures": [{"kind": "coordinator_degraded", "component": "scale",
+                               "reason": "us-east-1: listing hosts: timed out VcpuLimitExceeded"},
+                              {"kind": "coordinator_degraded", "component": "text_check", "reason": "VcpuLimitExceeded"}]}
+        self.assertEqual({l.get("cause") for l in self.lines(other)}, {"the coordinator's GPU host scaling is degraded"})
+        plain = {"tiles": [{"id": "fcvm:1", "half": "fcvm", "phase": "restoring"}]}
+        self.assertTrue(all("cause" not in l for l in self.lines(plain)))
+
+    def test_the_gpu_hosts_are_no_cause_for_an_ec2_tile_and_the_budget_is(self):
+        quota = {"kind": "coordinator_degraded", "component": "scale",
+                 "reason": "us-east-1 on-demand: VcpuLimitExceeded: You have requested more vCPU capacity"}
+        tiles = [{"id": "ec2:1", "half": "ec2", "phase": "starting"}, {"id": "phone:1", "phase": "restoring"}]
+        state = {"tiles": tiles[:1], "phones": {"tiles": tiles[1:]}, "failures": [quota]}
+        causes = {l["tile"]: l.get("cause") for l in self.lines(state)}
+        self.assertEqual(causes, {"ec2:1": None, "phone:1": "EC2 refused a GPU host launch for the account's quota"})
+        state["fleet"] = {"power": {"state": "asleep", "reason": "budget"}}
+        self.assertEqual({l.get("cause") for l in self.lines(state)}, {"the day's spend ceiling holds the fleet asleep"})
+
+    def test_the_quota_codes_are_the_coordinators(self):
+        self.assertEqual(smoke.quota_codes(), ("VcpuLimitExceeded", "MaxSpotInstanceCountExceeded"))
+
+    def test_the_job_summaries_show_the_cause(self):
+        root = Path(smoke.__file__).resolve().parent.parent.parent
+        for workflow in ("fleet-viewer-smoke.yml", "fleet-prod-smoke.yml"):
+            text = (root / ".github/workflows" / workflow).read_text()
+            rows = [l for l in text.splitlines() if "jq -r 'select(.ok == false" in l]
+            self.assertEqual(len(rows), 2, workflow)
+            for row in rows:
+                self.assertIn('\\(.cause // "-")', row, workflow)
 
 
 class PotatoEvidenceTests(unittest.TestCase):
@@ -1243,6 +1471,12 @@ class AttributionTests(unittest.TestCase):
                         # region/instance (test_an_ec2_tile_is_attributed_to_its_bare_instance_id
                         # pins that format): only the field is checked here.
                         self.assertTrue(isinstance(tile.get("vm"), str) and tile["vm"], "an EC2 tile names no vm")
+                    elif tile.get("half") == "lambda":
+                        # A Lambda tile runs in a Lambda environment (`vm`) on an instance the
+                        # fleet cannot see, not on a host image the release gate judges: it names
+                        # an environment and is attributed to nothing.
+                        self.assertTrue(isinstance(tile.get("vm"), str) and tile["vm"], "a Lambda tile names no vm")
+                        self.assertEqual(smoke.tile_attribution(tile), ([], []))
                     else:
                         hosts, instances = smoke.tile_attribution(tile)
                         self.assertTrue(hosts or instances, "a running tile /live names no host or instance for")
@@ -1257,8 +1491,8 @@ class AttributionTests(unittest.TestCase):
         # Every kind of probe the smoke attributes from a tile appears in some vector. The potato
         # game's host is pinned by 33_potato.json's /view/potato/host checks: its final view is
         # after the host has gone.
-        for kind in (("wall", "fcvm"), ("wall", "ec2"), ("phones", "fcvm"), ("windows", "fcvm"),
-                     ("minecraft", "fcvm"), ("aggregate", "fcvm")):
+        for kind in (("wall", "fcvm"), ("wall", "ec2"), ("wall", "lambda"), ("phones", "fcvm"),
+                     ("windows", "fcvm"), ("minecraft", "fcvm"), ("aggregate", "fcvm")):
             self.assertIn(kind, seen)
 
     def test_the_summary_line_holds_digests_and_no_line_holds_an_id(self):
@@ -1323,6 +1557,74 @@ class HostLocalTests(unittest.TestCase):
                 patch.object(smoke, "live_target", live_target), contextlib.redirect_stdout(io.StringIO()), \
                 self.assertRaises(Stop):
             smoke.main(family="v6", modes=("wall",), relaunch=False)
+
+
+class SmokeHoldTests(unittest.TestCase):
+    """A drill (the prod Spot reclaim) needs a viewer holding a seat, or the fleet sleeps under it.
+    --hold-seconds keeps the smoke's seat after the viewer path and then checks every tile again."""
+
+    def run_main(self, **kw):
+        clock, opened, paths = [100.0], [], []
+        class Live:
+            def __init__(self, *a, **k):
+                opened.append(self)
+                self.queue = [{"type": "hello", "viewer": "v-1"}, {"type": "admission", "capacity": 5},
+                              {"type": "snapshot", "state": {"tiles": []}}]
+            def send(self, m): pass
+            def message(self, deadline):
+                clock[0] += 5
+                if clock[0] >= deadline:
+                    raise TimeoutError()
+                return 1, json.dumps(self.queue.pop(0) if self.queue else {"type": "snapshot", "state": {"tiles": []}}).encode()
+            def close(self): pass
+        def viewer_path(family, modes, takeover, resolvers, until, commit, now, settle_seconds):
+            until(lambda s: True)
+            paths.append(clock[0])
+            return 0
+        env = {"STAGING_API_URL": "https://api.example.test", "STAGING_ORIGIN": "https://stage.example.test",
+               "CF_ACCESS_CLIENT_ID": "synthetic-id", "CF_ACCESS_CLIENT_SECRET": "synthetic-secret"}
+        def get(url, headers=None):
+            return ((403 if url.endswith("/agent") else 200), {}, b"") if headers else (
+                302, {"Location": "https://login.cloudflareaccess.com/login"}, b"")
+        out = io.StringIO()
+        with patch.dict(os.environ, env), patch.object(smoke, "Socket", Live), patch.object(smoke, "get", get), \
+                patch.object(smoke, "prove_viewer", lambda f, s: None), patch.object(smoke, "viewer_path", viewer_path), \
+                patch.object(smoke.time, "monotonic", lambda: clock[0]), contextlib.redirect_stdout(out):
+            failed = smoke.main(family="v4", modes=("wall",), relaunch=False, **kw)
+        return failed, paths, len(opened), out.getvalue()
+
+    def test_a_held_seat_runs_the_viewer_path_again_after_the_hold_on_one_connection(self):
+        failed, paths, connections, out = self.run_main(hold_seconds=1800)
+        self.assertEqual(failed, 0)
+        self.assertEqual(len(paths), 2)
+        self.assertGreaterEqual(paths[1] - paths[0], 1800)
+        self.assertEqual(connections, 1)
+        self.assertIn('"held": 1800', out)
+
+    def test_without_a_hold_the_viewer_path_runs_once(self):
+        self.assertEqual(len(self.run_main()[1]), 1)
+
+    def test_the_hold_argument_is_bounded_and_needs_modes(self):
+        self.assertEqual(smoke.arguments(["--modes", "wall"])["hold_seconds"], 0)
+        self.assertEqual(smoke.arguments(["--modes", "wall", "--hold-seconds", "1800"])["hold_seconds"], 1800)
+        for argv in (["--modes", "wall", "--hold-seconds", "1801"], ["--modes", "wall", "--hold-seconds", "-1"],
+                     ["--broadcast", "--hold-seconds", "60"],
+                     # A mode list that normalizes to nothing would run unheld.
+                     ["--modes", ",", "--broadcast", "--hold-seconds", "60"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                smoke.arguments(argv)
+
+    def test_only_a_dispatch_holds_and_its_job_gets_the_time(self):
+        wf = (HERE.parent.parent / ".github/workflows/fleet-prod-smoke.yml").read_text()
+        self.assertIn('HOLD_MINUTES: ${{ inputs.hold_minutes || \'0\' }}', wf)
+        # 10#: "010" is ten minutes, not octal eight, and "08" is not an arithmetic error.
+        self.assertIn('--hold-seconds "$((10#$HOLD_MINUTES * 60))"', wf)
+        for given, seconds in (("010", "600"), ("08", "480"), ("0", "0")):
+            got = subprocess.run(["bash", "-c", 'echo "$((10#$HOLD_MINUTES * 60))"'], env={"HOLD_MINUTES": given},
+                                 capture_output=True, text=True, check=True).stdout.strip()
+            self.assertEqual(got, seconds, given)
+        self.assertIn("timeout-minutes: ${{ (inputs.hold_minutes || '0') != '0' && 90 || 45 }}", wf)
+        self.assertNotIn("${{ inputs.hold_minutes }}\n", wf.split("run: |", 1)[1].split("\n\n", 1)[0])
 
 
 class SmokeWorkflowTests(unittest.TestCase):
@@ -1554,6 +1856,379 @@ class ReleaseInvocationTests(unittest.TestCase):
         self.assertEqual(len(sleeps), 10)
 
 
+class LaneReleaseTests(unittest.TestCase):
+    """The staging release with the Lambda lane: off (FLEET_LAMBDA_LANE unset or off) it is exactly the release
+    without a lane; on, it asks the release function which lane image the coordinator runs, selects the lane build
+    that pairs with this commit for staging (fleet/lambda/release.py), and releases with that digest. A release
+    that fails puts the selection back unless the function reports the new lane image running."""
+
+    DIGEST = "sha256:" + "c" * 64
+    RUNNING = "sha256:" + "1" * 64
+    SELECTED = "sha256:" + "2" * 64
+    BEFORE = {"current": RUNNING, "previous": "sha256:" + "0" * 64, "next": RUNNING}
+    OLDER, NEWER = "9" * 40, "e" * 40  # an ancestor and a descendant of the run's commit, "a" * 40
+
+    def run_publish(self, results, lane=None):
+        results, events = list(results), []
+        def command(args, body=None, env=None, allow_missing=False):
+            if args[1] == "ecr":
+                return json.dumps({"imageDetails": [{"imageDigest": self.DIGEST}]})
+            events.append(("invoke", json.loads(body)))
+            outcome = results.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            Path(args[-1]).write_text(json.dumps(outcome))
+            return json.dumps({"StatusCode": 200})
+        def select_lane(stack, running, commit):
+            events.append(("select", stack, running, commit))
+            return self.SELECTED, dict(self.BEFORE)
+        def restore_lane(stack, before):
+            events.append(("restore", stack, before))
+        def is_ancestor(older, newer):
+            # Strict: publish.py never asks about a commit and itself (its `c != commit` guard).
+            assert older != newer, "asked whether a commit is its own ancestor"
+            events.append(("ancestry", older, newer))
+            return (older, newer) in {("9" * 40, "a" * 40), ("a" * 40, "e" * 40), ("9" * 40, "e" * 40)}
+        github_output = tempfile.NamedTemporaryFile("r", delete=False)
+        self.addCleanup(os.unlink, github_output.name)
+        env = {"GITHUB_SHA": "a" * 40, "COORDINATOR_REPO": "111122223333.dkr.ecr.us-east-2.amazonaws.com/fcvm-fleet/coordinator",
+               "COORDINATOR_RELEASE": "fcvm-coordinator-release", "GITHUB_OUTPUT": github_output.name}
+        if lane is not None:
+            env["FLEET_LAMBDA_LANE"] = lane
+        out = io.StringIO()
+        with patch.dict(os.environ, env), patch.object(publish, "command", command), \
+                patch.object(publish, "select_lane", select_lane), patch.object(publish, "restore_lane", restore_lane), \
+                patch.object(publish, "commit_is_ancestor", is_ancestor), \
+                patch.object(publish.time, "sleep", lambda s: None), contextlib.redirect_stdout(out):
+            if lane is None:
+                os.environ.pop("FLEET_LAMBDA_LANE", None)
+            try:
+                publish.main()
+                error = None
+            except Exception as caught:
+                error = caught
+        self.printed = [json.loads(line) for line in out.getvalue().splitlines() if line.startswith("{")]
+        self.github_output = Path(github_output.name).read_text()
+        return events, error
+
+    def release_payload(self):
+        return {"commit": "a" * 40, "digest": self.DIGEST, "lambda_digest": self.SELECTED}
+
+    def test_with_the_lane_off_the_release_is_exactly_todays(self):
+        for lane in (None, "", "off"):
+            with self.subTest(lane=lane):
+                events, error = self.run_publish([{"status": "deployed", "digest": self.DIGEST}], lane)
+                self.assertIsNone(error)
+                self.assertEqual(events, [("invoke", {"commit": "a" * 40, "digest": self.DIGEST})])
+
+    def test_with_the_lane_on_the_release_carries_the_selected_build_in_order(self):
+        events, error = self.run_publish([
+            {"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]},
+            {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.SELECTED}], "on")
+        self.assertIsNone(error)
+        self.assertEqual(events, [("invoke", {"action": "lane"}), ("ancestry", "a" * 40, self.OLDER),
+                                  ("select", "stage", self.RUNNING, "a" * 40), ("invoke", self.release_payload())])
+
+    def test_a_release_of_an_ancestor_of_what_staging_runs_fails_the_release_step(self):
+        # Invariant 1 again, under the release step: the order step decides the skip, so a descendant found here
+        # means staging moved between the two steps. Nothing is selected or released, and the step fails rather
+        # than conclude success for a release it did not make (prod's release discovery reads that conclusion).
+        events, error = self.run_publish([{"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.NEWER]}], "on")
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("staging runs a descendant", str(error))
+        self.assertEqual(events, [("invoke", {"action": "lane"}), ("ancestry", "a" * 40, self.NEWER)])
+
+    def test_staging_running_this_very_commit_is_released_normally(self):
+        events, error = self.run_publish([{"status": "ok", "lambda_digest": self.RUNNING, "commits": ["a" * 40]},
+                                          {"status": "unchanged", "digest": self.DIGEST, "lambda_digest": self.SELECTED}], "on")
+        self.assertIsNone(error)
+        self.assertEqual(events, [("invoke", {"action": "lane"}), ("select", "stage", self.RUNNING, "a" * 40),
+                                  ("invoke", self.release_payload())])
+
+    def run_order(self, results, lane="on"):
+        results, sent = list(results), []
+        def invoke(function, payload):
+            sent.append(payload)
+            return results.pop(0)
+        def is_ancestor(older, newer):
+            assert older != newer
+            return (older, newer) in {("a" * 40, "e" * 40)}
+        github_output = tempfile.NamedTemporaryFile("r", delete=False)
+        self.addCleanup(os.unlink, github_output.name)
+        env = {"GITHUB_SHA": "a" * 40, "COORDINATOR_RELEASE": "fcvm-coordinator-release",
+               "GITHUB_OUTPUT": github_output.name}
+        if lane is not None:
+            env["FLEET_LAMBDA_LANE"] = lane
+        out = io.StringIO()
+        with patch.dict(os.environ, env), patch.object(publish, "invoke", invoke), \
+                patch.object(publish, "commit_is_ancestor", is_ancestor), \
+                patch.object(publish, "command", side_effect=AssertionError("the order step pushes nothing")), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as exit:
+            if lane is None:
+                os.environ.pop("FLEET_LAMBDA_LANE", None)
+            publish.run(["--order"])
+            raise SystemExit(0)
+        return exit.exception.code, sent, Path(github_output.name).read_text()
+
+    def test_the_order_step_skips_the_release_of_an_ancestor_before_any_release_call(self):
+        # The workflow's release step runs only when this says release, so a skipped run's release step
+        # concludes "skipped" and prod's release discovery (prod_release.released) never takes it.
+        code, sent, out = self.run_order([{"status": "ok", "lambda_digest": None, "commits": [self.NEWER]}])
+        self.assertEqual((code, sent, out), (0, [{"action": "lane"}], "skip=true\n"))
+        code, sent, out = self.run_order([{"status": "ok", "lambda_digest": None, "commits": [self.OLDER]}])
+        self.assertEqual((code, out), (0, "skip=false\n"))
+        code, sent, out = self.run_order([{"status": "ok", "lambda_digest": None, "commits": ["a" * 40]}])
+        self.assertEqual((code, out), (0, "skip=false\n"))
+        # Lane off: nothing is asked, nothing skipped.
+        for lane in (None, "off"):
+            code, sent, out = self.run_order([], lane=lane)
+            self.assertEqual((code, sent, out), (0, [], "skip=false\n"))
+        # An answer that cannot order fails the step: the release does not run.
+        code, sent, out = self.run_order([{"status": "ok", "lambda_digest": None, "commits": []}])
+        self.assertEqual((code, out), (1, ""))
+
+    def test_a_lane_answer_with_no_running_commit_releases_nothing(self):
+        # A running image with no commit tag cannot be ordered: the gate fails closed.
+        events, error = self.run_publish([{"status": "ok", "lambda_digest": self.RUNNING, "commits": []}], "on")
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(events, [("invoke", {"action": "lane"})])
+
+    def git(self, codes):
+        calls, codes = [], iter(codes)
+        def run(args, **kwargs):
+            calls.append(args[:4])
+            return types.SimpleNamespace(returncode=next(codes), stdout="", stderr="")
+        return calls, patch.object(publish.subprocess, "run", side_effect=run)
+
+    def test_a_failed_fetch_is_not_called_a_missing_commit(self):
+        calls, p = self.git([128, 128])  # not in the checkout's main, the fetch fails
+        with p, self.assertRaises(RuntimeError) as raised:
+            publish.commit_is_ancestor("a" * 40, "e" * 40)
+        self.assertIn("could not fetch main", str(raised.exception))
+        self.assertNotIn("does not contain", str(raised.exception))
+
+    def test_a_running_commit_newer_than_the_checkout_is_fetched_before_ordering(self):
+        calls, p = self.git([128, 0, 0, 0])  # not here, fetch, on main now, an ancestor
+        with p:
+            self.assertTrue(publish.commit_is_ancestor("a" * 40, "e" * 40))
+        self.assertEqual(calls, [["git", "merge-base", "--is-ancestor", "e" * 40], ["git", "fetch", "--quiet", "origin"],
+                                 ["git", "merge-base", "--is-ancestor", "e" * 40], ["git", "merge-base", "--is-ancestor", "a" * 40]])
+        calls, p = self.git([0, 0])  # on the checkout's main: no fetch
+        with p:
+            self.assertTrue(publish.commit_is_ancestor("a" * 40, "e" * 40))
+        self.assertEqual(len(calls), 2)
+
+    def test_a_running_commit_from_another_branch_stops_the_release(self):
+        # In the checkout (fetch-depth 0 brings every branch) but not on main, even after a fetch: refused,
+        # never ordered as "not an ancestor".
+        calls, p = self.git([1, 0, 1])
+        with p, self.assertRaisesRegex(RuntimeError, "main does not contain"):
+            publish.commit_is_ancestor("a" * 40, "e" * 40)
+        self.assertEqual(calls[-1], ["git", "merge-base", "--is-ancestor", "e" * 40])
+
+    def test_a_lane_answer_without_the_running_commits_releases_nothing(self):
+        events, error = self.run_publish([{"status": "ok", "lambda_digest": self.RUNNING}], "on")
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(events, [("invoke", {"action": "lane"})])
+
+    def test_a_first_lane_release_selects_with_nothing_running(self):
+        events, error = self.run_publish([
+            {"status": "ok", "lambda_digest": None, "commits": [self.OLDER]},
+            {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.SELECTED}], "on")
+        self.assertIsNone(error)
+        self.assertEqual(events[2], ("select", "stage", None, "a" * 40))
+
+    def test_a_lane_query_that_fails_releases_nothing(self):
+        events, error = self.run_publish([{"status": "failed", "errorType": "ValueError", "step": "input"}], "on")
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(events, [("invoke", {"action": "lane"})])
+
+    def test_a_failed_release_puts_the_selection_back(self):
+        events, error = self.run_publish([
+            {"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]},
+            {"status": "failed", "errorType": "Refused", "step": "rollout", "code": "rollout-failed"},
+            {"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]}], "on")
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(events[-2:], [("invoke", {"action": "lane"}), ("restore", "stage", self.BEFORE)])
+
+    def test_a_release_that_applied_despite_its_error_keeps_the_selection(self):
+        # The call ended without a result each time, but the function had released: it runs the new lane image.
+        events, error = self.run_publish(
+            [{"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]}] + [publish.CommandFailed("aws", 255)] * 11
+            + [{"status": "ok", "lambda_digest": self.SELECTED, "commits": ["a" * 40]}], "on")
+        self.assertIsInstance(error, publish.CommandFailed)
+        self.assertEqual(events[-1], ("invoke", {"action": "lane"}))
+        self.assertNotIn("restore", [e[0] for e in events])
+
+    def test_a_release_reporting_another_lane_image_puts_the_selection_back(self):
+        events, error = self.run_publish([
+            {"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]},
+            {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.RUNNING},
+            {"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]}], "on")
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(events[-1], ("restore", "stage", self.BEFORE))
+
+    def test_when_nothing_says_what_runs_the_selection_is_left_and_the_release_error_raised(self):
+        events, error = self.run_publish([
+            {"status": "ok", "lambda_digest": self.RUNNING, "commits": [self.OLDER]},
+            {"status": "failed", "step": "rollout"},
+            {"status": "failed", "step": "lane"}], "on")
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("release did not complete", str(error))
+        self.assertNotIn("restore", [e[0] for e in events])
+
+    def test_an_unknown_lane_setting_is_refused_before_anything_runs(self):
+        events, error = self.run_publish([], "yes")
+        self.assertIsInstance(error, ValueError)
+        self.assertEqual(events, [])
+
+    def test_the_lane_selection_takes_the_build_that_pairs_with_this_commit(self):
+        calls = []
+        lane = publish.lane_release()
+        with patch.dict(os.environ, {"LAMBDA_TILE_REPO": "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile"}), \
+                patch.object(lane, "paired_build", lambda ecr, commit: calls.append(("paired", ecr.registry, commit)) or self.SELECTED), \
+                patch.object(lane, "snapshot", lambda ecr, stack: calls.append(("snapshot", stack)) or dict(self.BEFORE)), \
+                patch.object(lane, "select", lambda ecr, stack, new, running: calls.append((stack, new, running)) or {}):
+            self.assertEqual(publish.select_lane("stage", self.RUNNING, "a" * 40), (self.SELECTED, self.BEFORE))
+        self.assertEqual(calls, [("paired", "111122223333", "a" * 40), ("snapshot", "stage"),
+                                 ("stage", self.SELECTED, self.RUNNING)])
+        with patch.dict(os.environ, {"LAMBDA_TILE_REPO": "registry.example/other"}):
+            with self.assertRaises(ValueError):
+                publish.select_lane("stage", self.RUNNING, "a" * 40)
+
+    def test_a_lane_repository_error_keeps_its_aws_code(self):
+        lane = publish.lane_release()
+        out = io.StringIO()
+        with patch.object(publish, "main", side_effect=lane.CommandFailed("AccessDeniedException")), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            publish.run([])
+        self.assertEqual(json.loads(out.getvalue()), {"status": "failed", "errorType": "CommandFailed",
+                                                      "code": "AccessDeniedException"})
+
+    def test_the_staging_deploy_passes_the_lane_setting_and_follows_the_lane_build(self):
+        workflow = (HERE.parent.parent / ".github/workflows/fleet-coordinator-deploy.yml").read_text()
+        step = workflow.split("- name: Publish and release the staging coordinator", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("FLEET_LAMBDA_LANE: ${{ vars.FLEET_LAMBDA_LANE }}", step)
+        self.assertIn("LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}", step)
+        # publish.py runs fleet/lambda/release.py and reads the lane workflow's paths in the credentialed job.
+        paths = re.findall(r"^      - '([^']+)'", workflow.split("\n  push:\n", 1)[1].split("\n  workflow_", 1)[0], re.M)
+        for path in ("fleet/lambda/release.py", ".github/workflows/fleet-lambda-image.yml"):
+            self.assertIn(path, paths)
+        # A finished lane publish on main starts a staging release (invariant 1 orders it in publish.py).
+        triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertEqual(re.findall(r"^  (\w+):", triggers, re.M), ["push", "workflow_run", "workflow_dispatch"])
+        trigger = triggers.split("\n  workflow_run:\n", 1)[1].split("\n  workflow_dispatch:", 1)[0]
+        self.assertIn('workflows: ["Fleet Lambda lane image"]', trigger)
+        self.assertIn("types: [completed]", trigger)
+        self.assertIn("branches: [main]", trigger)
+        for job in ("build", "deploy"):
+            condition = workflow.split(f"\n  {job}:\n", 1)[1].split("\n    runs-on:", 1)[0]
+            condition = " ".join(condition.split("if: >-", 1)[1].split())
+            self.assertEqual(condition,
+                             "github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' && "
+                             "(github.event_name != 'workflow_run' || (vars.FLEET_LAMBDA_LANE == 'on' && "
+                             "github.event.workflow_run.conclusion == 'success' && "
+                             "github.event.workflow_run.event == 'push' && "
+                             "github.event.workflow_run.head_branch == 'main' && "
+                             "github.event.workflow_run.head_repository.full_name == github.repository))", job)
+        # Invariant 2: a lane-started run never shares the push deploys' group.
+        group = workflow.split("\nconcurrency:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("group: ${{ github.event_name == 'workflow_run' && format('fleet-coordinator-stage-lane-{0}', "
+                      "github.event.workflow_run.id) || 'fleet-coordinator-stage' }}", group)
+        # Invariant 3: every release runs in the deploy job, one at a time in the smokes' queued group.
+        deploy = workflow.split("\n  deploy:\n", 1)[1].split("\n  smoke:\n", 1)[0]
+        self.assertIn("    concurrency:\n      group: fleet-viewer-smoke\n      cancel-in-progress: false\n", deploy)
+        self.assertIn("      queue: max\n", deploy)
+        self.assertIn("fetch-depth: 0", deploy)
+        self.assertIn("run: python3 -B fleet/coord/publish.py", deploy)
+        # The order step decides before any release call; the release step runs only when it says release,
+        # so a skipped run's release step concludes "skipped" (prod_release.released ignores it).
+        order = deploy.split("      - name: Order the release (an ancestor of what staging runs is skipped)\n", 1)[1]
+        self.assertIn("        id: order\n", order.split("\n      - name:", 1)[0])
+        self.assertIn("run: python3 -B fleet/coord/publish.py --order", order.split("\n      - name:", 1)[0])
+        release = deploy.split("      - name: Publish and release the staging coordinator\n", 1)[1].split("\n      - name:", 1)[0]
+        self.assertIn("        if: steps.order.outputs.skip == 'false'\n", release)
+        self.assertLess(deploy.index("Order the release"), deploy.index("Publish and release the staging coordinator"))
+        self.assertNotIn("outputs.status", workflow)
+        self.assertNotIn("id: release", workflow)
+        # A successful deploy is always smoked, and the smoke knows it follows this run's release.
+        smoke_job = workflow.split("\n  smoke:\n", 1)[1]
+        self.assertIn("    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'\n", smoke_job)
+        # The smoke follows this run's release only when the order step did not skip it.
+        self.assertIn("    outputs:\n      skip: ${{ steps.order.outputs.skip }}\n", deploy)
+        self.assertIn("      released: ${{ needs.deploy.outputs.skip == 'false' }}\n", smoke_job)
+        # The served image reports its commit before it is published (invariant 4's other half).
+        self.assertIn('http://127.0.0.1:24120/version)" = "{\\"commit\\":\\"$GITHUB_SHA\\"}"', workflow)
+        # One place for the switch, which the job conditions and the step env read: the repository variable.
+        protocol = (HERE.parent.parent / "fleet/PROTOCOL.md").read_text()
+        self.assertEqual(len(protocol.split("- With the repository variable `FLEET_LAMBDA_LANE` set to `on`", 1)), 2)
+        self.assertNotRegex(protocol, r"FLEET_LAMBDA_LANE[^\n]*\n?[^\n]*in `fleet-stage-deploy`")
+
+
+class SmokeCommitTests(unittest.TestCase):
+    """Invariant 4: a smoke says which commit it tested. The coordinator reports its build's commit at
+    /version; the smoke compares it with its run's commit (GITHUB_SHA)."""
+
+    RUN = "a" * 40
+
+    def attribute(self, answer):
+        with patch.object(smoke, "get", lambda url, headers=None: answer):
+            return smoke.commit_attribution("https://api.example", {"h": "v"}, self.RUN)
+
+    def test_the_run_commit_is_the_one_tested(self):
+        self.assertEqual(self.attribute((200, {}, json.dumps({"commit": self.RUN}).encode())),
+                         {"tested_commit": self.RUN, "run_commit": self.RUN, "same": True})
+
+    def test_another_commit_is_named(self):
+        other = "e" * 40
+        self.assertEqual(self.attribute((200, {}, json.dumps({"commit": other}).encode())),
+                         {"tested_commit": other, "run_commit": self.RUN, "same": False})
+
+    def test_a_coordinator_that_cannot_say_is_reported_as_unknown(self):
+        for answer in ((404, {}, b""), (200, {}, b"not json"), (200, {}, b'{"commit": null}'),
+                       (200, {}, b'{"commit": "https://example.invalid"}')):
+            with self.subTest(answer=answer):
+                self.assertEqual(self.attribute(answer), {"tested_commit": None, "run_commit": self.RUN, "same": False})
+
+    def test_a_version_request_that_fails_in_transport_is_an_unknown_commit(self):
+        import http.client, socket, urllib.error
+        for error in (TimeoutError("timed out"), socket.timeout("timed out"), ConnectionResetError(),
+                      urllib.error.URLError("unreachable"), http.client.RemoteDisconnected("closed")):
+            with self.subTest(error=type(error).__name__):
+                def get(url, headers=None):
+                    raise error
+                with patch.object(smoke, "get", get):
+                    self.assertEqual(smoke.commit_attribution("https://api.example", {}, self.RUN),
+                                     {"tested_commit": None, "run_commit": self.RUN, "same": False})
+
+    def test_the_agents_mode_prints_the_agents_record_and_nothing_else(self):
+        source = (HERE / "stage-smoke.py").read_text()
+        body = source.split("\ndef main(", 1)[1]
+        check = body.index('raise AssertionError("the CI token reached the agents-only endpoint")')
+        attribution = body.index("commit_attribution(api, headers")
+        guard = body.rindex("if not agents:", check, attribution)
+        self.assertLess(check, guard)
+        self.assertLess(guard, attribution)
+
+    def test_the_notice_is_for_a_smoke_that_follows_its_own_release(self):
+        other = {"tested_commit": "e" * 40, "run_commit": self.RUN, "same": False}
+        self.assertEqual(smoke.commit_lines(other, released=True),
+                         [other, {"notice": "this smoke tests the commit in tested_commit, not the one its run released"}])
+        # A web deploy, the release gate, the schedule or a dispatch released no coordinator: no notice.
+        self.assertEqual(smoke.commit_lines(other, released=False), [other])
+        same = {"tested_commit": self.RUN, "run_commit": self.RUN, "same": True}
+        self.assertEqual(smoke.commit_lines(same, released=True), [same])
+        workflow = (HERE.parent.parent / ".github/workflows/fleet-viewer-smoke.yml").read_text()
+        self.assertIn("      released:\n        type: boolean\n        default: false\n", workflow)
+        self.assertEqual(workflow.count("SMOKE_RELEASED: ${{ inputs.released }}"), 2)
+
+    def test_the_smoke_prints_it_after_the_access_check(self):
+        source = (HERE / "stage-smoke.py").read_text()
+        body = source.split("\ndef main(", 1)[1]
+        self.assertLess(body.index('step("agents-only endpoint check")'), body.index("commit_attribution(api, headers"))
+        self.assertLess(body.index("commit_attribution(api, headers"), body.index('step("/live connect")'))
+
+
 class ResolveRetransmitTests(unittest.TestCase):
     """resolve() retransmits one query within its deadline, as a stub resolver does."""
 
@@ -1766,10 +2441,14 @@ class ProdDecideTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         self.calls = []
+        # A second candidate read (decide re-reads it after its checks with the prod lane on) answers
+        # self.second when set, so a test can tell the two reads apart.
+        self.second = None
         def invoke(function, payload):
             self.calls.append(payload)
             if function == "fcvm-coordinator-release-prod":
-                return copy.deepcopy(self.candidate)
+                reads = sum(1 for c in self.calls if c == {"action": "candidate"})
+                return copy.deepcopy(self.second if reads > 1 and self.second is not None else self.candidate)
             return copy.deepcopy(self.status)
         patches = [patch.object(prod, "api", self.gh.api), patch.object(prod.publish, "invoke", invoke)]
         for p in patches:
@@ -1777,7 +2456,7 @@ class ProdDecideTests(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def test_a_smoke_after_both_releases_and_the_verification_promotes_the_set(self):
-        target, prior, changes = prod.decide()
+        target, prior, changes, _ = prod.decide()
         self.assertEqual(target, {"coordinator": {"commit": self.C, "digest": self.D}, "web_commit": self.W,
                                   "generation": 12, "build_id": "factory:new", "smoke_run": self.coordinator_run})
         self.assertEqual(changes, {"image": True, "coordinator": True, "web": True})
@@ -1822,12 +2501,149 @@ class ProdDecideTests(unittest.TestCase):
             [release_job("deploy", "Publish and release the staging coordinator", 2000, 2100, status="in_progress")])
         self.skips("in progress")
 
+    def test_a_release_skipped_for_an_ancestor_is_not_what_staging_runs(self):
+        # The descendant deploys, then an ancestor's run finishes later: its order step skipped the release, so
+        # its release step concludes "skipped" and staging still runs the descendant.
+        job = release_job("deploy", "Publish and release the staging coordinator", 2000, 2100)
+        job["steps"] = [{"name": "Order the release (an ancestor of what staging runs is skipped)", "conclusion": "success",
+                         "completed_at": ts(2050)},
+                        {"name": "Publish and release the staging coordinator", "conclusion": "skipped", "completed_at": ts(2050)}]
+        self.gh.run("fleet-coordinator-deploy.yml", "1" * 40, [job])
+        self.assertEqual(prod.released("coordinator")[0], self.C)
+        self.assertEqual(prod.decide()[0]["coordinator"]["commit"], self.C)
+
     def test_a_failed_newer_release_falls_back_and_staging_pointer_must_agree(self):
         self.gh.run("fleet-coordinator-deploy.yml", "1" * 40,
             [release_job("deploy", "Publish and release the staging coordinator", 2000, 2100, conclusion="failure")])
         self.assertEqual(prod.decide()[0]["coordinator"]["commit"], self.C)
         self.candidate["stage"]["commits"] = ["1" * 40]
         self.skips("not its last successful staging release")
+
+    STAGED, RUNNING = "sha256:" + "2" * 64, "sha256:" + "1" * 64
+
+    def lane_on(self, selection=None, stage_runs=None, prod_runs=None):
+        """The prod lane on. What each stack runs comes from the candidate (its running task's lane image);
+        staging's selection (keep-stage-current) is only checked against it."""
+        lane = publish.lane_release()
+        selected = lane.Image(selection or self.STAGED, "{}", lane.MEDIA_TYPES[0])
+        ecr = types.SimpleNamespace(tagged=lambda tag: selected if tag == "keep-stage-current" else None)
+        for p in (patch.dict(os.environ, {"FLEET_LAMBDA_LANE_PROD": "on"}),
+                  patch.object(prod.publish, "staging_lane", lambda: (lane, ecr))):
+            p.start()
+            self.addCleanup(p.stop)
+        self.candidate["stage"]["lambda_digest"] = self.STAGED if stage_runs is None else stage_runs
+        self.candidate["prod"]["lambda_digest"] = self.RUNNING if prod_runs is None else prod_runs or None
+
+    def record(self, **extra):
+        return {"coordinator": {"commit": self.C, "digest": self.D}, "web_commit": self.W,
+                "worker_version": "0" * 8 + "-0000-0000-0000-" + "0" * 12, **self.RECEIPT, "smoke_run": 1,
+                **extra, "previous": None}
+
+    def test_with_the_prod_lane_on_the_set_carries_the_lane_image_staging_runs(self):
+        self.lane_on()
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertEqual(target["lambda_digest"], self.STAGED)
+        self.assertNotIn("lambda_digest", prior)
+        self.assertEqual(prior_lane, self.RUNNING)
+        self.assertEqual(changes, {"image": True, "coordinator": True, "web": True, "lane": True})
+
+    def test_a_record_without_a_lane_image_is_passed_back_unchanged(self):
+        # The record's compare-and-swap takes prior as the record it replaces: it must be the stored entry, byte
+        # for byte. (Prod runs no lane image, which is what an entry without lambda_digest names.)
+        self.lane_on(prod_runs="")
+        self.candidate["prod"].update({"digest": self.D, "commits": [self.C]})
+        self.status["prod"] = dict(self.RECEIPT)
+        self.candidate["release"] = self.record()
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertEqual(prior, prod.entry(self.candidate["release"]))
+        self.assertEqual(prior_lane, "")
+
+    def test_before_prods_first_lane_image_nothing_says_null(self):
+        self.lane_on(prod_runs="")
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertEqual(target["lambda_digest"], self.STAGED)
+        self.assertNotIn(None, (target.get("lambda_digest"), prior_lane))
+        self.assertEqual(prior_lane, "")
+        self.assertNotIn("lambda_digest", prior)
+
+    def test_a_lane_selection_staging_does_not_run_is_not_promoted(self):
+        # The tags stay moved after a cancelled deploy, a hand selection or an unknown running image: the set is
+        # what staging runs, and a selection that differs from it is no set a smoke covered.
+        self.lane_on(selection="sha256:" + "9" * 64)
+        self.skips("not the lane image it runs")
+        self.setUp()
+        self.lane_on(stage_runs="")
+        self.skips("staging runs no lane image")
+
+    def test_prod_running_another_lane_image_than_its_record_names_is_outside_a_promotion(self):
+        self.lane_on()
+        self.candidate["prod"].update({"digest": self.D, "commits": [self.C]})
+        self.status["prod"] = dict(self.RECEIPT)
+        self.candidate["release"] = self.record(lambda_digest="sha256:" + "8" * 64)
+        self.skips("its record names another lane image")
+
+    def test_a_new_lane_image_alone_is_a_promotion(self):
+        self.lane_on()
+        self.candidate["prod"].update({"digest": self.D, "commits": [self.C]})
+        self.status["prod"] = dict(self.RECEIPT)
+        self.candidate["release"] = self.record(lambda_digest=self.RUNNING)
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertEqual(changes, {"image": False, "coordinator": False, "web": False, "lane": True})
+        self.assertEqual(prior, prod.entry(self.candidate["release"]))
+        self.setUp()
+        self.lane_on(prod_runs=self.STAGED)
+        self.candidate["prod"].update({"digest": self.D, "commits": [self.C]})
+        self.status["prod"] = dict(self.RECEIPT)
+        self.candidate["release"] = self.record(lambda_digest=self.STAGED)
+        self.skips("already runs")
+
+    def test_the_lane_image_comes_from_the_read_after_the_checks(self):
+        self.lane_on(selection="sha256:" + "6" * 64, stage_runs="sha256:" + "7" * 64)
+        self.second = copy.deepcopy(self.candidate)
+        self.second["stage"]["lambda_digest"] = "sha256:" + "6" * 64
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertEqual(target["lambda_digest"], "sha256:" + "6" * 64)
+        self.assertEqual(self.calls.count({"action": "candidate"}), 2)
+
+    def test_staging_changing_between_the_two_reads_promotes_nothing(self):
+        self.lane_on()
+        self.second = copy.deepcopy(self.candidate)
+        self.second["stage"]["digest"] = "sha256:" + "f" * 64
+        self.skips("changed while the promotion was deciding")
+
+    def test_a_lane_image_the_function_could_not_read_promotes_nothing(self):
+        for stack in ("stage", "prod"):
+            with self.subTest(stack=stack):
+                self.setUp()
+                self.lane_on()
+                self.candidate[stack]["lane_error"] = "pointer-mismatch"
+                self.skips("could not read the lane image " + stack + " runs")
+
+    def test_a_record_without_a_lane_image_means_none(self):
+        # With the lane on, an entry without lambda_digest names no lane image. Prod running one is a change no
+        # promotion recorded (a lane-only promotion whose rollback also failed), not "already runs the set".
+        self.lane_on(prod_runs=self.STAGED)
+        self.candidate["prod"].update({"digest": self.D, "commits": [self.C]})
+        self.status["prod"] = dict(self.RECEIPT)
+        self.candidate["release"] = self.record()
+        self.skips("its record names another lane image")
+
+    def test_with_the_prod_lane_off_one_candidate_read_and_no_prior_lane(self):
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertEqual(self.calls.count({"action": "candidate"}), 1)
+        self.assertIsNone(prior_lane)
+        out = tempfile.NamedTemporaryFile("r", delete=False)
+        self.addCleanup(os.unlink, out.name)
+        with patch.dict(os.environ, {"GITHUB_OUTPUT": out.name}), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.main(["decide"]), 0)
+        self.assertNotIn("prior_lane", Path(out.name).read_text())
+
+    def test_with_the_prod_lane_off_the_set_is_todays(self):
+        target, prior, changes, prior_lane = prod.decide()
+        self.assertNotIn("lambda_digest", target)
+        self.assertNotIn("lambda_digest", prior)
+        self.assertEqual(set(changes), {"image", "coordinator", "web"})
+        self.assertIsNone(prior_lane)
 
     def test_prod_already_running_the_set_promotes_nothing(self):
         self.candidate["prod"] = {"digest": self.D, "commits": [self.C]}
@@ -1855,7 +2671,8 @@ class ProdStepTests(unittest.TestCase):
                                       "IMAGE_RELEASE": "fcvm-fleet-ami-prod-release"})
         env.start()
         self.addCleanup(env.stop)
-        self.answers, self.calls = {}, []
+        # prod-status answers prod's current receipt; image_promote reads it before its first call.
+        self.answers, self.calls = {"prod-status": {"prod": {"generation": 11, "build_id": "factory:old"}}}, []
         def invoke(function, payload):
             self.calls.append(payload.get("action", "release"))
             answer = self.answers[payload.get("action")]
@@ -1885,6 +2702,131 @@ class ProdStepTests(unittest.TestCase):
                 self.answers["promote-prod"] = answer
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(prod.main(["image-promote", receipt]), code)
+
+    def test_a_promotion_waits_while_terraforms_lock_is_held(self):
+        # The image release function shares Terraform's backend lock. With ejc3/aws#1014 applied it answers "busy"
+        # while someone else holds it (an apply, a plan, another release); until then a held lock is still a function
+        # error, which is what failed run 45149811634. Busy means nothing ran: ask again, at most 11 times.
+        receipt = {"generation": 24, "build_id": "factory:new"}
+        self.answers["promote-prod"] = [{"status": "busy"}] * 10 + [{"status": "promoted", **receipt}]
+        sleeps = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.image_promote(receipt, sleep=sleeps.append), "promoted")
+        self.assertEqual(sleeps, [60] * 10)
+        self.assertEqual(self.calls.count("promote-prod"), 11)
+        self.assertEqual(self.calls.count("prod-status"), 1)
+
+    def test_a_promotion_still_locked_after_eleven_answers_is_held_not_failed(self):
+        # Held (exit 3): the release job ends with a notice and no rollback runs for a set that never moved. Held only
+        # when prod-status, which takes no lock, still names the receipt prod ran before the call.
+        receipt = '{"generation": 24, "build_id": "factory:new"}'
+        old = {"generation": 11, "build_id": "factory:old"}
+        self.answers["prod-status"] = [{"prod": old}, {"prod": old}]
+        self.answers["promote-prod"] = [{"status": "busy"}] * 11 + [{"status": "promoted", "generation": 24, "build_id": "factory:new"}]
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(prod.time, "sleep", lambda _: None):
+            self.assertEqual(prod.main(["image-promote", receipt]), prod.HELD)
+        self.assertEqual(self.calls.count("promote-prod"), 11)
+        workflow = (HERE.parent.parent / ".github/workflows/fleet-prod-promote.yml").read_text()
+        notice = [line for line in workflow.splitlines() if 'if [ "$rc" = 3 ]' in line and "image" in line]
+        self.assertEqual(len(notice), 1)
+        self.assertIn("Terraform's lock", notice[0])
+
+    def test_a_lock_held_after_the_promotion_completed_is_that_promotion(self):
+        # publish.invoke retries a call that ended without a result while the function went on: the first
+        # promote-prod completed and every retry answers busy. prod-status names the receipt: the release continues.
+        receipt = {"generation": 24, "build_id": "factory:new"}
+        self.answers["prod-status"] = [{"prod": {"generation": 11, "build_id": "factory:old"}}, {"prod": dict(receipt)}]
+        self.answers["promote-prod"] = [{"status": "busy"}] * 11
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.image_promote(receipt, sleep=lambda _: None), "unchanged")
+            self.answers["prod-status"] = [{"prod": {"generation": 11, "build_id": "factory:old"}}, {"prod": dict(receipt)}]
+            self.answers["promote-prod"] = [{"status": "busy"}] * 11
+            with patch.object(prod.time, "sleep", lambda _: None):
+                self.assertEqual(prod.main(["image-promote", json.dumps(receipt)]), 0)
+
+    def test_a_lock_held_with_prod_on_a_third_release_is_a_failure(self):
+        receipt = '{"generation": 24, "build_id": "factory:new"}'
+        self.answers["prod-status"] = [{"prod": {"generation": 11, "build_id": "factory:old"}},
+                                       {"prod": {"generation": 9, "build_id": "factory:other"}}]
+        self.answers["promote-prod"] = [{"status": "busy"}] * 11
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(prod.time, "sleep", lambda _: None):
+            self.assertEqual(prod.main(["image-promote", receipt]), 1)
+
+    def test_a_lock_held_with_prods_images_unreadable_is_a_failure(self):
+        # prod-status refused both times names no receipt at all: two unreadable answers are not "nothing moved".
+        receipt = '{"generation": 24, "build_id": "factory:new"}'
+        self.answers["prod-status"] = [{"status": "refused", "reason": "x"}] * 2
+        self.answers["promote-prod"] = [{"status": "busy"}] * 11
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(prod.time, "sleep", lambda _: None):
+            self.assertEqual(prod.main(["image-promote", receipt]), 1)
+
+    def test_a_lock_held_with_prod_already_on_the_receipt_is_that_promotion(self):
+        # A rerun after an earlier attempt completed, with the lock held: prod-status names the receipt before and
+        # after, which is the completed promotion and not a held one.
+        receipt = {"generation": 24, "build_id": "factory:new"}
+        self.answers["prod-status"] = [{"prod": dict(receipt)}, {"prod": dict(receipt)}]
+        self.answers["promote-prod"] = [{"status": "busy"}] * 11
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.image_promote(receipt, sleep=lambda _: None), "unchanged")
+
+    def test_an_image_rollback_waits_while_terraforms_lock_is_held(self):
+        new, old = {"generation": 12, "build_id": "n"}, {"generation": 11, "build_id": "o"}
+        self.answers["prod-status"] = {"prod": new}
+        self.answers["rollback-prod"] = [{"status": "busy"}, {"status": "rolled_back", **old}]
+        sleeps = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.image_rollback(new, old, deadline=time.time() + 1000, sleep=sleeps.append), "rolled_back")
+        self.assertEqual(sleeps, [60])
+
+    def test_an_image_rollback_keeps_asking_through_a_long_lock_until_its_deadline(self):
+        # A Terraform apply that holds the lock for 30 minutes: the rollback keeps asking every 60 s and then runs.
+        new, old = {"generation": 12, "build_id": "n"}, {"generation": 11, "build_id": "o"}
+        self.answers["prod-status"] = {"prod": new}
+        self.answers["rollback-prod"] = [{"status": "busy"}] * 30 + [{"status": "rolled_back", **old}]
+        sleeps = []
+        clock = lambda: sum(sleeps)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.image_rollback(new, old, deadline=3600, clock=clock, sleep=sleeps.append), "rolled_back")
+        self.assertEqual(sleeps, [60] * 30)
+
+    def test_an_image_rollback_that_cannot_run_fails_by_its_deadline(self):
+        # A rollback that could not run fails (never held), and the busy wait ends at the rollback's own deadline, not
+        # at the job's timeout or the role's session.
+        new, old = {"generation": 12, "build_id": "n"}, {"generation": 11, "build_id": "o"}
+        self.answers["prod-status"] = {"prod": new}
+        self.answers["rollback-prod"] = [{"status": "busy"}] * 200
+        sleeps = []
+        clock = lambda: sum(sleeps)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "deadline") as raised:
+            prod.image_rollback(new, old, deadline=1800, clock=clock, sleep=sleeps.append)
+        self.assertNotIsInstance(raised.exception, prod.publish.Held)
+        self.assertEqual(sum(sleeps), 1800)
+
+    def test_the_rollback_job_says_which_return_failed(self):
+        # "prod was returned to its previous set" only when every step that ran succeeded.
+        workflow = (HERE.parent.parent / ".github/workflows/fleet-prod-promote.yml").read_text()
+        rollback = workflow.split("\n  rollback:\n", 1)[1]
+        step = rollback[rollback.index("      - name: The promotion failed\n"):]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        for outcomes, says in (({"WORKER": "success", "COORDINATOR": "skipped", "IMAGES": "success"}, "was returned to its previous set"),
+                               ({"WORKER": "skipped", "COORDINATOR": "success", "IMAGES": "failure"}, "Host and tile images"),
+                               # A job cancelled before a return step started reports that step skipped too.
+                               ({"WORKER": "skipped", "COORDINATOR": "skipped", "IMAGES": "skipped", "CANCELLED": "true"},
+                                "was cancelled")):
+            with self.subTest(**outcomes):
+                out = subprocess.run(["bash", "-c", script],
+                                     env={"PATH": os.environ["PATH"], "CANCELLED": "false", **outcomes},
+                                     capture_output=True, text=True)
+                self.assertEqual(out.returncode, 1)
+                self.assertIn(says, out.stdout)
+                if outcomes["IMAGES"] == "failure" or outcomes.get("CANCELLED") == "true":
+                    self.assertNotIn("was returned to its previous set", out.stdout)
+        for name, id_ in (("Worker", "worker"), ("Coordinator", "coordinator"), ("Host and tile images", "images")):
+            self.assertRegex(rollback, r"      - name: " + re.escape(name) + r"\n        id: " + id_ + r"\n")
+        self.assertIn("IMAGES: ${{ steps.images.outcome }}", step)
+        self.assertIn("CANCELLED: ${{ job.status == 'cancelled' }}", step)
+        # Status functions such as cancelled() are valid only in `if:`; in a step's env they make the whole file invalid.
+        self.assertNotRegex(workflow, r"(?m)^\s+[A-Z_]+: \$\{\{[^}]*\b(cancelled|always|success|failure)\(\)")
 
     def test_an_image_rollback_returns_only_to_the_previous_release(self):
         new, old = {"generation": 12, "build_id": "n"}, {"generation": 11, "build_id": "o"}
@@ -1956,6 +2898,369 @@ class PublishProdTests(unittest.TestCase):
             publish.arguments(["--force"])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             publish.arguments(["--stack", "prod", "--commit", "a" * 40])
+
+
+class ProdLaneTests(unittest.TestCase):
+    """publish.py --stack prod --lambda-digest D: the lane image of the set prod takes (a promotion) or returns to
+    (a rollback) is selected for prod and released with the coordinator. Without it the release is today's."""
+
+    DIGEST = "sha256:" + "c" * 64
+    RUNNING, STAGED, EARLIER = "sha256:" + "1" * 64, "sha256:" + "2" * 64, "sha256:" + "0" * 64
+    BEFORE = {"current": RUNNING, "previous": EARLIER, "next": RUNNING}
+
+    def run_prod(self, results, extra=(), repository=None):
+        results, events = list(results), []
+        def invoke(name, payload):
+            events.append(("invoke", payload))
+            outcome = results.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        def select_prod_lane(running, digest):
+            events.append(("select", running, digest))
+            return digest, dict(self.BEFORE)
+        def restore_lane(stack, before):
+            events.append(("restore", stack, before))
+        env = {"COORDINATOR_RELEASE": "fcvm-coordinator-release-prod", "LAMBDA_TILE_REPO": repository or "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile-prod"}
+        with patch.dict(os.environ, env), patch.object(publish, "invoke", invoke), \
+                patch.object(publish, "select_prod_lane", select_prod_lane), patch.object(publish, "restore_lane", restore_lane), \
+                patch.object(publish, "command", side_effect=AssertionError("prod pushes nothing")), \
+                patch.object(publish.time, "sleep", lambda _: None), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exit:
+            publish.run(["--stack", "prod", "--commit", "a" * 40, "--digest", self.DIGEST, *extra])
+            raise SystemExit(0)
+        return exit.exception.code, events
+
+    def lane(self, digest):
+        return {"status": "ok", "lambda_digest": digest, "commits": ["9" * 40]}
+
+    def test_without_a_lane_digest_the_release_is_todays(self):
+        code, events = self.run_prod([{"status": "deployed", "digest": self.DIGEST}])
+        self.assertEqual((code, events), (0, [("invoke", {"commit": "a" * 40, "digest": self.DIGEST})]))
+
+    def test_a_promotion_carries_the_sets_lane_image(self):
+        code, events = self.run_prod([self.lane(self.RUNNING),
+                                      {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.STAGED}],
+                                     extra=["--lambda-digest", self.STAGED])
+        self.assertEqual(code, 0)
+        self.assertEqual(events, [("invoke", {"action": "lane"}), ("select", self.RUNNING, self.STAGED),
+                                  ("invoke", {"commit": "a" * 40, "digest": self.DIGEST, "lambda_digest": self.STAGED})])
+
+    def test_a_rollback_carries_the_lane_image_its_record_names(self):
+        code, events = self.run_prod([self.lane(self.STAGED),
+                                      {"status": "deployed", "digest": self.DIGEST, "lambda_digest": self.EARLIER}],
+                                     extra=["--force", "--lambda-digest", self.EARLIER])
+        self.assertEqual(code, 0)
+        self.assertEqual(events[1], ("select", self.STAGED, self.EARLIER))
+        self.assertEqual(events[2][1], {"commit": "a" * 40, "digest": self.DIGEST, "force": True, "lambda_digest": self.EARLIER})
+
+    def test_a_held_or_failed_prod_release_puts_the_selection_back(self):
+        for result, code in (({"status": "held", "reason": "viewers"}, publish.HELD),
+                             ({"status": "failed", "step": "rollout"}, 1)):
+            with self.subTest(status=result["status"]):
+                got, events = self.run_prod([self.lane(self.RUNNING), result, self.lane(self.RUNNING)],
+                                            extra=["--lambda-digest", self.STAGED])
+                self.assertEqual(got, code)
+                self.assertEqual(events[-1], ("restore", "prod", self.BEFORE))
+
+    def test_a_rollback_to_a_set_without_a_lane_image_removes_it(self):
+        # The set returned to ran no lane image: the function removes FLEET_LAMBDA_IMAGE; no tag moves.
+        code, events = self.run_prod([{"status": "deployed", "digest": self.DIGEST, "lambda_digest": None}],
+                                     extra=["--force", "--lambda-digest", "none"])
+        self.assertEqual(code, 0)
+        self.assertEqual(events, [("invoke", {"commit": "a" * 40, "digest": self.DIGEST, "force": True, "lambda_digest": None})])
+
+    def test_a_none_release_must_report_the_lane_image_removed(self):
+        code, events = self.run_prod([{"status": "deployed", "digest": self.DIGEST}], extra=["--force", "--lambda-digest", "none"])
+        self.assertEqual(code, 1)
+
+    def test_a_malformed_lane_digest_is_refused_before_anything(self):
+        code, events = self.run_prod([], extra=["--force", "--lambda-digest", "latest"])
+        self.assertEqual((code, events), (1, []))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            publish.arguments(["--lambda-digest", self.STAGED])  # staging takes none
+
+    def test_a_production_release_naming_the_staging_repository_is_refused(self):
+        # Before any call: a prod release that moves or names a lane image uses prod's repository only.
+        for lane in (self.STAGED, "none"):
+            for repository in ("111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile", "registry.example/other"):
+                with self.subTest(lane=lane, repository=repository):
+                    code, events = self.run_prod([], extra=["--force", "--lambda-digest", lane], repository=repository)
+                    self.assertEqual((code, events), (1, []))
+
+    def test_each_stack_takes_only_its_own_lane_repository(self):
+        for stack, url, other in (("stage", "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile", "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile-prod"), ("prod", "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile-prod", "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile")):
+            with self.subTest(stack=stack):
+                with patch.dict(os.environ, {"LAMBDA_TILE_REPO": url}):
+                    _, ecr = publish.lane_repository(stack)
+                self.assertEqual((ecr.repository, ecr.registry), (publish.lane_release().REPOSITORIES[stack], "111122223333"))
+                for wrong in (other, ""):
+                    with patch.dict(os.environ, {"LAMBDA_TILE_REPO": wrong}), self.assertRaisesRegex(ValueError, stack):
+                        publish.lane_repository(stack)
+
+    def test_prod_reads_stagings_selection_from_stagings_repository_on_its_own_credentials(self):
+        with patch.dict(os.environ, {"LAMBDA_TILE_REPO": "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile-prod"}):
+            _, source = publish.staging_lane()
+        self.assertEqual((source.repository, source.registry), ("fcvm-fleet/lambda-tile", "111122223333"))
+        with patch.dict(os.environ, {"LAMBDA_TILE_REPO": "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile"}), self.assertRaises(ValueError):
+            publish.staging_lane()
+
+    def test_staging_code_paths_never_name_the_production_repository(self):
+        import inspect
+        for function in (publish.main, publish.order, publish.select_lane):
+            source = inspect.getsource(function)
+            with self.subTest(function=function.__name__):
+                self.assertNotIn('"prod"', source)
+                self.assertNotIn("lambda-tile-prod", source)
+                self.assertNotIn("staging_lane", source)
+        self.assertIn('lane_repository("stage")', inspect.getsource(publish.select_lane))
+        workflows = HERE.parent.parent / ".github/workflows"
+        for name in ("fleet-lambda-image.yml", "fleet-coordinator-deploy.yml"):
+            text = (workflows / name).read_text()
+            with self.subTest(workflow=name):
+                self.assertNotIn("lambda-tile-prod", text)
+                self.assertNotIn("fleet-prod-deploy", text)
+                self.assertNotIn("release.py copy", text)
+
+    def test_the_prod_selection_takes_the_named_digest(self):
+        calls = []
+        lane = publish.lane_release()
+        with patch.dict(os.environ, {"LAMBDA_TILE_REPO": "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile-prod"}), \
+                patch.object(lane, "snapshot", lambda ecr, stack: calls.append(("snapshot", ecr.repository, stack)) or dict(self.BEFORE)), \
+                patch.object(lane, "select", lambda ecr, stack, new, running: calls.append((stack, new, running)) or {}):
+            self.assertEqual(publish.select_prod_lane(self.STAGED, self.EARLIER), (self.EARLIER, self.BEFORE))
+        self.assertEqual(calls, [("snapshot", "fcvm-fleet/lambda-tile-prod", "prod"), ("prod", self.EARLIER, self.STAGED)])
+
+
+class ProdLaneWorkflowTests(unittest.TestCase):
+    """The prod workflows carry the set's lane image: decide reads staging's selection with the prod lane on, a
+    promotion releases the target's, and both rollbacks return to the one the earlier set names."""
+
+    WORKFLOWS = HERE.parent.parent / ".github/workflows"
+    FLAG = '${lane:+--lambda-digest "$lane"}'
+
+    def step(self, text, name, after=0):
+        start = text.index(f"      - name: {name}\n", after)
+        return text[start:text.find("\n      - ", start + 10)], start
+
+    def test_a_promotion_decides_and_releases_the_lane_image(self):
+        promote = (self.WORKFLOWS / "fleet-prod-promote.yml").read_text()
+        candidate = promote.split("\n  candidate:\n", 1)[1].split("\n  hold:\n", 1)[0]
+        self.assertIn("      lane: ${{ steps.decide.outputs.lane }}\n", candidate)
+        self.assertIn("          sparse-checkout: |\n            fleet/coord\n            fleet/lambda\n", candidate)
+        self.assertIn("FLEET_LAMBDA_LANE_PROD: ${{ vars.FLEET_LAMBDA_LANE_PROD }}", candidate)
+        self.assertIn("LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}", candidate)
+        release = promote.split("\n  release:\n", 1)[1].split("\n  smoke:\n", 1)[0]
+        coordinator, _ = self.step(release, "Coordinator")
+        self.assertIn("(needs.candidate.outputs.coordinator == 'true' || needs.candidate.outputs.lane == 'true')", coordinator)
+        self.assertIn("lane=$(jq -r '.lambda_digest // empty' <<<\"$TARGET\")", coordinator)
+        self.assertIn(self.FLAG, coordinator)
+        self.assertIn("      prior_lane: ${{ steps.decide.outputs.prior_lane }}\n", candidate)
+        rollback = promote.split("\n  rollback:\n", 1)[1]
+        coordinator, _ = self.step(rollback, "Coordinator")
+        self.assertIn("needs.candidate.outputs.lane == 'true'", coordinator)
+        # Leaving a set with a lane image: return to the one prod ran before (from its task), or to none.
+        self.assertIn("PRIOR_LANE: ${{ needs.candidate.outputs.prior_lane }}", coordinator)
+        self.assertIn('if [ -n "$(jq -r \'.lambda_digest // empty\' <<<"$TARGET")" ]; then lane="${PRIOR_LANE:-none}"; fi', coordinator)
+        self.assertIn(self.FLAG, coordinator)
+
+    def test_a_promotion_copies_the_tested_lane_image_before_anything_prod_runs_moves(self):
+        # Its own step, right after the credentials and before the host and tile images move: a failed copy changes
+        # nothing prod runs. The Coordinator step then releases the same digest; neither rollback copies.
+        promote = (self.WORKFLOWS / "fleet-prod-promote.yml").read_text()
+        release = promote.split("\n  release:\n", 1)[1].split("\n  smoke:\n", 1)[0]
+        names = re.findall(r"^      - (?:name: (.+)|uses: ([^@ ]+))", release, re.M)
+        order = [n or u for n, u in names]
+        self.assertLess(order.index("aws-actions/configure-aws-credentials"), order.index("Copy the lane image into prod's repository"))
+        self.assertLess(order.index("Copy the lane image into prod's repository"), order.index("Host and tile images"))
+        step, _ = self.step(release, "Copy the lane image into prod's repository")
+        self.assertIn("LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}", step)
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        lane = "sha256:" + "2" * 64
+        def run(target, skopeo=True):
+            bin_ = tempfile.mkdtemp()
+            self.addCleanup(lambda: __import__("shutil").rmtree(bin_))
+            # The script sees jq and, when asked for, a skopeo: nothing else on PATH.
+            os.symlink(__import__("shutil").which("jq"), Path(bin_, "jq"))
+            if skopeo:
+                Path(bin_, "skopeo").write_text("#!/bin/sh\n")
+                os.chmod(Path(bin_, "skopeo"), 0o755)
+            stub = 'python3() { echo "python3 $*"; }\nsudo() { echo "sudo $*"; }\n'
+            return subprocess.run(["/bin/bash", "-c", stub + script], capture_output=True, text=True,
+                                  env={"PATH": bin_, "TARGET": json.dumps(target)})
+        with_lane = {"coordinator": {"commit": "a" * 40, "digest": "sha256:" + "a" * 64}, "lambda_digest": lane}
+        out = run(with_lane)
+        self.assertEqual((out.returncode, out.stdout.splitlines()), (0, [f"python3 -B fcvm/fleet/lambda/release.py copy --digest {lane}"]))
+        out = run({"coordinator": with_lane["coordinator"]})
+        self.assertEqual((out.returncode, out.stdout), (0, ""))
+        # Without skopeo on the runner it is installed, and a runner that still lacks it fails before the copy.
+        out = run(with_lane, skopeo=False)
+        self.assertIn("sudo apt-get install -y skopeo", out.stdout)
+        self.assertNotIn("release.py copy", out.stdout)
+        self.assertNotEqual(out.returncode, 0)
+        coordinator, _ = self.step(release, "Coordinator")
+        self.assertNotIn("release.py copy", coordinator)
+        self.assertIn(self.FLAG, coordinator)
+        rollbacks = promote.split("\n  rollback:\n", 1)[1] + (self.WORKFLOWS / "fleet-prod-rollback.yml").read_text()
+        self.assertNotIn("release.py copy", rollbacks)
+
+    def run_coordinator_step(self, lane):
+        """The manual rollback's Coordinator step, run by bash with python3 replaced by a stub that prints its
+        arguments one per line."""
+        rollback = (self.WORKFLOWS / "fleet-prod-rollback.yml").read_text()
+        coordinator, _ = self.step(rollback, "Coordinator")
+        script = textwrap.dedent(coordinator.split("        run: |\n", 1)[1])
+        previous = json.dumps({"coordinator": {"commit": "a" * 40, "digest": "sha256:" + "a" * 64}})
+        env = {"PATH": os.environ["PATH"], "PREVIOUS": previous, "LANE": lane}
+        return subprocess.run(["bash", "-c", 'python3() { printf "%s\\n" "$@"; }\n' + script], env=env,
+                              capture_output=True, text=True, check=True).stdout.splitlines()
+
+    def test_a_manual_rollback_passes_the_lane_the_current_step_chose(self):
+        today = ["-B", "fleet/coord/publish.py", "--stack", "prod", "--force",
+                 "--commit", "a" * 40, "--digest", "sha256:" + "a" * 64]
+        self.assertEqual(self.run_coordinator_step(""), today)
+        self.assertEqual(self.run_coordinator_step("none"), today + ["--lambda-digest", "none"])
+        lane = "sha256:" + "2" * 64
+        self.assertEqual(self.run_coordinator_step(lane), today + ["--lambda-digest", lane])
+        rollback = (self.WORKFLOWS / "fleet-prod-rollback.yml").read_text()
+        coordinator, _ = self.step(rollback, "Coordinator")
+        self.assertIn("LANE: ${{ steps.current.outputs.lane }}", coordinator)
+        self.assertIn("LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}", coordinator)
+        for step in ("Worker", "Coordinator", "Host and tile images"):
+            body, _ = self.step(rollback, step)
+            self.assertIn("steps.current.outcome == 'success'", body)
+
+
+class ManualRollbackLaneTests(unittest.TestCase):
+    """prod_release.py current, the manual rollback's first step, chooses its lane flag from both recorded
+    entries and refuses when prod runs another lane image than its record names."""
+
+    S, R = "sha256:" + "5" * 64, "sha256:" + "2" * 64
+
+    C1, C0 = "sha256:" + "a" * 64, "sha256:" + "c" * 64
+
+    def entry(self, generation, lane=None, coordinator=None):
+        return {"coordinator": {"commit": "a" * 40, "digest": coordinator or self.C1}, "web_commit": None,
+                "worker_version": None, "generation": generation, "build_id": "b", "smoke_run": None,
+                **({"lambda_digest": lane} if lane else {})}
+
+    def current(self, release, runs=None, lane_error=None, switch=None, coordinator=None):
+        """Run `current` against a candidate answer whose prod runs `runs` (None: the function names nothing, as
+        before ejc3/aws#1002; "": no lane image). Returns the exit code, the outputs and what was printed."""
+        out = tempfile.NamedTemporaryFile("r", delete=False)
+        self.addCleanup(os.unlink, out.name)
+        prod_side = {"digest": coordinator or self.C1, "commits": ["a" * 40]}
+        if runs is not None:
+            prod_side["lambda_digest"] = runs or None
+        if lane_error:
+            prod_side.update({"lambda_digest": None, "lane_error": lane_error})
+        answer = {"status": "ok", "stage": {"digest": "sha256:" + "b" * 64, "commits": []}, "prod": prod_side,
+                  "release": release}
+        env = {"COORDINATOR_RELEASE": "fcvm-coordinator-release-prod", "GITHUB_OUTPUT": out.name}
+        printed = io.StringIO()
+        with patch.dict(os.environ, env), patch.object(prod.publish, "invoke", lambda f, p: copy.deepcopy(answer)), \
+                contextlib.redirect_stdout(printed):
+            os.environ.pop("FLEET_LAMBDA_LANE_PROD", None)
+            if switch:
+                os.environ["FLEET_LAMBDA_LANE_PROD"] = switch
+            code = prod.main(["current"])
+        outputs = dict(line.split("=", 1) for line in Path(out.name).read_text().splitlines())
+        return code, outputs, printed.getvalue()
+
+    def test_with_no_lane_image_anywhere_it_is_todays(self):
+        release = {**self.entry(1), "previous": self.entry(0)}
+        for runs in (None, ""):
+            for switch in (None, "on"):
+                with self.subTest(runs=runs, switch=switch):
+                    code, outputs, _ = self.current(release, runs, switch=switch)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(json.loads(outputs["previous"]), self.entry(0))
+                    self.assertEqual(json.loads(outputs["current"]), self.entry(1))
+                    self.assertEqual(outputs["lane"], "")
+
+    def test_the_lane_flag_is_chosen_from_both_entries(self):
+        # PREVIOUS names a lane image: pass it. Else CURRENT names one: none. Else no flag.
+        cases = [(self.S, self.R, self.R), (self.S, None, "none"), (None, self.S, self.S), (self.S, self.S, self.S)]
+        for left, back, flag in cases:
+            with self.subTest(left=left, back=back):
+                release = {**self.entry(1, left), "previous": self.entry(0, back)}
+                code, outputs, _ = self.current(release, left or "")
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs["lane"], flag)
+
+    def test_a_rollback_of_a_rollback_returns_to_the_set_it_left(self):
+        # The record job writes the restored set with the rolled-back one as its previous (record(PREVIOUS, ...,
+        # CURRENT)); rolling back again must return to the lane image the first rollback left.
+        for back in (self.R, None):
+            with self.subTest(back=back):
+                release = {**self.entry(1, self.S), "previous": self.entry(0, back)}
+                code, outputs, _ = self.current(release, self.S)
+                self.assertEqual((code, outputs["lane"]), (0, back or "none"))
+                written = {}
+                def record(function, payload):
+                    written.update(payload["release"])
+                    return {"status": "recorded"}
+                with patch.object(prod.publish, "invoke", record), contextlib.redirect_stdout(io.StringIO()), \
+                        patch.dict(os.environ, {"COORDINATOR_RELEASE": "fcvm-coordinator-release-prod"}):
+                    prod.record(json.loads(outputs["previous"]), None, json.loads(outputs["current"]))
+                code, outputs, _ = self.current(written, back or "")
+                self.assertEqual((code, outputs["lane"]), (0, self.S))
+                self.assertEqual(json.loads(outputs["previous"]), self.entry(1, self.S))
+
+    def test_prod_running_another_lane_image_than_its_record_names_refuses(self):
+        # What prod runs, not only the record: a rollback whose record step failed, or a switch turned off while
+        # prod ran a lane image, leaves the record describing something else.
+        cases = [(self.S, self.R), (self.S, "")]
+        for recorded, runs in cases:
+            with self.subTest(recorded=recorded, runs=runs):
+                release = {**self.entry(1, recorded), "previous": self.entry(0, coordinator=self.C0)}
+                code, outputs, printed = self.current(release, runs)
+                self.assertEqual(code, 1)
+                self.assertNotIn("previous", outputs)
+                self.assertIn("prod runs another lane image than its release record names", printed)
+
+    def test_with_no_lane_image_recorded_the_lane_read_is_not_consulted(self):
+        # Main's emergency path: a flagless release leaves FLEET_LAMBDA_IMAGE alone, so a lane read that failed (a
+        # deployment not COMPLETED, a pointer mismatch, an ECS error) or a lane image nobody recorded stops nothing.
+        release = {**self.entry(1), "previous": self.entry(0)}
+        for kwargs in ({"lane_error": "not-idle"}, {"lane_error": "unreadable"}, {"runs": self.S}):
+            with self.subTest(**kwargs):
+                code, outputs, _ = self.current(release, **kwargs)
+                self.assertEqual((code, outputs["lane"]), (0, ""))
+
+    def test_a_resumed_rollback_of_a_lane_only_set_is_accepted(self):
+        # Both entries name one coordinator image (a promotion that changed only the lane image), so the
+        # coordinator digest cannot tell the sets apart: prod running E0's lane image is the resumed state.
+        for back in (self.R, None):
+            with self.subTest(back=back):
+                release = {**self.entry(1, self.S), "previous": self.entry(0, back)}
+                code, outputs, _ = self.current(release, back or "")
+                self.assertEqual((code, outputs["lane"]), (0, back or "none"))
+
+    def test_a_lane_image_prod_cannot_read_refuses_when_an_entry_names_one(self):
+        for left, back in ((self.S, None), (None, self.S), (self.S, self.R)):
+            with self.subTest(left=left, back=back):
+                release = {**self.entry(1, left), "previous": self.entry(0, back)}
+                code, outputs, printed = self.current(release, lane_error="not-idle")
+                self.assertEqual(code, 1)
+                self.assertNotIn("previous", outputs)
+                self.assertIn("could not read the lane image prod runs (not-idle)", printed)
+
+    def test_a_rollback_whose_later_step_failed_is_resumed(self):
+        # The Coordinator step applied the previous set, then a later step failed, so the record job did not run:
+        # prod runs E0's coordinator and lane image while the record still says E1. A rerun must go on.
+        for back in (self.R, None):
+            with self.subTest(back=back):
+                release = {**self.entry(1, self.S), "previous": self.entry(0, back, coordinator=self.C0)}
+                code, outputs, _ = self.current(release, back or "", coordinator=self.C0)
+                self.assertEqual((code, outputs["lane"]), (0, back or "none"))
+        # Only E0's coordinator with E0's lane image is that state.
+        release = {**self.entry(1, self.S), "previous": self.entry(0, self.R, coordinator=self.C0)}
+        for runs, coordinator in ((self.R, self.C1), ("", self.C0)):
+            with self.subTest(runs=runs, coordinator=coordinator):
+                code, _, printed = self.current(release, runs, coordinator=coordinator)
+                self.assertEqual(code, 1)
+                self.assertIn("prod runs another lane image than its release record names", printed)
 
 
 class FakeLive:

@@ -20,6 +20,8 @@ pub struct Cli {
 pub enum Commands {
     /// List running VMs
     Ls(LsArgs),
+    /// Print the directories this binary keeps its state and data in
+    Paths(PathsArgs),
     /// Podman-compatible container operations
     Podman(Box<PodmanArgs>),
     /// Snapshot operations (create, serve, run, export)
@@ -42,6 +44,36 @@ pub enum Commands {
     Fleet(FleetArgs),
     /// Raw VMs: a guest that runs no fc-agent (Windows), booted from UEFI firmware
     Vm(VmArgs),
+    /// A pool of rootless network namespaces that restored clones run in, one after another
+    Netpool(NetpoolArgs),
+}
+
+// ============================================================================
+// Netpool Command (recycled rootless network namespaces)
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct NetpoolArgs {
+    #[command(subcommand)]
+    pub cmd: NetpoolCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum NetpoolCommands {
+    /// Build SLOTS namespaces and lend them to this user's rootless clones in this data
+    /// directory until SIGTERM or SIGINT. A clone with no published port takes one when
+    /// one is free and builds its own otherwise.
+    Serve(NetpoolServeArgs),
+    /// Print the running pool's namespaces by state and its counters as one JSON line
+    Stats,
+}
+
+#[derive(Args, Debug)]
+pub struct NetpoolServeArgs {
+    /// Namespaces the pool keeps. Each is a holder process, a pasta process and a network
+    /// namespace with a bridge and two TAPs, whether lent or not
+    #[arg(long)]
+    pub slots: usize,
 }
 
 // ============================================================================
@@ -167,6 +199,14 @@ pub enum FleetCommand {
     Aggregate(Box<FleetAggregateArgs>),
     /// Serve the phones' web proxy: HTTPS CONNECT to the browser's allowed names only
     PhoneWebProxy(FleetPhoneWebProxyArgs),
+    /// Run a Lambda tile: the lane image's Lambda runtime, the renderer and its tunnel
+    LambdaTile(Box<FleetLambdaTileArgs>),
+    /// Run pages mode's host module without a coordinator or viewers, and record what it
+    /// measures
+    RendersBench(Box<FleetRendersBenchArgs>),
+    /// Wait for a pages-mode module to go, then remove everything it made
+    #[command(hide = true)]
+    RendersReap(FleetRendersReapArgs),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -253,6 +293,15 @@ pub enum FleetEc2 {
     /// Fake EC2 instances that come up after a delay and render nothing (dark tiles)
     Fake,
     /// Real EC2 instances from the tile launch template (--ec2-template)
+    Aws,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FleetLambda {
+    /// No Lambda tiles: every AWS tile is an EC2 tile
+    None,
+    /// Lambda Managed Instances functions running the lane image (fleet/PROTOCOL.md,
+    /// "Lambda tile")
     Aws,
 }
 
@@ -474,9 +523,29 @@ pub struct FleetCoordArgs {
     )]
     pub host_subnets: Vec<crate::fleet::coord::hosts::Regional>,
 
+    /// A launch template of pages mode's host (`<region>:<name>`, repeatable, one region).
+    /// With any, the coordinator runs one such CPU host while the fleet is awake, as it runs
+    /// the GPU hosts: spot first, on demand when spot is refused for capacity (at most one),
+    /// none while the fleet sleeps. Its instances are tagged `Purpose=fcvm-fleet-renders`.
+    #[arg(
+        long = "renders-template",
+        env = "FLEET_RENDERS_TEMPLATES",
+        value_delimiter = ','
+    )]
+    pub renders_templates: Vec<crate::fleet::coord::hosts::Regional>,
+
+    /// A subnet pages mode's host may launch in (`<region>:<subnet id>`, repeatable); the
+    /// region of the --renders-template needs at least one
+    #[arg(
+        long = "renders-subnet",
+        env = "FLEET_RENDERS_SUBNETS",
+        value_delimiter = ','
+    )]
+    pub renders_subnets: Vec<crate::fleet::coord::hosts::Regional>,
+
     /// Sleep with no active viewer (no tiles, every VM stopped) and wake for the next one,
     /// on hosts the coordinator does not launch (a fixed host, a test box). Implied by any
-    /// --host-template.
+    /// --host-template or --renders-template.
     #[arg(long)]
     pub sleep_when_idle: bool,
 
@@ -511,18 +580,25 @@ pub struct FleetCoordArgs {
     #[arg(long, env = "FLEET_SLEEP_WITHOUT_NEW_VIEWER", default_value_t = 3600)]
     pub sleep_without_new_viewer: u64,
 
+    /// Seconds of --sleep-without-new-viewer that must remain for a connected page that
+    /// becomes active (shown again, or reconnecting) to wake a sleeping fleet. With less
+    /// left the page's Wake button wakes it.
+    #[arg(long, env = "FLEET_MIN_WAKE_REMAINING", default_value_t = 600)]
+    pub min_wake_remaining: u64,
+
     /// The most the fleet may spend in one UTC day, in USD. The coordinator meters what the
-    /// fleet's GPU hosts and EC2 tiles cost (spot at the spot price, on demand at the
-    /// on-demand rate) and, at this less 15 minutes of the current burn, sleeps the fleet
-    /// until 00:00 UTC: no wake or claim wakes it. Needs a fleet that sleeps (--host-template
-    /// or --sleep-when-idle) and instances to meter (--host-template or --ec2 aws). Off
-    /// without it.
+    /// fleet's GPU hosts, pages mode's host and EC2 tiles cost (spot at the spot price, on
+    /// demand at the on-demand rate) and, at this less 15 minutes of the current burn, sleeps
+    /// the fleet until 00:00 UTC: no wake or claim wakes it. Needs a fleet that sleeps
+    /// (--host-template, --renders-template or --sleep-when-idle) and instances to meter
+    /// (--host-template, --renders-template or --ec2 aws). Off without it.
     #[arg(long, env = "FLEET_DAILY_SPEND_USD")]
     pub daily_spend_usd: Option<f64>,
 
     /// On-demand rates the spend meter uses, `<instance type>=<USD per hour>`, comma
     /// separated, over its built-in rates for the fleet's instance types (us-east-1 list
-    /// prices). Spot instances are priced at their current spot price.
+    /// prices). Spot instances are priced at their current spot price. A host group launches
+    /// only types this table prices.
     #[arg(long, env = "FLEET_SPEND_RATES", value_delimiter = ',')]
     pub spend_rates: Vec<String>,
 
@@ -583,6 +659,33 @@ pub struct FleetCoordArgs {
     /// spaces)
     #[arg(long, env = "FLEET_EC2_SECURITY_GROUPS", value_delimiter = ' ')]
     pub ec2_security_group: Vec<String>,
+
+    /// Where Lambda tiles come from. With `aws`, --lambda-tiles of the AWS half's
+    /// --ec2-tiles places are Lambda tiles, and the coordinator's port 443 routes by server
+    /// name: their tunnel, their viewers, and the EC2 aggregator (needs --ec2-aggregate-tls)
+    #[arg(long, value_enum, default_value_t = FleetLambda::None)]
+    pub lambda: FleetLambda,
+
+    /// How many of the AWS half's --ec2-tiles places are Lambda tiles (at most all of them)
+    #[arg(long, default_value_t = 0)]
+    pub lambda_tiles: usize,
+
+    /// The region the Lambda tiles' functions run in
+    #[arg(long, env = "FLEET_LAMBDA_REGION", default_value = "us-east-1")]
+    pub lambda_region: String,
+
+    /// The lane image the functions run, by digest: `<repository>@sha256:<hex>`. A tag is
+    /// refused; fleet/lambda/release.py keeps the selected digests in the repository
+    #[arg(long, env = "FLEET_LAMBDA_IMAGE")]
+    pub lambda_image: Option<String>,
+
+    /// The functions' execution role (ARN)
+    #[arg(long, env = "FLEET_LAMBDA_ROLE")]
+    pub lambda_role: Option<String>,
+
+    /// The Lambda Managed Instances capacity provider (ARN) the functions run on
+    #[arg(long, env = "FLEET_LAMBDA_CAPACITY_PROVIDER")]
+    pub lambda_capacity_provider: Option<String>,
     /// This fleet's name, tagged on its EC2 tiles at launch (`Fleet=<name>`). At start and
     /// shutdown the coordinator terminates the tiles tagged with it, so two fleets in one
     /// account (staging and production) need different names.
@@ -801,6 +904,16 @@ pub struct FleetAgentArgs {
     #[arg(long, default_value_t = 0)]
     pub potato_players: u32,
 
+    /// Potato mode: the ring's CPU allotment. A player that is not asleep (awake, waking,
+    /// booting, or going to sleep until its save has finished and its fcvm has exited) holds
+    /// one CPU, and the agent never has more than this many such players: a wake that finds
+    /// none free waits for one. At least 3: one player holds the ball, one is saving and one
+    /// must be waking. Where the agent runs in a delegated systemd unit with the cpuset
+    /// controller (`Delegate=yes`, `DelegateSubgroup=`), the players' VMs and the fcvm
+    /// commands that save and restore them are also confined to this many host CPUs.
+    #[arg(long, default_value_t = 8)]
+    pub potato_cpus: u32,
+
     /// The potato player image (`make potato-image`)
     #[arg(long, default_value = "localhost/fcvm-potato:fleet")]
     pub potato_image: String,
@@ -919,6 +1032,19 @@ pub struct FleetAgentArgs {
     /// fcvm's snapshot directory, where the gold snapshot and the forks are made
     #[arg(long, default_value = "/mnt/fcvm-btrfs/snapshots")]
     pub minecraft_snapshot_dir: std::path::PathBuf,
+
+    /// Pages mode: run pages mode's host module (`fcvm fleet renders-bench`'s) while the
+    /// coordinator orders it to (docs/fleet/ARCHITECTURE.md, "Pages mode"). The agent must run
+    /// in a subgroup of a delegated systemd unit, as renders-bench must.
+    #[arg(long, requires = "renders_args")]
+    pub renders: bool,
+
+    /// Pages mode: one of the module's options, as `fcvm fleet renders-bench` takes it
+    /// (`--renders-arg=--corpus=/srv/corpus`). Repeatable. `--levels`, `--seconds`,
+    /// `--overlay-text` and `--overlay-transform` are the benchmark's and are refused: under
+    /// the agent the coordinator's orders say when to render and what overlay to serve.
+    #[arg(long = "renders-arg", allow_hyphen_values = true, requires = "renders")]
+    pub renders_args: Vec<String>,
 }
 
 /// `fcvm fleet phone-web-proxy`: the phones' web proxy on its own (a warm phone's bake and
@@ -928,6 +1054,200 @@ pub struct FleetPhoneWebProxyArgs {
     /// Address to listen on; phones reach it through `--forward-localhost`
     #[arg(long, default_value = "127.0.0.1:3128")]
     pub listen: std::net::SocketAddr,
+}
+
+/// `fcvm fleet renders-bench`: pages mode's host module ("One VM per page") on its own. It
+/// must run in a subgroup of a delegated systemd unit (`Delegate=yes` with
+/// `DelegateSubgroup=`), because each side runs in a cpuset of its own. The fleet agent runs
+/// the same module with these options (`fcvm fleet agent --renders --renders-arg ...`).
+#[derive(Args, Debug, Clone)]
+pub struct FleetRendersBenchArgs {
+    /// Where the records go: renders.jsonl, samples.jsonl, report.json, summary.json, logs
+    #[arg(long)]
+    pub out: std::path::PathBuf,
+    /// Scratch for the run (certificates, name files, injected bytes): a directory of the
+    /// module's own, removed at its start and at its end
+    #[arg(long)]
+    pub run_dir: std::path::PathBuf,
+    /// A file the module writes its stage to, by rename, as it starts and stops
+    #[arg(long)]
+    pub status_file: Option<std::path::PathBuf>,
+    /// The repository's bench/chromium (the replay, the drivers, the worker)
+    #[arg(long)]
+    pub bench: std::path::PathBuf,
+    /// The captured pages the replays serve
+    #[arg(long)]
+    pub corpus: std::path::PathBuf,
+    /// The pages to render, in the wall's order (comma separated)
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub urls: Vec<String>,
+    /// The snapshot every clone is restored from
+    #[arg(long)]
+    pub snapshot_tag: String,
+    /// The snapshot is made from this image when it is absent (`fcvm podman prepare`), with
+    /// these vCPUs and memory, on 2 MiB pages unless `--hugepages false`
+    #[arg(long, default_value = "localhost/chromium-bench-req")]
+    pub image: String,
+    #[arg(long, default_value_t = 4)]
+    pub vcpus: u32,
+    #[arg(long, default_value_t = 1024)]
+    pub mem_mib: u32,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub hugepages: bool,
+    /// How the memory server fills clone memory
+    #[arg(long, default_value = "minor")]
+    pub uffd_mode: String,
+    /// A Kitesurf build: `src` (the repository) and `tools/node-*/bin`
+    #[arg(long)]
+    pub kitesurf: Option<std::path::PathBuf>,
+    /// The engine bundle to serve (default: `<kitesurf>/dist`)
+    #[arg(long)]
+    pub kitesurf_dist: Option<std::path::PathBuf>,
+    /// Host CPUs of the fcvm side, the engines and the harness
+    #[arg(long, default_value = "0-39")]
+    pub cpus_fcvm: String,
+    #[arg(long, default_value = "40-79")]
+    pub cpus_engines: String,
+    #[arg(long, default_value = "80-95")]
+    pub cpus_harness: String,
+    /// The most clones in flight, and the most engines (one engine per render in flight);
+    /// 0 leaves a side out
+    #[arg(long, default_value_t = 40)]
+    pub max_fcvm: u32,
+    #[arg(long, default_value_t = 48)]
+    pub max_engines: u32,
+    /// Hold these renders in flight (fcvm,engines) and run no search
+    #[arg(long, value_delimiter = ',')]
+    pub levels: Option<Vec<u32>>,
+    /// Start an engine again, between renders, once its anonymous memory passes this; 0
+    /// never does
+    #[arg(long, default_value_t = 4096)]
+    pub recycle_mib: u64,
+    /// Replay processes behind each side's address
+    #[arg(long, default_value_t = 4)]
+    pub replay_procs: u32,
+    /// Harness CPUs each side's replay is confined to, the rest being the drivers'. 0 (the
+    /// default) confines nothing below the harness set: the replays and the drivers share
+    /// it, as each side shares its own
+    #[arg(long, default_value_t = 0)]
+    pub replay_cpus: u32,
+    /// The replays' addresses and ports. The fcvm side's also answers DNS for the clones.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub replay_addr_fcvm: std::net::Ipv4Addr,
+    #[arg(long, default_value = "127.0.0.3")]
+    pub replay_addr_engines: std::net::Ipv4Addr,
+    #[arg(long, default_value_t = 80)]
+    pub replay_http_port: u16,
+    #[arg(long, default_value_t = 443)]
+    pub replay_tls_port: u16,
+    #[arg(long, default_value_t = 53)]
+    pub replay_dns_port: u16,
+    /// The first engine's port on 127.0.0.1; engine N listens on this plus N
+    #[arg(long, default_value_t = 28800)]
+    pub engine_port_base: u16,
+    /// The CSS viewport both renderers are given
+    #[arg(long, default_value = "1280x720")]
+    pub viewport: String,
+    /// The longest one render may take, in seconds
+    #[arg(long, default_value_t = 30)]
+    pub timeout_s: u32,
+    /// The trailing window of the wall's figures, in seconds
+    #[arg(long, default_value_t = 30)]
+    pub window_s: u32,
+    /// Stop after this many seconds of rendering; 0 runs until a signal
+    #[arg(long, default_value_t = 0)]
+    pub seconds: u64,
+    /// A text and a transform put into every page, as a visitor's would be
+    #[arg(long)]
+    pub overlay_text: Option<String>,
+    #[arg(long)]
+    pub overlay_transform: Option<String>,
+    /// Values for the Setup lists that the module cannot read itself (`side.name=value`)
+    #[arg(long = "setup")]
+    pub setup: Vec<String>,
+    /// Wait at this stage until the module is ended: the host checks' option
+    /// (renders_teardown_check.py, renders_agent_check.py). Under the agent, an order to stop
+    /// or the end of the connection ends a module held at a stage of its start (`cgroups` to
+    /// `workers`); one held at `start`, `running` or `stopping` is ended only with the agent's
+    /// process, whose end lets the reaper remove everything
+    #[arg(long, hide = true)]
+    pub hold_at: Option<String>,
+}
+
+/// `fcvm fleet renders-reap`: started by the module, which holds the other end of
+/// `--watch-fd`
+#[derive(Args, Debug)]
+pub struct FleetRendersReapArgs {
+    #[arg(long)]
+    pub watch_fd: i32,
+    #[arg(long = "cgroup")]
+    pub cgroup: Vec<std::path::PathBuf>,
+    #[arg(long)]
+    pub run_dir: std::path::PathBuf,
+    #[arg(long)]
+    pub snapshot_tag: String,
+    #[arg(long, default_value_t = 20000)]
+    pub deadline_ms: u64,
+    #[arg(long)]
+    pub report: Option<std::path::PathBuf>,
+}
+
+/// `fcvm fleet lambda-tile`: a Lambda tile's runtime (fleet/PROTOCOL.md, "Lambda tile").
+/// The coordinator sets every value in the function's configuration.
+#[derive(Args, Debug)]
+pub struct FleetLambdaTileArgs {
+    /// The tile's slot, `lam-<n>`
+    #[arg(long, env = "FLEET_TILE_SLOT")]
+    pub slot: String,
+
+    /// The generation this function version runs
+    #[arg(long, env = "FLEET_TILE_GENERATION")]
+    pub generation: u64,
+
+    /// The tunnel credential the coordinator minted for this slot and generation
+    #[arg(long, env = "FLEET_TILE_CREDENTIAL", hide_env_values = true)]
+    pub credential: String,
+
+    /// The coordinator's tunnel endpoint, `host[:port]` (port 443 by default)
+    #[arg(long, env = "FLEET_TILE_TUNNEL")]
+    pub tunnel: String,
+
+    /// The certificate secret (JSON with `cert`, `key` and `scene_token`), as an EC2 tile reads it
+    #[arg(
+        long,
+        env = "FLEET_TLS_SECRET",
+        default_value = "fcvm-fleet/tls-wildcard"
+    )]
+    pub tls_secret: String,
+
+    /// The certificate secret's region
+    #[arg(long, env = "FLEET_SECRET_REGION", default_value = "us-east-2")]
+    pub tls_secret_region: String,
+
+    /// Where the certificate and scene token files are written (the environment's /tmp)
+    #[arg(long, env = "FLEET_TILE_STATE_DIR", default_value = "/tmp/fleet-tile")]
+    pub state_dir: std::path::PathBuf,
+
+    /// The renderer's command line
+    #[arg(
+        long,
+        env = "FLEET_TILE_RENDERER",
+        default_value = "/usr/local/bin/fleet-renderer"
+    )]
+    pub renderer: String,
+
+    /// The renderer's HTTP port on loopback
+    #[arg(long, default_value_t = 8080)]
+    pub http_port: u16,
+
+    /// The renderer's TLS port on loopback (above 1023: the environment's user binds no
+    /// privileged port)
+    #[arg(long, default_value_t = 8443)]
+    pub tls_port: u16,
+
+    /// Invocations served at once
+    #[arg(long, default_value_t = 2)]
+    pub workers: usize,
 }
 
 // ============================================================================
@@ -980,6 +1300,21 @@ pub struct SetupArgs {
     /// built on demand rather than on every setup.
     #[arg(long)]
     pub cloud_hypervisor: bool,
+
+    /// Build every pinned Firecracker (for the profiles whose kernels are published) and the
+    /// pinned Cloud Hypervisor from source, never from a published build, and write each binary
+    /// and a manifest.json of their names, commits, architecture, libc and SHA-256 to this
+    /// directory, then exit. vmm.yml publishes what this writes.
+    #[arg(long, value_name = "DIR")]
+    pub vmm_artifacts: Option<String>,
+
+    /// Only make the tmpfs directory the data directory's owner keeps VM states in
+    /// (/run/fcvm-<uid>) and install the tmpfiles.d rule that makes it at every boot
+    /// (/etc/tmpfiles.d/fcvm-<uid>.conf; remove that file to undo). Needs root. A full
+    /// setup run as root does this too. Without it a user's VM states are kept in the
+    /// data directory, where starts are slower.
+    #[arg(long)]
+    pub runtime_dir: bool,
 }
 
 // ============================================================================
@@ -1390,7 +1725,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub kernel_profile: Option<String>,
 
-    /// Directory for vsock socket (default: auto-generated in vm-disks)
+    /// Directory for vsock socket (default: auto-generated in vm-disks/<bucket>/<vm_id>)
     /// Use this to create a predictable socket path for external listeners.
     /// Example: --vsock-dir /tmp/myvm creates /tmp/myvm/vsock.sock
     #[arg(long)]
@@ -1455,11 +1790,24 @@ pub struct RunArgs {
 
     /// Disable swap for this VM: memory.swap.max=0 on the VM's own cgroup, which fcvm
     /// enters before it starts anything (see `FCVM_CGROUP_PARENT`). Guest memory is then
-    /// never swapped; under pressure the kernel evicts file cache instead. Needs root on a
-    /// cgroup2 host where the memory controller can be enabled for the VM's cgroup; fcvm
-    /// refuses to start without it. Not part of any snapshot key.
+    /// never swapped; under pressure the kernel evicts file cache instead. Needs root, or an
+    /// unprivileged start in a cgroup delegated to its user, on a cgroup2 host where the
+    /// memory controller can be enabled for the VM's cgroup; fcvm refuses to start without
+    /// it. Not part of any snapshot key.
     #[arg(long)]
     pub no_swap: bool,
+
+    /// Confine this VM's VMM: no capabilities, none regained by its exec, no_new_privs,
+    /// no core dumps, and a syscall allowlist per thread. A syscall outside the allowlist
+    /// kills the VMM, and the guest with it; FCVM_CONFINE_SECCOMP=log records such
+    /// syscalls instead, to check a workload before enforcing (README, "Confining the
+    /// VMM"). It does not yet restrict files or sockets; later layers do. Rootless mode,
+    /// the Firecracker backend and the default Firecracker build only, on a kernel with
+    /// Landlock ABI 9 or later; a start that cannot be confined is refused, never run
+    /// unconfined. The host's `[confine] mode = "required"` (or FCVM_CONFINE=required)
+    /// confines every start. Not part of any snapshot key.
+    #[arg(long)]
+    pub confine: bool,
 }
 
 // ============================================================================
@@ -1543,7 +1891,9 @@ pub struct SnapshotCreateArgs {
     /// the guest touches, until a clone records one. A snapshot of a restored clone is the
     /// parent's memory with the clone's writes merged in at the same offsets, so the parent's
     /// set names the same guest pages. The set only says which pages to copy; the bytes come
-    /// from the new memory file. Serves of the new snapshot keep recording on top of it.
+    /// from the new memory file. A set already holding four complete recordings is frozen,
+    /// so a new snapshot whose workload differs from its parent's keeps the parent's set until
+    /// its sidecar is deleted; one holding fewer takes recordings on top.
     /// Firecracker memory snapshots only; a failure to inherit is logged and leaves the
     /// snapshot without a set.
     #[arg(long, conflicts_with = "disk_only")]
@@ -1567,10 +1917,29 @@ pub struct SnapshotCreateArgs {
     /// is never resumed, and its fcvm process is sent SIGTERM (SIGKILL after 30 s); the
     /// command returns once that process has exited. A VM put to sleep this way does nothing
     /// after its snapshot, so nothing it does is lost when it is restored. The VM is stopped
-    /// also when the snapshot fails, since a failed snapshot can leave it paused. Firecracker
-    /// VMs only.
+    /// also when the snapshot fails, since a failed snapshot can leave it paused. A clone
+    /// refused because its restore is not acknowledged (see `--await-restore`) was not
+    /// touched and is left running. Firecracker VMs only.
     #[arg(long, conflicts_with_all = ["disk_only", "gpu_warm"])]
     pub stop: bool,
+
+    /// How long to wait, in seconds, for the restore of a VM that was restored from a
+    /// snapshot to be acknowledged, before refusing to snapshot it. The default refuses at
+    /// once.
+    ///
+    /// A restored VM is snapshotted only once its guest has acknowledged the restore, which
+    /// it does after it has retired the snapshot's connections, run the restore hook and
+    /// opened its network gate. `snapshot run` records the acknowledgement on the VM's
+    /// state (`restore_acknowledged` in `fcvm ls --json`) and then prints its restored
+    /// record, so a caller that has read the record needs no wait: its create is taken, and
+    /// runs once `snapshot run` has finished its own checks of the clone, which takes
+    /// milliseconds and is given up on after 60 s. A caller that learns a
+    /// clone is up from the clone itself (a port that answers) can be a few milliseconds
+    /// ahead of the record and gives a wait here. The wait ends early when the restore
+    /// fails, the VM's fcvm exits or its state is removed. A VM that was booted is never
+    /// waited for.
+    #[arg(long, value_name = "SECONDS", default_value_t = 0)]
+    pub await_restore: u64,
 
     /// The VM `--stop` pinned (internal): the create refuses any other, so a VM that took the
     /// selector's name or PID after the pin is never snapshotted and left paused.
@@ -1627,7 +1996,8 @@ pub struct SnapshotServeArgs {
     /// working set that already covered that page did better on both time and memory.
     ///
     /// Limitation: with the option on, a page that fault-around installed is never recorded,
-    /// so the recorded working set converges one demanded page per granule per clone, and
+    /// so the recorded working set holds about one demanded page per granule, from the few
+    /// clones that record it, and
     /// replay never restores what fault-around would have installed. Record the working set
     /// with the option off.
     ///
@@ -1678,9 +2048,9 @@ pub struct SnapshotServeArgs {
 
     /// Disable swap for the memory server: memory.swap.max=0 on its own cgroup, which
     /// fcvm enters before it maps the snapshot (see `FCVM_CGROUP_PARENT`). In minor mode
-    /// this keeps the shared memfd every clone maps out of swap. Needs root on a cgroup2
-    /// host where the memory controller can be enabled for the server's cgroup; fcvm
-    /// refuses to start without it.
+    /// this keeps the shared memfd every clone maps out of swap. Needs root, or an unprivileged
+    /// start in a cgroup delegated to its user, on a cgroup2 host where the memory
+    /// controller can be enabled for the server's cgroup; fcvm refuses to start without it.
     #[arg(long)]
     pub no_swap: bool,
 }
@@ -1723,11 +2093,24 @@ pub struct SnapshotRunArgs {
 
     /// Disable swap for this VM: memory.swap.max=0 on the VM's own cgroup, which fcvm
     /// enters before it starts anything (see `FCVM_CGROUP_PARENT`). Guest memory is then
-    /// never swapped; under pressure the kernel evicts file cache instead. Needs root on a
-    /// cgroup2 host where the memory controller can be enabled for the VM's cgroup; fcvm
-    /// refuses to start without it. Not part of any snapshot key.
+    /// never swapped; under pressure the kernel evicts file cache instead. Needs root, or an
+    /// unprivileged start in a cgroup delegated to its user, on a cgroup2 host where the
+    /// memory controller can be enabled for the VM's cgroup; fcvm refuses to start without
+    /// it. Not part of any snapshot key.
     #[arg(long)]
     pub no_swap: bool,
+
+    /// Confine this VM's VMM: no capabilities, none regained by its exec, no_new_privs,
+    /// no core dumps, and a syscall allowlist per thread. A syscall outside the allowlist
+    /// kills the VMM, and the guest with it; FCVM_CONFINE_SECCOMP=log records such
+    /// syscalls instead, to check a workload before enforcing (README, "Confining the
+    /// VMM"). It does not yet restrict files or sockets; later layers do. Rootless mode,
+    /// the Firecracker backend and the default Firecracker build only, on a kernel with
+    /// Landlock ABI 9 or later; a start that cannot be confined is refused, never run
+    /// unconfined. The host's `[confine] mode = "required"` (or FCVM_CONFINE=required)
+    /// confines every start. Not part of any snapshot key.
+    #[arg(long)]
+    pub confine: bool,
 
     /// Place the clone's vsock control socket at DIR/vsock.sock instead of its
     /// runtime directory (predictable path for external tooling). The snapshot
@@ -2128,9 +2511,26 @@ pub struct LsArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Print the directory this data directory's VM states and namespace pool are in
+    /// since this boot, and nothing else. Fails when it has none: no VM was started in
+    /// this boot. For scripts and benchmarks, which must not build that path themselves
+    #[arg(long, conflicts_with_all = ["json", "pid"])]
+    pub runtime_dir: bool,
+
     /// Filter by fcvm process PID
     #[arg(long)]
     pub pid: Option<u32>,
+}
+
+// ============================================================================
+// Paths Command
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct PathsArgs {
+    /// Print one JSON object instead of one `name<TAB>path` line per directory
+    #[arg(long)]
+    pub json: bool,
 }
 
 // ============================================================================

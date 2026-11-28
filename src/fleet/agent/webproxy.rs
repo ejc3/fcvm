@@ -207,6 +207,11 @@ async fn read_head(client: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
 }
 
 async fn tunnel(mut client: TcpStream, to: Upstream) -> anyhow::Result<()> {
+    // `relay` writes each read from the site to the browser as it arrives.
+    crate::network::relay_socket::set_relay_nodelay(
+        &client,
+        format_args!("phone web proxy, browser socket"),
+    );
     let head = read_head(&mut client).await?;
     let end = head
         .windows(4)
@@ -229,7 +234,14 @@ async fn tunnel(mut client: TcpStream, to: Upstream) -> anyhow::Result<()> {
         Upstream::Fixed(a) => TcpStream::connect(a).await.map_err(Into::into),
     };
     let upstream = match opened {
-        Ok(u) => u,
+        Ok(u) => {
+            // `relay` writes each read from the browser to the site as it arrives.
+            crate::network::relay_socket::set_relay_nodelay(
+                &u,
+                format_args!("phone web proxy, site socket"),
+            );
+            u
+        }
         Err(e) => {
             tracing::info!(%name, error = %e, "phone web proxy: cannot reach");
             client
@@ -265,7 +277,6 @@ async fn open(name: &str) -> anyhow::Result<TcpStream> {
         }
         match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(a)).await {
             Ok(Ok(s)) => {
-                s.set_nodelay(true).ok();
                 return Ok(s);
             }
             Ok(Err(e)) => last = anyhow::anyhow!("{a}: {e}"),
@@ -405,6 +416,62 @@ mod tests {
             .next()
             .unwrap_or("")
             .to_string()
+    }
+
+    /// The median time for a message written in two parts to cross the proxy's tunnel,
+    /// toward the browser or toward the site (see `relay_socket::two_part`).
+    async fn two_part_tunnel_median(toward_browser: bool) -> std::time::Duration {
+        use crate::network::relay_socket::two_part::*;
+        let site = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let site_addr = site.local_addr().unwrap();
+        let proxy = proxy_to(site_addr).await;
+        let mut c = TcpStream::connect(proxy).await.unwrap();
+        c.set_nodelay(true).unwrap();
+        c.write_all(b"CONNECT www.nvidia.com:443 HTTP/1.1\r\nHost: www.nvidia.com\r\n\r\n")
+            .await
+            .unwrap();
+        let (s, _) = site.accept().await.unwrap();
+        s.set_nodelay(true).unwrap();
+        assert_eq!(
+            reply_line(&mut c).await,
+            "HTTP/1.1 200 Connection established"
+        );
+        let (mut writer, mut reader) = if toward_browser { (s, c) } else { (c, s) };
+        let mut took = Vec::with_capacity(ROUNDS);
+        let mut buf = vec![0u8; SECOND];
+        for _ in 0..ROUNDS {
+            quickack_off(&reader);
+            let started = std::time::Instant::now();
+            writer.write_all(&[1u8; FIRST]).await.unwrap();
+            reader.read_exact(&mut buf[..FIRST]).await.unwrap();
+            writer.write_all(&[2u8; SECOND]).await.unwrap();
+            reader.read_exact(&mut buf[..SECOND]).await.unwrap();
+            took.push(started.elapsed());
+            tokio::time::sleep(BETWEEN_ROUNDS).await;
+        }
+        median(took)
+    }
+
+    /// A reply the site sends in two parts reaches the browser without waiting for the
+    /// browser to acknowledge the first: the proxy's browser socket has TCP_NODELAY.
+    #[tokio::test]
+    async fn a_reply_in_two_parts_reaches_the_browser_without_waiting_for_an_ack() {
+        let median = two_part_tunnel_median(true).await;
+        assert!(
+            median < crate::network::relay_socket::two_part::LIMIT,
+            "median {median:?} for a reply in two parts through the phone web proxy"
+        );
+    }
+
+    /// A request the browser sends in two parts reaches the site without waiting for the
+    /// site to acknowledge the first: the proxy's site socket has TCP_NODELAY.
+    #[tokio::test]
+    async fn a_request_in_two_parts_reaches_the_site_without_waiting_for_an_ack() {
+        let median = two_part_tunnel_median(false).await;
+        assert!(
+            median < crate::network::relay_socket::two_part::LIMIT,
+            "median {median:?} for a request in two parts through the phone web proxy"
+        );
     }
 
     #[tokio::test]

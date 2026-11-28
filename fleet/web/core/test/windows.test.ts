@@ -438,6 +438,15 @@ describe("what there is to show", () => {
     expect(v0.cards).toEqual([]);
     const v = viewOf(null);
     expect(v.empty).toBe("This fleet runs no Windows sandboxes.");
+    // none listed before a GPU host is up says nothing about the fleet (core/view.ts noneListedText)
+    const waking = stateWith(null);
+    const st = waking.accepted!;
+    const noHost = reduce(waking, {
+      type: "message",
+      text: snapshotText(2, { ...st, fleet: { ...st.fleet, hosts: [], power: { ...st.fleet.power, state: "waking", woke_at: EPOCH - 1000 } } }),
+      at: EPOCH,
+    });
+    expect(windowsView(input(noHost)).empty).toBe("The fleet is waking. The Windows sandboxes start when a GPU host is up.");
     expect(v.header).toBeNull();
     expect(v.plan.direct).toEqual([]);
     expect(viewOf(windowsOf(2)).empty).toBeNull();

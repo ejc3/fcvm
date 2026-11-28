@@ -445,7 +445,7 @@ pub async fn rewrite_memory_file(snapshot_dir: &Path) -> Result<Rewrite> {
 }
 
 /// Remove an unused copy and its reclaim record. A copy that cannot be removed stays recorded,
-/// so the next launch's reclaim removes it.
+/// so the next sweep removes it.
 fn discard_copy(temp: &Path, owner: crate::reclaim::Owner) {
     match std::fs::remove_file(temp) {
         Ok(()) => {}
@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn a_copy_keeps_bytes_holes_length_and_mtime() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dir = crate::storage::extents::test_dir::extent_mapped_tempdir();
         let memory = dir.path().join(SNAPSHOT_MEMORY_FILE);
         {
             let file = File::create(&memory).unwrap();

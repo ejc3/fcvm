@@ -22,12 +22,17 @@ pub struct Rect {
     pub h: f64,
 }
 
-/// Which half of the image a tile belongs to.
+/// What a tile runs on. The image has two halves, fcvm on the left and AWS on the right; the
+/// AWS half's tiles are EC2 instances and, with `--lambda-tiles`, Lambda execution
+/// environments, so `Ec2` and `Lambda` tiles share the right half.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Half {
     Fcvm,
     Ec2,
+    /// A T4 in a Lambda Managed Instances execution environment, one per tile, placed on the
+    /// AWS half after its EC2 tiles.
+    Lambda,
 }
 
 impl Half {
@@ -35,6 +40,7 @@ impl Half {
         match self {
             Half::Fcvm => "fcvm",
             Half::Ec2 => "ec2",
+            Half::Lambda => "lambda",
         }
     }
 }

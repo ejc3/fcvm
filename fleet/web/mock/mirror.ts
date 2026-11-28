@@ -59,6 +59,8 @@ function frame(k: number): Uint8Array[] {
  * an OVERFLOW record after ten frames and nothing after it, as a tap whose ring filled.
  */
 export function serveMockMirror(ws: WebSocket, capturePath: string | undefined, overflow = false): void {
+  // as the other mock sockets: an unheard error would end the mock
+  ws.on("error", () => {});
   // one zstd stream (level 3, 1 MiB window), flushed after each batch; the page decodes it as
   // one stream, so where its messages split does not matter
   const z = zlib.createZstdCompress({

@@ -4,13 +4,18 @@
 //!   through `fleet_core::apply`; browsers, agents and timers only send it events.
 //! - [`agent`]: one per GPU host. One supervisor task per slot owns that slot's fcvm
 //!   child process, so a slot's VM is only ever touched by one task.
+//! - [`renders`]: pages mode's host module, run on its own by `fcvm fleet renders-bench`.
 //!
 //! The pure parts (state, events, `apply`, tiling, wire types) are the `fleet-core` crate.
 
 pub mod agent;
 pub mod aggregate;
 pub mod coord;
+pub mod cpuset;
+pub mod lambda_tile;
 pub mod lines;
+pub mod renders;
+pub mod tunnel;
 
 use crate::cli::{FleetArgs, FleetCommand};
 use anyhow::Result;
@@ -24,6 +29,9 @@ pub async fn cmd_fleet(args: FleetArgs) -> Result<()> {
             agent::webproxy::spawn(a.listen).await?.await?;
             Ok(())
         }
+        FleetCommand::LambdaTile(a) => lambda_tile::run(*a).await,
+        FleetCommand::RendersBench(a) => renders::bench(*a).await,
+        FleetCommand::RendersReap(a) => renders::reap::cmd(a).await,
     }
 }
 

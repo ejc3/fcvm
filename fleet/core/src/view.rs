@@ -1,5 +1,5 @@
 //! What the coordinator sends out, derived from the state: the browser snapshot, each
-//! host's slot assignment, the EC2 driver's assignment and the shared scene.
+//! host's slot assignment, the EC2 and Lambda drivers' assignments and the shared scene.
 
 use crate::protocol::{
     AssignMinecraft, AssignPhone, AssignSlot, AssignWindows, ForkFrom, SharedScene,
@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TileView {
-    /// The tile's place: `fcvm:<k>` or `ec2:<k>`, 1-based, row-major.
+    /// The tile's place: `fcvm:<k>`, `ec2:<k>` or `lambda:<k>`, 1-based, row-major.
     pub id: String,
     pub half: Half,
     /// Its rectangle from `layout.from_frame` on.
@@ -23,7 +23,8 @@ pub struct TileView {
     /// `waiting_capacity` (dark), `borrowed` (lent to a visitor, drawn black),
     /// `relaunching` (desired generation not yet reported), or the slot's reported phase.
     pub phase: String,
-    /// The slot behind the tile (`slot-3`, `ec2-2`); null for an fcvm place with no GPU.
+    /// The slot behind the tile (`slot-3`, `ec2-2`, `lam-1`); null for an fcvm place with no
+    /// GPU.
     pub slot: Option<String>,
     /// The frame WebSocket over IPv6 and over IPv4. With published names (the fleet's
     /// coordinator) both are null until the launch's DNS names are published in its
@@ -39,6 +40,8 @@ pub struct TileView {
     pub generation: Option<u64>,
     pub fps: Option<f64>,
     pub gpu_stats: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_stats: Option<crate::protocol::VmStats>,
     pub error: Option<String>,
     /// Why the tile is not running when that is a fault.
     pub failure: Option<TileFailure>,
@@ -63,7 +66,8 @@ pub struct LayoutView {
     pub generation: u64,
     pub from_frame: i64,
     pub from_t: f64,
-    /// Each side's rectangle; null for a side with no places.
+    /// Each half's rectangle; null for a half with no places. `ec2` is the AWS half: its EC2
+    /// tiles and its Lambda tiles.
     pub fcvm: Option<Rect>,
     pub ec2: Option<Rect>,
 }
@@ -116,6 +120,15 @@ pub struct FleetView {
     pub ec2_n: usize,
     /// EC2 tiles without an instance (launching or waiting for capacity): dark tiles.
     pub ec2_waiting: usize,
+    /// The AWS half's Lambda tiles, as its EC2 tiles' three counts: tiles holding an
+    /// execution environment, places, and tiles without one. All absent when the fleet has
+    /// no Lambda tile.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub lambda_environments: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub lambda_n: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub lambda_waiting: usize,
     pub max_tiles: usize,
     /// The standby pool: GPUs beyond `max_tiles`, kept reset, scrubbed and bound with no
     /// VM, and how many of them have reported ready.
@@ -184,6 +197,24 @@ pub struct RelaunchAllView {
     /// half's current wait has run (null when none runs).
     pub ec2_capacity_wait_ms: u64,
     pub ec2_waiting_since: Option<u64>,
+    /// The Lambda tiles' progress, timed apart from the EC2 tiles' and in the same shape
+    /// (`lambda_done_at`, `lambda_pending`, ...), when the race had Lambda tiles; absent
+    /// otherwise.
+    #[serde(flatten)]
+    pub lambda: Option<LambdaRaceView>,
+}
+
+/// The Lambda tiles of the latest race. `lambda_ms` is click to the coordinator seeing each
+/// tile's new execution environment's first frame, less capacity waits Lambda named: the
+/// same event that ends the fcvm and EC2 times.
+#[derive(Debug, Clone, Serialize)]
+pub struct LambdaRaceView {
+    pub lambda_done_at: Option<u64>,
+    pub lambda_pending: usize,
+    pub lambda_gpus: usize,
+    pub lambda_ms: Option<u64>,
+    pub lambda_capacity_wait_ms: u64,
+    pub lambda_waiting_since: Option<u64>,
 }
 
 /// One half of the scoreboard; null until a race of that half has finished. Only
@@ -205,6 +236,10 @@ pub struct HalfScore {
 pub struct Scoreboard {
     pub fcvm: Option<HalfScore>,
     pub ec2: Option<HalfScore>,
+    /// The Lambda tiles' own row, apart from the EC2 tiles' though both are on the AWS half;
+    /// absent until a race with Lambda tiles has finished their part.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lambda: Option<HalfScore>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -412,6 +447,16 @@ pub struct SpendView {
     pub resets_at: u64,
     /// `budget` once the day's spend reached the ceiling; null otherwise.
     pub reason: Option<String>,
+    /// Today's spend and the current rate per backing (`hosts`, `ec2`, `lambda`), to the
+    /// cent, when the meter splits them; absent otherwise.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_backing: BTreeMap<String, BackingSpendView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackingSpendView {
+    pub usd_today: f64,
+    pub usd_per_hour: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -457,6 +502,10 @@ pub struct View {
     /// host has run players.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub potato: Option<crate::potato::PotatoView>,
+    /// Pages mode (`?mode=pages`): the renders host's last report and the overlay. Absent
+    /// while no host runs the mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renders: Option<crate::renders::RendersView>,
 }
 
 impl PhonesView {
@@ -494,7 +543,33 @@ pub struct MinecraftView {
     pub last_reset_all: Option<crate::minecraft::ResetAll>,
     /// The last fork that reached `running`.
     pub last_fork: Option<crate::minecraft::LastFork>,
+    /// Every server, up to [`crate::minecraft::TILES_LISTED`] of them; with more, the first
+    /// that many and every lent one, laid out in an image of their own, and `field` names all.
     pub tiles: Vec<MinecraftTileView>,
+    /// With more servers than are listed as tiles: every server, by host, with its view URL.
+    /// Their state is not here: it comes in `minecraft_status` messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<MinecraftField>,
+}
+
+/// Every Minecraft server of a fleet too large to list as tiles.
+#[derive(Debug, Clone, Serialize)]
+pub struct MinecraftField {
+    pub servers: usize,
+    pub hosts: Vec<MinecraftFieldHost>,
+}
+
+/// One host's servers, in the order of its status rows.
+#[derive(Debug, Clone, Serialize)]
+pub struct MinecraftFieldHost {
+    /// `minecraft_status.host` (`minecraft::host_key`).
+    pub key: String,
+    /// The servers' numbers (`mc-<n>`), by their place on the host.
+    pub servers: Vec<u32>,
+    /// Each one's view URL (`frame_url`), and its IPv4 one when any has one.
+    pub frames: crate::minecraft::Squeezed,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frames_v4: Option<crate::minecraft::Squeezed>,
 }
 
 /// A server's tile: a wall tile's fields, the name players join it at, and the server its
@@ -560,6 +635,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
             generation: None,
             fps: None,
             gpu_stats: None,
+            vm_stats: None,
             error: None,
             failure: None,
             last_relaunch: None,
@@ -596,6 +672,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
             generation: Some(s.generation),
             fps: s.observed.fps,
             gpu_stats: s.observed.gpu_stats.clone(),
+            vm_stats: s.observed.vm_stats.clone(),
             error: s.observed.error.as_deref().map(hide_account_ids),
             last_relaunch: s.last_relaunch.as_ref().map(|r| RelaunchView {
                 clicked_at: r.clicked_at,
@@ -626,8 +703,12 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
 pub fn view(state: &State) -> View {
     let f = &state.fleet;
     let c = &state.config;
-    let mut tiles = Vec::with_capacity(f.n + f.fcvm_dark.len() + f.ec2_n);
-    for (half, units) in [(Half::Fcvm, &f.slots), (Half::Ec2, &f.ec2)] {
+    let mut tiles = Vec::with_capacity(f.n + f.fcvm_dark.len() + f.ec2_n + f.lambda_n);
+    for (half, units) in [
+        (Half::Fcvm, &f.slots),
+        (Half::Ec2, &f.ec2),
+        (Half::Lambda, &f.lambda),
+    ] {
         let mut placed: Vec<&Slot> = units.values().filter(|s| s.position.is_some()).collect();
         placed.sort_by_key(|s| s.position);
         for s in placed {
@@ -705,7 +786,11 @@ pub fn view(state: &State) -> View {
             rect,
             frame_url,
             frame_url_v4,
-            tiles: (1..=f.ec2_n).map(|k| format!("ec2:{k}")).collect(),
+            // The whole AWS half: its EC2 tiles, then its Lambda tiles.
+            tiles: (1..=f.ec2_n)
+                .map(|k| format!("ec2:{k}"))
+                .chain((1..=f.lambda_n).map(|k| format!("lambda:{k}")))
+                .collect(),
         });
     }
     View {
@@ -737,6 +822,17 @@ pub fn view(state: &State) -> View {
             n: f.n + f.fcvm_dark.len(),
             ec2_n: f.ec2_n,
             ec2_waiting: f.ec2.values().filter(|s| s.observed.vm.is_none()).count(),
+            lambda_environments: f
+                .lambda
+                .values()
+                .filter(|s| s.observed.vm.is_some())
+                .count(),
+            lambda_n: f.lambda_n,
+            lambda_waiting: f
+                .lambda
+                .values()
+                .filter(|s| s.observed.vm.is_none())
+                .count(),
             max_tiles: c.max_tiles,
             standby,
             standby_ready,
@@ -769,6 +865,7 @@ pub fn view(state: &State) -> View {
         scoreboard: Scoreboard {
             fcvm: score(f.races.iter().map(|r| (r.id, &r.fcvm))),
             ec2: score(f.races.iter().map(|r| (r.id, &r.ec2))),
+            lambda: score(f.races.iter().map(|r| (r.id, &r.lambda))),
         },
         races: f.races.iter().rev().take(10).rev().cloned().collect(),
         nudges: nudges(&f.director, f.scene.epoch_unix_ms),
@@ -809,6 +906,14 @@ pub fn view(state: &State) -> View {
         windows: windows_view(state),
         minecraft: minecraft_view(state),
         potato: state.fleet.potato.view(&state.config.potato),
+        renders: state
+            .fleet
+            .renders
+            .view(&state.config.renders)
+            .map(|mut v| {
+                (v.frame_url, v.frame_url_v4) = renders_urls(state, &v.host);
+                v
+            }),
     }
 }
 
@@ -978,12 +1083,33 @@ fn minecraft_view(state: &State) -> Option<MinecraftView> {
     if f.minecraft.is_empty() {
         return None;
     }
-    let (places, image_aspect) = minecraft_places(state);
-    let tiles = places
+    let (places, mut image_aspect) = minecraft_places(state);
+    let listed = crate::minecraft::TILES_LISTED;
+    // A fleet of more servers than a page lists: the first `listed` and every lent one are
+    // tiles, in an image of their own; every server is named in `field`.
+    let many = f.minecraft.len() > listed;
+    let shown: Vec<(&u32, &(usize, Rect))> = places
         .iter()
-        .map(|(n, (i, rect))| {
-            let s = &f.minecraft[n];
-            let mut t = tile(state, format!("mc:{}", i + 1), Half::Fcvm, *rect, Some(s));
+        .filter(|(n, (i, _))| {
+            !many
+                || *i < listed
+                || f.minecraft[*n]
+                    .minecraft
+                    .as_ref()
+                    .is_some_and(|m| m.claim.is_some())
+        })
+        .collect();
+    let own = many.then(|| crate::minecraft::layout(shown.len()));
+    if let Some((_, aspect)) = &own {
+        image_aspect = *aspect;
+    }
+    let tiles = shown
+        .iter()
+        .enumerate()
+        .map(|(k, (n, (i, rect)))| {
+            let s = &f.minecraft[*n];
+            let rect = own.as_ref().map_or(*rect, |(rects, _)| rects[k]);
+            let mut t = tile(state, format!("mc:{}", i + 1), Half::Fcvm, rect, Some(s));
             let m = s.minecraft.as_ref();
             t.borrowed = m.and_then(|m| m.claim.as_ref()).map(|c| BorrowedView {
                 session: c.session.clone(),
@@ -1001,6 +1127,40 @@ fn minecraft_view(state: &State) -> Option<MinecraftView> {
             }
         })
         .collect();
+    let field = many.then(|| {
+        let mut by_host: BTreeMap<&str, Vec<(u32, u32)>> = BTreeMap::new();
+        for (n, s) in &f.minecraft {
+            if let (Some(host), Some(m)) = (s.host.as_deref(), s.minecraft.as_ref()) {
+                by_host.entry(host).or_default().push((m.index, *n));
+            }
+        }
+        let hosts = by_host
+            .into_iter()
+            .map(|(host, mut servers)| {
+                servers.sort_unstable();
+                let urls: Vec<(Option<String>, Option<String>)> = servers
+                    .iter()
+                    .map(|(_, n)| frame_urls(state, &f.minecraft[n]))
+                    .collect();
+                let v4: Vec<Option<String>> = urls.iter().map(|u| u.1.clone()).collect();
+                MinecraftFieldHost {
+                    key: crate::minecraft::host_key(host),
+                    servers: servers.iter().map(|(_, n)| *n).collect(),
+                    frames: crate::minecraft::squeeze(
+                        &urls.iter().map(|u| u.0.clone()).collect::<Vec<_>>(),
+                    ),
+                    frames_v4: v4
+                        .iter()
+                        .any(Option::is_some)
+                        .then(|| crate::minecraft::squeeze(&v4)),
+                }
+            })
+            .collect();
+        MinecraftField {
+            servers: f.minecraft.len(),
+            hosts,
+        }
+    });
     let lent: Vec<u64> = f
         .minecraft
         .values()
@@ -1028,6 +1188,7 @@ fn minecraft_view(state: &State) -> Option<MinecraftView> {
         last_reset_all: f.last_minecraft_reset_all.clone(),
         last_fork: f.last_minecraft_fork.clone(),
         tiles,
+        field,
     })
 }
 
@@ -1105,6 +1266,19 @@ fn spend_view(s: &crate::spend::Spend, c: &crate::state::Config) -> Option<Spend
         day_start,
         resets_at: day_start + crate::spend::DAY_MS,
         reason: s.tripped.then(|| crate::spend::BUDGET.to_string()),
+        by_backing: s
+            .by_backing
+            .iter()
+            .map(|(k, b)| {
+                (
+                    k.clone(),
+                    BackingSpendView {
+                        usd_today: cents(b.usd),
+                        usd_per_hour: cents(b.usd_per_hour),
+                    },
+                )
+            })
+            .collect(),
     })
 }
 
@@ -1118,6 +1292,22 @@ pub fn no_arrival_deadline(p: &Power, c: &crate::state::Config) -> Option<u64> {
         .map(|t| t + c.sleep_without_new_viewer_secs * 1000)
 }
 
+/// Whether an active page wakes a sleeping fleet at `at`: the limit without a new viewer
+/// has at least `min_wake_remaining_secs` left (the whole limit, when the limit is shorter
+/// than that), or there is no limit. A wake with less left would launch hosts that the limit
+/// terminates minutes later, under the viewer they were launched for. An arrival sets the
+/// limit's start to `at` first, so it always wakes.
+pub fn page_wakes(p: &Power, c: &crate::state::Config, at: u64) -> bool {
+    let Some(deadline) = no_arrival_deadline(p, c) else {
+        return true;
+    };
+    let min = c
+        .min_wake_remaining_secs
+        .min(c.sleep_without_new_viewer_secs)
+        * 1000;
+    at < deadline && deadline - at >= min
+}
+
 fn relaunch_all(r: &Race) -> RelaunchAllView {
     let pending = |h: &HalfRace| {
         h.tiles
@@ -1125,13 +1315,20 @@ fn relaunch_all(r: &Race) -> RelaunchAllView {
             .filter(|t| t.first_frame_at.is_none())
             .count()
     };
-    let waiting_since = r
-        .ec2
-        .tiles
-        .values()
-        .filter(|t| t.first_frame_at.is_none())
-        .filter_map(|t| t.waiting_since)
-        .min();
+    let waiting_since = |h: &HalfRace| {
+        h.tiles
+            .values()
+            .filter(|t| t.first_frame_at.is_none())
+            .filter_map(|t| t.waiting_since)
+            .min()
+    };
+    let capacity_wait = |h: &HalfRace| {
+        h.tiles
+            .values()
+            .map(|t| t.capacity_wait_ms)
+            .max()
+            .unwrap_or(0)
+    };
     RelaunchAllView {
         race: r.id,
         started_at: r.started_at,
@@ -1151,14 +1348,16 @@ fn relaunch_all(r: &Race) -> RelaunchAllView {
         ec2_gpus: r.ec2.tiles.len(),
         fcvm_ms: r.fcvm.time_ms,
         ec2_ms: r.ec2.time_ms,
-        ec2_capacity_wait_ms: r
-            .ec2
-            .tiles
-            .values()
-            .map(|t| t.capacity_wait_ms)
-            .max()
-            .unwrap_or(0),
-        ec2_waiting_since: waiting_since,
+        ec2_capacity_wait_ms: capacity_wait(&r.ec2),
+        ec2_waiting_since: waiting_since(&r.ec2),
+        lambda: (!r.lambda.tiles.is_empty()).then(|| LambdaRaceView {
+            lambda_done_at: r.lambda.done_at,
+            lambda_pending: pending(&r.lambda),
+            lambda_gpus: r.lambda.tiles.len(),
+            lambda_ms: r.lambda.time_ms,
+            lambda_capacity_wait_ms: capacity_wait(&r.lambda),
+            lambda_waiting_since: waiting_since(&r.lambda),
+        }),
     }
 }
 
@@ -1426,9 +1625,18 @@ pub fn host_regions(state: &State) -> BTreeMap<String, Option<Rect>> {
 
 /// The EC2 tiles the driver must run.
 pub fn ec2_assignment(state: &State) -> Vec<AssignSlot> {
-    state
-        .fleet
-        .ec2
+    remote_assignment(state, &state.fleet.ec2)
+}
+
+/// The Lambda tiles the driver must run: one function per tile, its generation the version
+/// to publish. Empty while the fleet sleeps (or the day's budget is spent), so the driver
+/// deletes every function then.
+pub fn lambda_assignment(state: &State) -> Vec<AssignSlot> {
+    remote_assignment(state, &state.fleet.lambda)
+}
+
+fn remote_assignment(state: &State, tiles: &BTreeMap<u32, Slot>) -> Vec<AssignSlot> {
+    tiles
         .values()
         .map(|s| AssignSlot {
             id: s.id.clone(),
@@ -1464,6 +1672,34 @@ pub fn host_aggregate_urls(state: &State, h: &Host) -> (Option<String>, Option<S
                 h.aggregate_ipv6.as_deref(),
                 h.aggregate_ipv4.as_deref(),
                 h.aggregate_v4_port,
+            ) =>
+        {
+            (p.frame_url.clone(), p.frame_url_v4.clone())
+        }
+        _ => (None, None),
+    }
+}
+
+/// Pages mode's host's frame URLs (IPv6, IPv4), as for a host aggregator: with published
+/// names, those of the addresses its hello gave, once published; otherwise the URLs of its
+/// last report.
+pub fn renders_urls(state: &State, host: &str) -> (Option<String>, Option<String>) {
+    let Some(h) = state.fleet.renders.hosts.get(host) else {
+        return (None, None);
+    };
+    if !state.config.names_published {
+        let r = h.report.as_ref();
+        return (
+            r.and_then(|r| r.frame_url.clone()),
+            r.and_then(|r| r.frame_url_v4.clone()),
+        );
+    }
+    match &h.published {
+        Some(p)
+            if p.names(
+                h.hello.ipv6.as_deref(),
+                h.hello.ipv4.as_deref(),
+                h.hello.v4_port,
             ) =>
         {
             (p.frame_url.clone(), p.frame_url_v4.clone())
@@ -1512,4 +1748,8 @@ pub fn frame_urls(state: &State, s: &Slot) -> (Option<String>, Option<String>) {
         }
         _ => (None, None),
     }
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }

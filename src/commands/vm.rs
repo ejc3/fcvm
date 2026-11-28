@@ -351,6 +351,11 @@ async fn relay_until_one_side_ends(
     drain: std::time::Duration,
 ) {
     use tokio::io::AsyncWriteExt;
+    // Each read from the client is written to the guest as it arrives.
+    crate::network::relay_socket::set_relay_nodelay(
+        &guest,
+        format_args!("rdp relay, guest socket"),
+    );
     let (mut client_rx, mut client_tx) = client.into_split();
     let (mut guest_rx, mut guest_tx) = guest.into_split();
     let to_guest = async {
@@ -423,6 +428,8 @@ impl NsHelper {
         vm_id: &str,
         data_dir: &Path,
         rdp_port: u16,
+        // The VM's decision: the helper runs in the VM's namespaces, spawned as its VMM is.
+        decision: &crate::confine::Decision,
     ) -> Result<NsHelper> {
         use tokio::io::AsyncBufReadExt;
         let exe = std::env::current_exe().context("finding this fcvm binary")?;
@@ -443,10 +450,9 @@ impl NsHelper {
         crate::utils::install_namespace_pre_exec(
             &mut command,
             &crate::utils::NamespaceParams {
-                vm_id: vm_id.to_string(),
                 user_namespace_path: Some(user_ns.to_path_buf()),
                 net_namespace_path: Some(net_ns.to_path_buf()),
-                ..Default::default()
+                ..crate::utils::NamespaceParams::new(vm_id, decision.clone())
             },
         )?;
         // The parent died between the fork and the prctl above: no signal will come.
@@ -574,15 +580,24 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
 
     // What VMs of processes killed without teardown left goes first, then this VM's
     // runtime directory is recorded before anything creates it (crate::reclaim).
-    crate::reclaim::reclaim_abandoned().await;
+    crate::reclaim::reclaim_abandoned_if_due().await;
     let vm_id = generate_vm_id();
     let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
         path: paths::vm_runtime_dir(&vm_id),
     })?;
     paths::check_socket_path_budget(&vm_id)?;
-    let data_dir = paths::vm_runtime_dir(&vm_id);
-    tokio::fs::create_dir_all(&data_dir)
+    // Refused when the host requires confinement: this command does not confine.
+    let decision = crate::confine::resolve(&crate::confine::Request {
+        flag: false,
+        backend: crate::hypervisor::Backend::Firecracker,
+        network: args.network.into(),
+        firecracker_args: None,
+        unsupported: Some("fcvm vm run does not support confinement yet"),
+        kernel_profile: None,
+        passthrough_devices: 0,
+    })?;
+    let data_dir = paths::create_vm_runtime_dir(&vm_id)
         .await
         .context("creating VM data directory")?;
 
@@ -605,6 +620,7 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
     // No vsock device: nothing in the guest listens on one. The restore machinery still
     // keys the source VM's directory off the path its vsock socket would have had, which is
     // the directory that holds the disk and the console log a restore redirects.
+    vm_state.config.vm_runtime_dir = Some(data_dir.clone());
     vm_state.config.vsock_socket_path = None;
     vm_state.config.source_vsock_socket_path = Some(data_dir.join("vsock.sock"));
 
@@ -651,6 +667,7 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
         &mut holder_slot,
         &mut helper_slot,
         &mut boot_slot,
+        &decision,
     )
     .await;
     if let Err(e) = booted {
@@ -707,6 +724,7 @@ async fn boot_raw_vm(
     holder_slot: &mut Option<tokio::process::Child>,
     helper_slot: &mut Option<NsHelper>,
     boot_slot: &mut Option<RawBoot>,
+    decision: &crate::confine::Decision,
 ) -> Result<()> {
     let vm_id = vm_state.vm_id.clone();
     // The disk is the VM's own reflink copy, at the path every VM's disk has, which is
@@ -739,6 +757,7 @@ async fn boot_raw_vm(
         vm_id.clone(),
         data_dir.join("firecracker.sock"),
         Some(data_dir.join("firecracker.log")),
+        decision.clone(),
     )) as Box<dyn Hypervisor>);
     backend
         .spawn(&process_spec)
@@ -756,8 +775,17 @@ async fn boot_raw_vm(
         .zip(process_spec.net_namespace_path.as_deref())
         .context("the rootless namespace has no namespace paths")?;
     write_generation(data_dir, &vm_id, 0)?;
-    *helper_slot =
-        Some(NsHelper::start(user_ns, net_ns, &vm_id, data_dir, args.health_port).await?);
+    *helper_slot = Some(
+        NsHelper::start(
+            user_ns,
+            net_ns,
+            &vm_id,
+            data_dir,
+            args.health_port,
+            decision,
+        )
+        .await?,
+    );
 
     *boot_slot = Some(RawBoot {
         ch_bin: ch_bin.to_path_buf(),
@@ -820,6 +848,7 @@ async fn boot_firmware(backend: &mut dyn Hypervisor, boot: &RawBoot) -> Result<(
         .add_network_interface(&NetIfaceSpec {
             iface_id: "eth0".to_string(),
             host_dev_name: boot.tap_device.clone(),
+            host_dev_fd: None,
             guest_mac: Some(boot.guest_mac.clone()),
         })
         .await?;
@@ -1352,6 +1381,43 @@ mod tests {
         let text = std::fs::read_to_string(clock_ack_path(dir.path())).unwrap();
         assert!(text.starts_with("vm-raw-b1 "), "{text}");
         server.abort();
+    }
+
+    /// A message the rdp client writes in two parts reaches the guest without waiting for
+    /// the guest to acknowledge the first: the relay's guest socket has TCP_NODELAY.
+    #[tokio::test]
+    async fn a_message_in_two_parts_reaches_the_guest_without_waiting_for_an_ack() {
+        use crate::network::relay_socket::two_part::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let guest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = guest.local_addr().unwrap();
+        let (mut client, relay_side) = tokio::net::UnixStream::pair().unwrap();
+        let relay = tokio::spawn(async move {
+            let guest = tokio::net::TcpStream::connect(target).await.unwrap();
+            relay_until_one_side_ends(relay_side, guest, RDP_RELAY_WRITE_STALL, RDP_RELAY_DRAIN)
+                .await
+        });
+        let (mut server, _) = guest.accept().await.unwrap();
+        let mut took = Vec::with_capacity(ROUNDS);
+        let mut buf = vec![0u8; SECOND];
+        for _ in 0..ROUNDS {
+            quickack_off(&server);
+            let started = std::time::Instant::now();
+            client.write_all(&[1u8; FIRST]).await.unwrap();
+            server.read_exact(&mut buf[..FIRST]).await.unwrap();
+            client.write_all(&[2u8; SECOND]).await.unwrap();
+            server.read_exact(&mut buf[..SECOND]).await.unwrap();
+            took.push(started.elapsed());
+            tokio::time::sleep(BETWEEN_ROUNDS).await;
+        }
+        drop(client);
+        drop(server);
+        relay.await.unwrap();
+        let median = median(took);
+        assert!(
+            median < LIMIT,
+            "median {median:?} for a message in two parts to the guest"
+        );
     }
 
     /// Every connection to rdp.sock is relayed to the guest's port, both ways.

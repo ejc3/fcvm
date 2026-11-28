@@ -9,6 +9,14 @@
 # Override per nesting level (e.g., /mnt/fcvm-btrfs/level-1)
 data_dir = "/mnt/fcvm-btrfs"
 
+# Directory under which each data directory keeps what describes running processes only:
+# VM states and the namespace pool, in <runtime_dir>/<key of data_dir>. Unset (the
+# default): /run/fcvm-<uid of data_dir's owner> when it exists (`sudo fcvm setup` makes it
+# and has it made at every boot) or the caller is root, else <data_dir>/runtime.
+# FCVM_RUNTIME_DIR overrides it. Every process that uses a data directory must see the
+# same directory here: a container with its own /run needs a base named for it.
+# runtime_dir = "/run/fcvm-example"
+
 # Directory for shared content-addressed assets (kernels, rootfs, initrd, image-cache)
 # All nesting levels share this for deduplication via btrfs reflinks
 assets_dir = "/mnt/fcvm-btrfs"
@@ -18,6 +26,16 @@ assets_dir = "/mnt/fcvm-btrfs"
 # Ignored if the host filesystem is already btrfs.
 btrfs_size = "60G"
 
+# Confinement of each VM's VMM (`--confine` on `podman run` and `snapshot run`; src/confine.rs).
+# "off": a start is confined when it passes --confine. "required": every start is confined,
+# and one that cannot be fails. FCVM_CONFINE=required tightens this; it cannot loosen it.
+[confine]
+mode = "off"
+# FCVM_CONFINE_SECCOMP=log installs the syscall allowlist in log mode, which allows every
+# syscall and records the ones outside the list. With mode = "required" it is refused unless
+# this is true; a start in log mode warns and is shown as "seccomp-log", never "seccomp".
+allow_seccomp_log = false
+
 # Pinned pasta (passt) build
 # This upstream commit keeps `-a`, `-g` and `-n` on a host with no IPv4
 # interface for pasta to copy its configuration from. Before it, pasta used
@@ -25,9 +43,10 @@ btrfs_size = "60G"
 # address, and took the packets the VM's namespace sent to the guest.
 # It also contains 3f57f0382f6a, the addr_seen fix for issue #661: overheard
 # bridge traffic must not retarget inbound port forwarding away from the guest.
-# `fcvm setup` builds it, plus the carried patch that guards udp_sock_errs()
-# against a NULL flow (scripts/passt-udp-sock-errs-null-flow.patch), into a
-# content-addressed binary. Rootless VMs require that binary while this section
+# `fcvm setup` builds it, plus the carried patches (scripts/passt-*.patch: a
+# guard of udp_sock_errs() against a NULL flow, and for the pastas of a
+# namespace pool `--no-neigh-notify` and a reset with a status reply on the
+# control socket), into a content-addressed binary. Rootless VMs require that binary while this section
 # is present.
 #
 # The source comes from the commit's snapshot archive, verified by
@@ -44,21 +63,97 @@ archives = [
     "https://passt.top/passt/snapshot/passt-4e8aa70379a35ec9deb11d76513e7f6c4123b667.tar.xz",
 ]
 
+# Pinned libseccomp, linked into every Firecracker that `fcvm setup` builds.
+# Firecracker's seccompiler links libseccomp (`-lseccomp`) into the build script
+# that compiles the binary's seccomp policy, and upstream Firecracker now calls
+# seccomp_export_bpf_mem(), which libseccomp has from 2.6.0 on. Ubuntu 24.04
+# ships 2.5.5, so a Firecracker with that call does not link against the host's
+# library.
+# `fcvm setup` builds this release as a static archive into a content-addressed
+# directory, and the Firecracker build is given that directory as a library
+# search path. Nothing is installed on the host. The build needs make and a C compiler. The archive's
+# name is part of each Firecracker binary's name, so moving this pin rebuilds
+# them.
+#
+# The source is the release tarball, verified by archive_sha256, from the first
+# of `archives` that serves it. Upstream's release is the only source listed.
+# scripts/publish-libseccomp-archive.sh uploads a copy as a release asset of
+# this repository
+# (https://github.com/ejc3/fcvm/releases/download/libseccomp-<version>/libseccomp-<version>.tar.gz);
+# once that release exists, listing it first here is a one-line change.
+[libseccomp]
+version = "2.6.1"
+archive_sha256 = "501f66c667225d53791b97e1d7cf85ab764c297d04881f60f38f451c4b0ee1be"
+archives = [
+    "https://github.com/seccomp/libseccomp/releases/download/v2.6.1/libseccomp-2.6.1.tar.gz",
+]
+
 # Default Firecracker binary, for every kernel profile that does not set its
-# own firecracker_repo (all of them except nested.arm64).
-# Build from the fork's patch chain rebased onto upstream v1.17.0 (95f868c8e,
-# 2026-09-04): vsock muxer capacity + the bounded UFFD-minor memory backend,
-# and a Full snapshot written to a new memory file leaves all-zero 4 KiB pages
-# as holes, and with dirty tracking on a diff holds the pages a discard emptied
-# (balloon, free page reporting) as zeros. nested.arm64 builds its own NV2
-# fork, which has neither change; its Full snapshot leaves only never-written
-# guest memory as holes. This build's snapshot load takes drive_overrides, so a clone opens its
-# own disks and needs no mount namespace; its --version says so (+fcvm.drive-overrides).
-# v1.17.0 writes snapshot format 12 and refuses format 11, and the previous
-# build cannot restore format 12. A restore uses the binary the snapshot
-# recorded (SnapshotMetadata::firecracker_bin) while that file exists. A
-# snapshot that records none is loaded with this build, so a format 11 one
-# fails to load, and the error says to re-create it or pass --firecracker-bin.
+# own firecracker_repo.
+# Built from the fork's patch chain on upstream Firecracker's main branch
+# (2a8d0138c, 2026-11-25, 1.19.0-dev). The branch is named for its upstream base
+# and only grows; a later base gets a new branch. What the chain adds to upstream:
+# - vsock: 16384 connections and a 2048-entry kill queue, for the egress proxy;
+# - the UffdMinor memory backend: clones map one sealed file of the snapshot's
+#   memory and share its clean pages (--uffd-mode minor);
+# - a Full snapshot written to a new memory file leaves all-zero 4 KiB pages and
+#   never-mapped guest memory as holes, and with dirty tracking a snapshot holds
+#   the pages a discard emptied (balloon, free page reporting) as zeros;
+# - --numa-balancing-after-secs, which keeps new guest memory out of NUMA
+#   balancing for that long (fcvm passes 60). Guest memory that maps a memfd (a
+#   clone of a --uffd-mode minor serve) is left as it is;
+# - mem_backend.write_set_path: a File-backend load populates the recorded write
+#   set before the guest runs;
+# - host_dev_fd: a net device takes a TAP queue the process inherited, which is
+#   how a clone in a pooled namespace gets its TAP;
+# - drive backing files opened with POSIX_FADV_RANDOM;
+# - a Diff snapshot of a VM that maps its memory file privately without dirty
+#   tracking (a File or UFFD minor restore) takes the pages the guest wrote from
+#   /proc/self/pagemap, where upstream takes every page of the file that is in
+#   the page cache (mincore);
+# - a Diff written in place over a memory file that already holds the guest's
+#   memory as of the last snapshot writes up to four clean pages lying between
+#   two written runs with them, as one write (each write into a file that
+#   shares its extents with its parent costs about the same whatever its
+#   length: 810 s against 302 s for a 15.7 GB diff of a 128 GiB guest, measured
+#   on the v1.17.0-based branch, #2047);
+# - a balloon inflate on 2 MiB pages zeroes a huge page it covers only in part
+#   when that allocates nothing, and leaves it otherwise: upstream zeroes it
+#   always, which on a clone served from a shared memfd copied a huge page for
+#   every 4 KiB of balloon (850 MiB for a 1536 MiB inflate of a 2 GiB guest);
+# - on arm64 a restore gives the GIC the enable and active state the snapshot
+#   holds: the saved value used to be written to the clear-registers as well,
+#   which left every interrupt the new VM starts with enabled (all sixteen SGIs)
+#   enabled whatever the guest had done (#2172, firecracker#6486);
+# - the default seccomp policy installed once per process. fcvm builds for the
+#   gnu target, which has no policy of its own, so that policy is upstream's
+#   unimplemented.json: every syscall of the native architecture allowed;
+# - on x86_64 a snapshot load ends with a paravirtual kick for every vCPU the
+#   snapshot holds as runnable, in a guest that was offered KVM_FEATURE_PV_UNHALT:
+#   KVM keeps a spinlock kick that is pending for a runnable vCPU in a flag no
+#   ioctl reads, so the snapshot does not hold it, and without the kick a vCPU
+#   restored just before the HLT of its lock wait halts with interrupts off for
+#   good (#2131). KVM from 6.15 on clears the kick again on the vCPU's first
+#   entry (#2132) unless it carries the patch that keeps it (kernel/README.md):
+#   every x86_64 kernel below that builds KVM does, the host kernel and the guest
+#   kernels that run KVM themselves, and no distribution kernel does. The gpu,
+#   phone and nested amd64 profiles pin the same fix on their own branches, and
+#   every_x86_64_firecracker_pin_kicks_runnable_vcpus_on_restore fails when one
+#   of these pins moves to a commit that is not listed as carrying it.
+# A snapshot load's drive_overrides is upstream's own on this base
+# (firecracker#6402); a clone opens its own disks through it.
+# `--version` names what fcvm reads before it uses a field or flag:
+# +fcvm.drive-overrides.numa-window.write-set.tap-fd.pagemap-dirty.
+# Snapshots: upstream's format is 13.0.0, and the chain ends every state file
+# with a mark of its own layout, checked before anything is decoded. A file
+# without the mark, which is every file an earlier build wrote (formats 10, 12
+# and the nested builds' 13), and a file of another layout are refused with
+# "Invalid data version". A restore uses the binary the snapshot recorded
+# (SnapshotMetadata::firecracker_bin) while that file exists. A snapshot whose
+# binary is gone, or that records none, is loaded with this build, is refused,
+# and the error says to re-create it or pass --firecracker-bin. An earlier
+# build refuses a file of this one: its decode fails ("bitcode error" from the
+# v1.17.0-based builds, default and nested).
 # `fcvm setup` builds this automatically; `find_firecracker()` uses it.
 # `commit` is required. Setup keeps a binary already built for it without
 # contacting the remote. Otherwise it fetches the commit by its hash, which
@@ -70,19 +165,114 @@ archives = [
 # Kernel profiles can override with their own firecracker_repo/branch/commit.
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "agent/uffd-minor-v1.17.0-drive-overrides"
-commit = "3057dcb77d2d3b2791fc0729ae1d1cf4cf401588"
+branch = "fcvm/base-2a8d0138"
+commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
-# Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).
-# Pinned to a fork branch carrying the aarch64 SVE register save/restore fix
-# (upstream CH PR #8268), which landed after the v52.0 release and is in no tagged
-# release yet. Required for CH snapshot/restore on SVE-capable hosts (Graviton3+).
-# The branch also carries memory_restore_mode=map (ejc3/cloud-hypervisor#1), which fcvm's
-# Cloud Hypervisor restores use: the snapshot's memory file mapped instead of copied.
+# Built on demand with `fcvm setup --cloud-hypervisor`. This is upstream's main branch at
+# `commit` (v55.0 plus 117 commits), with no patch of fcvm's own: the restore options fcvm
+# passes are upstream's (memory_restore_mode=copyonwrite since v54.0, and
+# clock_restore_mode=preserve, which is on main and in no release yet).
+# `commit` is required. The binary's name is a hash of the repo, the commit, the
+# architecture and the libc, launch runs that file and no other, and setup refuses a
+# checkout whose HEAD is not the commit. A snapshot restores only on the build that wrote
+# it, so moving this pin means every Cloud Hypervisor snapshot is created again.
 [cloud_hypervisor]
-repo = "ejc3/cloud-hypervisor"
-branch = "fcvm-v52-sve-fix"
+repo = "cloud-hypervisor/cloud-hypervisor"
+commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
+
+# Published builds of the pinned VMMs above (src/setup/vmm_artifacts.rs). vmm.yml builds each
+# Firecracker pin of a published kernel profile and the Cloud Hypervisor pin from source, per
+# architecture and libc, on GitHub-hosted runners, publishes each binary as a release asset of
+# `repo` named for its store file, and pushes the entries below to a vmm-digests/ branch.
+# Setup installs an entry whose name is the one it would build, checked against `sha256`, and
+# builds locally when there is none. A pin change builds locally until its entries land.
+[vmm_artifacts]
+repo = "ejc3/fcvm"
+
+[[vmm_artifacts.files]]
+name = "cloud-hypervisor-243d1c8ffff4.bin"
+commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
+arch = "x86_64"
+libc = "libc-2.39"
+sha256 = "d8999c7baf176ec124cd48bb4cb5dffe5a584a4e105f0e416232ed27383e35b3"
+
+[[vmm_artifacts.files]]
+name = "cloud-hypervisor-af878066d491.bin"
+commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
+arch = "x86_64"
+libc = "libc-2.36"
+sha256 = "adb7e3ec2521514c8a3d361e2647f0b81b7ecaaf2eba8eaa998ddb52e811354c"
+
+[[vmm_artifacts.files]]
+name = "cloud-hypervisor-b857d4ccd8bc.bin"
+commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
+arch = "aarch64"
+libc = "libc-2.36"
+sha256 = "0588ddf36dbdf419ed1e500548dec6809ec9bb7048b218b9d74db9247b8fc4aa"
+
+[[vmm_artifacts.files]]
+name = "cloud-hypervisor-f65bbba51d6a.bin"
+commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
+arch = "aarch64"
+libc = "libc-2.39"
+sha256 = "3d9121a05b45dc55b2f937ac147bec7d90a5805b0faecd3b7e6c45cad92ce963"
+
+[[vmm_artifacts.files]]
+name = "firecracker-default-22be8e6e2431.bin"
+commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
+arch = "x86_64"
+libc = "libc-2.36"
+sha256 = "fa4138bfdcd89835d666a2309687cfa2486b4f5030e058a9244f8238be990862"
+
+[[vmm_artifacts.files]]
+name = "firecracker-default-56214b50b7a5.bin"
+commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
+arch = "aarch64"
+libc = "libc-2.39"
+sha256 = "b98c7e646b1df3c6b94ff4d19e17d7160a4ec82ed702fac85da4580dc8ba892a"
+
+[[vmm_artifacts.files]]
+name = "firecracker-default-cbb3df61508a.bin"
+commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
+arch = "aarch64"
+libc = "libc-2.36"
+sha256 = "ea144a8afba92f3915a05a6b117c18a5a67b1a70eb10d351f2b5f33857969be9"
+
+[[vmm_artifacts.files]]
+name = "firecracker-default-f8cb4eaa1956.bin"
+commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
+arch = "x86_64"
+libc = "libc-2.39"
+sha256 = "bcbefd56b5c163d22b21b8ca234dc0876d0e83eac4edf59549e7047c4ad867c8"
+
+[[vmm_artifacts.files]]
+name = "firecracker-nested-32142642e8b2.bin"
+commit = "af888e7aec38fe4727fd75878aaed017a3113028"
+arch = "x86_64"
+libc = "libc-2.36"
+sha256 = "814abae267fddad546677ec23731bb71dc73bf0a079a234c178411bc94d05d89"
+
+[[vmm_artifacts.files]]
+name = "firecracker-nested-a419eeec6fe9.bin"
+commit = "af888e7aec38fe4727fd75878aaed017a3113028"
+arch = "x86_64"
+libc = "libc-2.39"
+sha256 = "fa0383038131ab113bc029720cf0580624fed5663fbd3800443d4140d0a549eb"
+
+[[vmm_artifacts.files]]
+name = "firecracker-nested-bfef5f6122d9.bin"
+commit = "8750b52190681dbc6fbf633243e1793b1841290d"
+arch = "aarch64"
+libc = "libc-2.36"
+sha256 = "09c92382893aa1ad240aaf1911a6cec4f64c1fcee5e219f88e2fae3b05bddedc"
+
+[[vmm_artifacts.files]]
+name = "firecracker-nested-ceaab5b7a449.bin"
+commit = "8750b52190681dbc6fbf633243e1793b1841290d"
+arch = "aarch64"
+libc = "libc-2.39"
+sha256 = "b307855f7cbfe8530d17dd6a8e07a725b1da93082fa649b680c14b8ab5d81dd9"
 
 # Rootfs Modification Plan
 #
@@ -168,6 +358,12 @@ disable = [
     "update-notifier-motd.timer",
     "ua-timer.timer",
     "apport-autoreport.timer",
+    # fc-agent configures the guest's network itself, so nothing ever marks it online for
+    # networkd: the wait ran into its 2 min timeout on every boot, holding network-online.target
+    # and 24 jobs behind it (multi-user and graphical targets, apport, pollinate, ModemManager,
+    # udisks2 and more). A snapshot taken before then carried that wait into every clone, which
+    # then ran all of those jobs together about 120 s after the guest booted.
+    "systemd-networkd-wait-online.service",
 ]
 
 [files]
@@ -252,13 +448,15 @@ remove_dirs = [
 # "# CONFIG_INET_DIAG is not set", which leaves SOCK_DESTROY unavailable and no
 # way to retire a restored clone's snapshot-time sockets. kernel_sha is the
 # verified content hash of build_inputs and lets installed binaries resolve the
-# release artifact without retaining a source checkout. The pin follows the
+# release artifact without retaining a source checkout. kernel_artifact_sha256 is
+# the SHA-256 of the released vmlinux; setup refuses a download with any other. The pin follows the
 # deployable-profile rule above.
 [kernel_profiles.default.arm64]
 description = "Default fcvm guest kernel"
 kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "ca1837829fd0"
+kernel_artifact_sha256 = "28115c483723c3f8a7e3cc86958084cfd121223f6ea7beb09716154d868b8aab"
 build_inputs = [
     "kernel/default-arm64.build.toml",
     "kernel/default.conf",
@@ -276,6 +474,7 @@ description = "Default fcvm guest kernel (x86_64)"
 kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "cb9d7ff723d3"
+kernel_artifact_sha256 = "d3768ed71d18647617bfeec9bcb45b6f6c75835d51a22d3be41e0a23d5dc43df"
 build_inputs = [
     "kernel/default-amd64.build.toml",
     "kernel/default-x86.conf",
@@ -320,8 +519,8 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # 6 GiB guest's detach (DESIGN.md "arm64: g5g.metal", #1317). amd64 stays on the
 # previous commit until the change is measured on a g4dn.metal.
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/vfio-keep-dma-on-detach"
-firecracker_commit = "afeb8da92d1d6aaaa4ff009e8df88aafbfc3b1a4"
+firecracker_branch = "agent/vfio-keep-dma-on-detach-gic-clear-restore"
+firecracker_commit = "51247b891bceddcdd06169f61d5a64b33f5e0ba5"
 firecracker_args = "--enable-pci"
 # On the PCI transport the guest's virtio-net NIC is a PCI device, which udev renames
 # to enp0s<slot>; fc-agent and fcvm configure "eth0" (IPv6, routes, the snapshot gate),
@@ -367,9 +566,11 @@ build_inputs = [
 kernel_config = "kernel/gpu-x86.conf"
 patches_dir = "kernel/patches-gpu-7.3"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
+# The fork's VFIO branch (agent/vfio-uffd-populate) plus the paravirtual kick a snapshot
+# load gives every runnable vCPU (#2131, see [firecracker]).
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/vfio-uffd-populate"
-firecracker_commit = "4fc14097b96701d5c382a24a7b8bbaec025445e4"
+firecracker_branch = "agent/vfio-pv-kick-restore"
+firecracker_commit = "6ab54b9fe17f81cbfe6e127807c37870313ee3a5"
 firecracker_args = "--enable-pci"
 # On the PCI transport the guest's virtio-net NIC is a PCI device, which udev renames
 # to enp0s<slot>; fc-agent and fcvm configure "eth0" (IPv6, routes, the snapshot gate),
@@ -408,16 +609,20 @@ kernel_repo = "ejc3/fcvm"
 published = false
 build_inputs = [
     "kernel/phone-x86.conf",
-    "kernel/patches-gpu-7.3/*.patch",
+    "kernel/patches-phone-7.3/*.patch",
 ]
 kernel_config = "kernel/phone-x86.conf"
-patches_dir = "kernel/patches-gpu-7.3"
+# The gpu profile's patches (links to them) and, because this guest runs KVM, the x86_64
+# host kernel's patch that keeps a pending paravirtual kick across an async page-ready
+# completion (kernel/README.md, #2132).
+patches_dir = "kernel/patches-phone-7.3"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 # The fork's VFIO branch with the nested state in snapshots (ejc3/firecracker#23) and the
-# Prefilled memory backend (ejc3/firecracker#24) merged.
+# Prefilled memory backend (ejc3/firecracker#24) merged, plus the paravirtual kick a
+# snapshot load gives every runnable vCPU (#2131, see [firecracker]).
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/vfio-uffd-populate"
-firecracker_commit = "4fc14097b96701d5c382a24a7b8bbaec025445e4"
+firecracker_branch = "agent/vfio-pv-kick-restore"
+firecracker_commit = "6ab54b9fe17f81cbfe6e127807c37870313ee3a5"
 firecracker_args = "--enable-pci"
 boot_args = "net.ifnames=0"
 
@@ -439,7 +644,8 @@ description = "Nested virtualization support for running VMs inside VMs"
 guest_kvm = true
 kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "2889ae84beea"
+kernel_sha = "bb3a9cf0f7cc"
+kernel_artifact_sha256 = "6a0a3e0cbe7623593fbc62c3c51ba82ab72761c91a873b180a86652627201a1f"
 
 # Build configuration - these files determine when kernel needs rebuilding
 # SHA is computed from contents of all files matching these patterns
@@ -469,8 +675,8 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # the snapshot but its notification is not, and under EVENT_IDX the guest never
 # notifies again, so the clone never reached the host over vsock (#1207).
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "fix/vsock-restore-tx-kick-nv2"
-firecracker_commit = "dbea5779fb3777e5f237e8cc1d0d15e4e1d22448"
+firecracker_branch = "fix/vsock-restore-tx-kick-nv2-gic-clear-restore"
+firecracker_commit = "8750b52190681dbc6fbf633243e1793b1841290d"
 firecracker_args = "--enable-nv2"
 
 # Boot args for nested KVM
@@ -488,10 +694,14 @@ fuse_readers = 64
 # nested guest from kernel/patches-arm64 and holds the host-only KVM patches.
 kernel_version = "7.3.3"
 patches_dir = "kernel/patches-arm64-host"
+# Kconfig lines set on top of the running kernel's config and checked after olddefconfig:
+# no wireless extensions (#2034).
+config_fragment = "kernel/host-arm64.conf"
 
-# Build inputs for SHA calculation (patches only, skip *.vm.patch for host)
+# Build inputs for SHA calculation (patches and the config fragment)
 build_inputs = [
     "kernel/patches-arm64-host/*.patch",
+    "kernel/host-arm64.conf",
 ]
 
 # x86_64 nested profile (Intel VT-x / AMD-V)
@@ -504,7 +714,8 @@ description = "Nested virtualization support for running VMs inside VMs (x86_64)
 guest_kvm = true
 kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "12a11e36fba7"
+kernel_sha = "6544a8efc8d3"
+kernel_artifact_sha256 = "91663ff28780213635e539f4dd92f3bfd50b7265fba4c060a291b2ad3b5a2c55"
 
 # Build configuration - these files determine when kernel needs rebuilding
 build_inputs = [
@@ -515,7 +726,9 @@ build_inputs = [
 
 # Build paths (relative to repo root)
 kernel_config = "kernel/nested-x86.conf"
-patches_dir = "kernel/patches-x86"  # FUSE remap_file_range patch for reflink support
+# The FUSE and virtio patches, and patch 0008 for the KVM this guest runs: it keeps a pending
+# paravirtual kick across an async page-ready completion (kernel/README.md, #2132).
+patches_dir = "kernel/patches-x86"
 
 # Base config for VM kernel (Firecracker's microvm config)
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/7614ab4d258ad66eee72a34f2fbf3712c3664c65/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
@@ -524,10 +737,12 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # (ejc3/firecracker#23, on the default branch's pinned commit). Without it a
 # restored L1 comes back outside VMX operation and its L2 never starts, which
 # kept the x86_64 L2 tests off the SnapshotEnabled runners (#664).
+# The pin adds the paravirtual kick a snapshot load gives every runnable vCPU (#2131, see
+# [firecracker]).
 # No special boot_args needed for x86.
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/uffd-minor-v1.17.0-nested-state"
-firecracker_commit = "ddc1969f8dba126a1c771aa7be9d4ec09ffc177c"
+firecracker_branch = "agent/uffd-minor-v1.17.0-nested-state-pv-kick-restore"
+firecracker_commit = "af888e7aec38fe4727fd75878aaed017a3113028"
 
 # Host kernel configuration for x86 nested profile
 # Uses the running kernel's config (/boot/config-$(uname -r)) as base,
@@ -555,6 +770,7 @@ description = "Kernel with FUSE and btrfs support for efficient container storag
 kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "b1dd099392e5"
+kernel_artifact_sha256 = "464accf3e4d36668921442202fbd58f474349ff9df083aba90a2933966a86385"
 
 # The patches are build inputs: the build applies them, so the tag has to
 # change when one of them does.
@@ -580,6 +796,7 @@ description = "Kernel with FUSE and btrfs support for efficient container storag
 kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "e710148cf2c4"
+kernel_artifact_sha256 = "6ead06a21e9329bed557b15fb4d234ba48bee8f66083c891b59f114be0f04d5c"
 
 # The patches are build inputs: the build applies them, so the tag has to
 # change when one of them does.
@@ -599,7 +816,9 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # --- mountinfo scaling experiment -------------------------------------------
 # Two identical 6.16.1 guest kernels that differ only by a patch to
 # caching get_dominating_id()'s ring scan per peer group, so the pair can be A/B'd for
-# the cost of generating /proc/self/mountinfo in a slave mount namespace.
+# the cost of generating /proc/self/mountinfo in a slave mount namespace. Both run KVM,
+# so both carry the patch that keeps a pending paravirtual kick across an async page-ready
+# completion (kernel/README.md, #2132).
 # 6.16.1 is chosen because that is where the behaviour was first measured.
 
 [kernel_profiles.mountinfo-base.amd64]
@@ -612,13 +831,14 @@ kernel_repo = "ejc3/fcvm"
 published = false
 build_inputs = [
     "kernel/mountinfo.conf",
+    "kernel/patches-mountinfo-base/*.patch",
 ]
 kernel_config = "kernel/mountinfo.conf"
-# Empty means apply no patches. The repo's default FUSE patches target a newer
-# kernel and do not apply to 6.16.1, and this comparison only times reads of
-# /proc/self/mountinfo, so the pair carries none and differs by exactly the
-# patch under test.
-patches_dir = ""
+# Holds one patch, a link to the KVM patch the fix profile also applies. The repo's
+# default FUSE patches target a newer kernel and do not apply to 6.16.1, and this
+# comparison only times reads of /proc/self/mountinfo, so the pair carries none of them
+# and differs by exactly the patch under test.
+patches_dir = "kernel/patches-mountinfo-base"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/7614ab4d258ad66eee72a34f2fbf3712c3664c65/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 
 [kernel_profiles.mountinfo-fix.amd64]
@@ -634,7 +854,7 @@ build_inputs = [
     "kernel/patches-mountinfo/*.patch",
 ]
 kernel_config = "kernel/mountinfo.conf"
-# Holds exactly one patch, the one under test. The control applies none, so the
-# pair differs by that patch alone.
+# Holds the patch under test and the KVM patch the control applies too, so the pair
+# differs by the patch under test alone.
 patches_dir = "kernel/patches-mountinfo"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/7614ab4d258ad66eee72a34f2fbf3712c3664c65/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"

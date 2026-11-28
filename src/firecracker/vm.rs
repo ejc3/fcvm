@@ -10,6 +10,26 @@ use tracing::{debug, error, info, warn};
 
 use crate::utils::{spawn_streaming, strip_firecracker_prefix};
 
+/// Seconds a guest's memory stays out of automatic NUMA balancing after Firecracker creates
+/// or restores it (`--numa-balancing-after-secs`, ejc3/firecracker).
+///
+/// A balancing scan unmaps guest memory from stage 2 and the guest faults it back in, and a
+/// UFFD clone's freshly copied pages are hinted and migrated. On a two-node c8g.metal-48xl,
+/// with balancing on, a UFFD clone took 6,906 hinting faults and 3,317 migrations to start at
+/// C=128 to 1000 clones, and 7.5 host CPU-s; out of balancing, 32, 15 and 2.6 CPU-s.
+/// A guest that lives on gains from balancing: a 32-vCPU 200 GiB guest running a memory
+/// bandwidth loop for 10 min reached 700 GB/s once balancing had placed its memory, against a
+/// steady 434 GB/s without it, and 1000 idle clones cost 20% less CPU with it. So the
+/// exclusion covers a clone's start (a C=128 ramp to 1000 clones takes 20 to 35 s) and ends.
+///
+/// Firecracker binds anonymous guest memory and a private mapping of a snapshot's memory
+/// file. It leaves guest memory that maps a memfd as it is, which is what a clone of a
+/// `--uffd-mode minor` serve has: a shmem mapping keeps its policy in the file, where every
+/// clone of the serve reads it, so one clone's window would begin and end every clone's.
+/// Such a clone has no window and needs none, because the kernel does not scan a shmem
+/// mapping whose file has no policy (`vma_policy_mof`).
+pub const NUMA_BALANCING_AFTER_SECS: u64 = 60;
+
 use super::FirecrackerClient;
 
 /// Socket/device wait timeout (total wait time = RETRY_COUNT * RETRY_DELAY)
@@ -58,6 +78,18 @@ fn firecracker_log_level(requested: Option<&str>) -> Result<&'static str> {
         })
 }
 
+/// How long the threads of a confined VMM have to install their seccomp filters after
+/// Firecracker reports the VM built ([`VmManager::verify_confined`]). Measured: the check
+/// waited 0 to 6 ms over the 180 confined starts of each architecture's gate run
+/// (`waited_ms` on the line the check logs). The deadline is also how long the guest of an
+/// unfiltered VMM can run on a cold boot before the VMM is killed.
+const SECCOMP_VERIFY_DEADLINE: std::time::Duration = if cfg!(test) {
+    // The tests check a stand-in that never installs one.
+    std::time::Duration::from_millis(300)
+} else {
+    std::time::Duration::from_secs(5)
+};
+
 /// Fails when `FCVM_FIRECRACKER_LOG_LEVEL` names no Firecracker log level. `main` calls this
 /// before a command prepares anything, and [`VmManager::start`] checks again for callers of the
 /// library.
@@ -81,6 +113,255 @@ impl ApiSocketProbe for TokioApiSocketProbe {
         let stream = tokio::net::UnixStream::connect(socket_path).await?;
         drop(stream);
         Ok(())
+    }
+}
+
+/// Firecracker's own ERROR lines repeated in fcvm's log per VMM process; later ones are only counted.
+const REPEATED_FIRECRACKER_ERRORS: usize = 20;
+/// How often [`FirecrackerLogFollower`] reads what Firecracker appended to its log.
+const FIRECRACKER_LOG_POLL: Duration = Duration::from_secs(1);
+/// The most [`FirecrackerLogErrors::read_new`] reads in one call.
+const FIRECRACKER_LOG_READ_MAX: u64 = 16 << 20;
+/// The longest unterminated line [`FirecrackerLogErrors`] keeps waiting for its newline.
+const FIRECRACKER_LOG_LINE_MAX: usize = 64 << 10;
+
+/// Whether `line` is one Firecracker wrote at level ERROR. With `--show-level --show-log-origin`
+/// a line is `<time> [<instance>:<thread>:<LEVEL>:<file>:<line>] <message>`.
+fn is_firecracker_error_line(line: &str) -> bool {
+    line.split_once(" [")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .is_some_and(|(origin, _)| origin.split(':').nth(2) == Some("ERROR"))
+}
+
+/// Picks Firecracker's ERROR lines out of what it appends to its own log (`--log-path`).
+///
+/// Firecracker reports a failure it answers the guest for, such as a block write the host
+/// refused, only in that file, which fcvm otherwise reads only at teardown. A guest whose disk
+/// write failed with ENOSPC on the host remounted its filesystem read-only, and the one record
+/// of why was `Failed to execute Out virtio block request ... No space left on device` there.
+#[derive(Debug, Default)]
+struct FirecrackerLogErrors {
+    /// Bytes of the file already read.
+    offset: u64,
+    /// The end of the last read, after its last newline.
+    partial: Vec<u8>,
+    /// ERROR lines returned so far.
+    repeated: usize,
+    /// ERROR lines found after [`REPEATED_FIRECRACKER_ERRORS`] were returned.
+    counted: u64,
+    /// Bytes the last [`Self::read_new`] read.
+    last_read: u64,
+}
+
+impl FirecrackerLogErrors {
+    /// Reads what was appended since the last call and adds the ERROR lines to repeat to
+    /// `lines`. A line is added once it is complete, and only the first
+    /// [`REPEATED_FIRECRACKER_ERRORS`] are; later ones are counted in `counted`. A file shorter
+    /// than what was read is read again from its start. A read that fails part way still adds
+    /// the lines it read before the failure.
+    fn read_new<F: std::io::Read + std::io::Seek>(
+        &mut self,
+        file: &mut F,
+        lines: &mut Vec<String>,
+    ) -> std::io::Result<()> {
+        use std::io::{Read, SeekFrom};
+        let len = file.seek(SeekFrom::End(0))?;
+        if len < self.offset {
+            self.offset = 0;
+            self.partial.clear();
+        }
+        file.seek(SeekFrom::Start(self.offset))?;
+        // On a failure, read_to_end keeps in `partial` what it read before it.
+        let held = self.partial.len();
+        let read = file
+            .take(FIRECRACKER_LOG_READ_MAX)
+            .read_to_end(&mut self.partial);
+        self.last_read = (self.partial.len() - held) as u64;
+        self.offset += self.last_read;
+        let mut start = 0;
+        while let Some(end) = self.partial[start..].iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.partial[start..start + end]);
+            start += end + 1;
+            if !is_firecracker_error_line(&line) {
+                continue;
+            }
+            if self.repeated < REPEATED_FIRECRACKER_ERRORS {
+                self.repeated += 1;
+                lines.push(line.into_owned());
+            } else {
+                self.counted += 1;
+            }
+        }
+        self.partial.drain(..start);
+        if self.partial.len() > FIRECRACKER_LOG_LINE_MAX {
+            self.partial.clear();
+        }
+        read.map(|_| ())
+    }
+
+    /// [`Self::read_new`] until the end of the file, in reads of at most
+    /// [`FIRECRACKER_LOG_READ_MAX`], for the last read when the VMM has stopped. A failed read
+    /// ends it, and the lines read before the failure stay in `lines`.
+    fn read_rest<F: std::io::Read + std::io::Seek>(
+        &mut self,
+        file: &mut F,
+        lines: &mut Vec<String>,
+    ) -> std::io::Result<()> {
+        loop {
+            self.read_new(file, lines)?;
+            if self.last_read < FIRECRACKER_LOG_READ_MAX {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Empties the log `path` names before a launch. Firecracker opens `--log-path` without
+/// truncating it and writes from its start, so a relaunch over the log an earlier process wrote
+/// would leave that process's lines after its own, and the follower would repeat that
+/// process's errors as the new one's. A missing log, or one that is not a regular file, is left
+/// as it is. A log fcvm cannot open for writing fails the launch: Firecracker, run as the same
+/// user, opens it for writing too.
+fn clear_log_before_launch(path: &Path) -> Result<()> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("reading {} before launching Firecracker", path.display())
+            })
+        }
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_len(0))
+        .with_context(|| format!("emptying {} before launching Firecracker", path.display()))
+}
+
+/// Opens the log `path` names for reading, or `None` while it does not exist. It is opened
+/// non-blocking and its type is read from the open descriptor, so a FIFO with no writer cannot
+/// block the caller (on the last poll, the thread stopping the VM), whatever replaced the file.
+/// Anything but a regular file is an error of kind [`std::io::ErrorKind::InvalidInput`].
+fn open_regular_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(Some(file))
+}
+
+/// The messages for one read of Firecracker's log: each ERROR line it found, then, if the read
+/// failed, that the log cannot be read.
+fn read_messages(lines: Vec<String>, read: std::io::Result<()>) -> Vec<String> {
+    let mut messages: Vec<String> = lines
+        .into_iter()
+        .map(|line| format!("Firecracker logged an error: {line}"))
+        .collect();
+    if let Err(error) = read {
+        messages.push(format!(
+            "cannot read Firecracker's log ({error}), so its errors are no longer repeated here"
+        ));
+    }
+    messages
+}
+
+/// Repeats Firecracker's ERROR lines in fcvm's log while the VMM runs, under fcvm's own target,
+/// so they survive a filter on fcvm's targets (`RUST_LOG=fcvm=info`).
+struct FirecrackerLogFollower {
+    path: PathBuf,
+    vm_id: String,
+    file: Option<std::fs::File>,
+    errors: FirecrackerLogErrors,
+    /// Whether a read failed or the log is not a regular file, after which nothing more is read.
+    failed: bool,
+    /// Whether an open that may succeed later (any refusal but "not a regular file") was
+    /// reported. The follower keeps trying it and reports it once.
+    open_refusal_reported: bool,
+    /// Whether the last poll ran. A read the follower's task queued before it was stopped can
+    /// run after it, when the log may already hold the next process's lines.
+    stopped: bool,
+}
+
+impl FirecrackerLogFollower {
+    fn new(path: PathBuf, vm_id: String) -> Self {
+        Self {
+            path,
+            vm_id,
+            file: None,
+            errors: FirecrackerLogErrors::default(),
+            failed: false,
+            open_refusal_reported: false,
+            stopped: false,
+        }
+    }
+
+    /// Reads what Firecracker appended and logs its ERROR lines; with `last`, to the end of the
+    /// file, and then how many were only counted since the last report. A failed read stops the
+    /// reading, not that report. After the last poll it reads nothing. Returns the messages it
+    /// logged.
+    fn poll(&mut self, last: bool) -> Vec<String> {
+        let mut messages = Vec::new();
+        if self.stopped {
+            return messages;
+        }
+        self.stopped = last;
+        if !self.failed && self.file.is_none() {
+            match open_regular_file(&self.path) {
+                Ok(file) => self.file = file,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                    self.failed = true;
+                    messages.extend(read_messages(Vec::new(), Err(error)));
+                }
+                Err(error) => {
+                    if !self.open_refusal_reported {
+                        self.open_refusal_reported = true;
+                        messages.push(format!(
+                            "cannot open Firecracker's log ({error}); fcvm keeps trying"
+                        ));
+                    }
+                }
+            }
+            if last && !self.failed && self.file.is_none() && !self.open_refusal_reported {
+                messages.push(
+                    "Firecracker's log was never created, so none of its errors were repeated here"
+                        .to_string(),
+                );
+            }
+        }
+        if let (false, Some(file)) = (self.failed, self.file.as_mut()) {
+            let mut lines = Vec::new();
+            let read = if last {
+                self.errors.read_rest(file, &mut lines)
+            } else {
+                self.errors.read_new(file, &mut lines)
+            };
+            self.failed = read.is_err();
+            messages.extend(read_messages(lines, read));
+        }
+        if last && self.errors.counted > 0 {
+            messages.push(format!(
+                "Firecracker logged {} more errors than are repeated here; they are in its log until a relaunch empties it",
+                self.errors.counted
+            ));
+        }
+        for message in &messages {
+            warn!(vm_id = %self.vm_id, log = %self.path.display(), "{message}");
+        }
+        messages
     }
 }
 
@@ -112,6 +393,9 @@ pub struct VmManager {
     user_namespace_path: Option<PathBuf>, // User namespace path for rootless clones (enter via setns in pre_exec)
     net_namespace_path: Option<PathBuf>, // Net namespace path for rootless clones (enter via setns in pre_exec)
     mount_redirects: Option<crate::utils::MountRedirects>, // mount namespace for a restored clone
+    keep_fds: Vec<std::os::fd::RawFd>,   // descriptors left open across the VMM's exec
+    decision: crate::confine::Decision,  // confined or not, from confine::resolve
+    tap_owner: Option<String>,           // confined: the TAP its pre_exec makes the VMM's own
     process: Option<Child>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>, // last few Firecracker stderr lines, for launch failure errors
     // Reader task for the child's stderr pipe. Awaited (bounded) before rendering
@@ -128,10 +412,23 @@ pub struct VmManager {
     /// its page cache alone. It belongs to the VMM process, not to fcvm: it is dropped when
     /// that process exits or is reaped, and when [`Self::start`] launches another one.
     memory_in_use: Option<std::fs::File>,
+    /// Repeats the running VMM's ERROR lines from its log ([`FirecrackerLogFollower`]); stopped
+    /// with the process, after one last read.
+    log_follower: Option<(
+        Arc<Mutex<FirecrackerLogFollower>>,
+        tokio::task::JoinHandle<()>,
+    )>,
 }
 
 impl VmManager {
-    pub fn new(vm_id: String, socket_path: PathBuf, log_path: Option<PathBuf>) -> Self {
+    /// `decision` comes from the caller's [`crate::confine::resolve`]; every launch of this
+    /// manager, a guest-reboot relaunch included, spawns the VMM under it.
+    pub fn new(
+        vm_id: String,
+        socket_path: PathBuf,
+        log_path: Option<PathBuf>,
+        decision: crate::confine::Decision,
+    ) -> Self {
         Self {
             vm_id,
             vm_name: None,
@@ -143,12 +440,16 @@ impl VmManager {
             user_namespace_path: None,
             net_namespace_path: None,
             mount_redirects: None,
+            keep_fds: Vec::new(),
+            decision,
+            tap_owner: None,
             process: None,
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
             stderr_reader: None,
             console_lines: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             client: None,
             memory_in_use: None,
+            log_follower: None,
         }
     }
 
@@ -197,7 +498,7 @@ impl VmManager {
     /// Set namespace holder PID for rootless networking
     ///
     /// When set, Firecracker will be launched inside an existing user+net namespace
-    /// via nsenter. The holder process (created by `unshare --user --net -- sleep infinity`)
+    /// via nsenter. The holder process (`fcvm __netns-agent`)
     /// keeps the namespace alive while Firecracker runs.
     ///
     /// UID/GID mappings are written externally by `setup_namespace_mappings()`, which
@@ -206,6 +507,18 @@ impl VmManager {
     /// files - the user has access both inside and outside.
     pub fn set_holder_pid(&mut self, pid: u32) {
         self.holder_pid = Some(pid);
+    }
+
+    /// Descriptors the VMM keeps open across its exec
+    /// ([`crate::utils::NamespaceParams::keep_fds`]).
+    pub fn set_keep_fds(&mut self, fds: Vec<std::os::fd::RawFd>) {
+        self.keep_fds = fds;
+    }
+
+    /// The unpooled TAP a confined VMM's pre_exec makes its own
+    /// ([`crate::utils::NamespaceParams::tap_owner`]). Kept across relaunches.
+    pub fn set_tap_owner(&mut self, tap: Option<String>) {
+        self.tap_owner = tap;
     }
 
     /// Set user namespace path for rootless clones
@@ -261,8 +574,50 @@ impl VmManager {
         config_override: Option<&Path>,
         firecracker_args: Option<&str>,
     ) -> Result<()> {
+        // A confined VMM never launches with arguments that turn its seccomp off or replace
+        // its filter, whatever the caller's resolve saw: checked on the arguments this
+        // launch uses, before anything is cleared or removed.
+        if self.decision.confinement().is_some() {
+            let refused = firecracker_args
+                .map(crate::confine::overriding_args)
+                .unwrap_or_default();
+            anyhow::ensure!(
+                refused.is_empty(),
+                "the VMM of {} is confined: {}",
+                self.vm_id,
+                refused.join("; ")
+            );
+        }
+        // A confined VMM is handed the filter fcvm setup compiled for this binary, as bytes
+        // read once and checked against the digest setup recorded, in a sealed memfd: also
+        // before anything is cleared or removed. A confined decision that names no seccomp
+        // mode has no filter to hand over and is refused.
+        let filter_fd = match self.decision.confinement() {
+            None => None,
+            Some(confinement) => {
+                let mode = confinement.seccomp.with_context(|| {
+                    format!(
+                        "the VMM of {} is confined, and its decision names no seccomp mode",
+                        self.vm_id
+                    )
+                })?;
+                // Two small files and the directories above them, read on the blocking pool.
+                let binary = firecracker_bin.to_owned();
+                let bytes = tokio::task::spawn_blocking(move || {
+                    crate::confine::verified_filter_bytes(&binary, mode)
+                })
+                .await
+                .context("the read of the confined seccomp filter did not finish")?
+                .with_context(|| format!("the VMM of {} is confined", self.vm_id))?;
+                Some(crate::confine::sealed_memfd(&bytes)?)
+            }
+        };
         // A relaunch is another VMM process, and it maps no snapshot the previous one did.
         self.memory_in_use = None;
+        self.stop_log_follower();
+        if let Some(log_path) = &self.log_path {
+            clear_log_before_launch(log_path)?;
+        }
         let log_level = firecracker_log_level(self.firecracker_log_level.as_deref())?;
         if let Some(ref name) = self.vm_name {
             info!(target: "vm", vm_name = %name, vm_id = %self.vm_id, "starting Firecracker process");
@@ -328,11 +683,43 @@ impl VmManager {
             cmd.arg("--show-log-origin");
         }
 
-        // Seccomp is enabled by default (Firecracker's security boundary).
-        // Set FCVM_NO_SECCOMP=1 to disable for debugging.
+        // Firecracker installs its default seccomp policy unless told otherwise. fcvm's
+        // build is for the gnu target, whose default policy allows every syscall of the
+        // native architecture (rootfs-config.toml, [firecracker]).
+        // Set FCVM_NO_SECCOMP=1 to install none, for debugging.
+        if self.decision.confinement().is_some()
+            && (std::env::var_os("FCVM_NO_SECCOMP").is_some()
+                || std::env::var_os("FCVM_STRACE_FC").is_some())
+        {
+            anyhow::bail!(
+                "the VMM of {} is confined, and FCVM_NO_SECCOMP or FCVM_STRACE_FC would \
+                 undo that; unset them",
+                self.vm_id
+            );
+        }
+        // A confined VMM gets fcvm's syscall allowlist for this build in place of the
+        // default policy, which for a gnu build allows every syscall.
+        let mut keep_fds = self.keep_fds.clone();
+        if let Some(filter_fd) = &filter_fd {
+            use std::os::fd::AsRawFd as _;
+            // The VMM opens the memfd by the number it inherits; the launch's pre_exec
+            // leaves that descriptor open across the exec (NamespaceParams::keep_fds).
+            cmd.arg("--seccomp-filter")
+                .arg(format!("/proc/self/fd/{}", filter_fd.as_raw_fd()));
+            keep_fds.push(filter_fd.as_raw_fd());
+            // One malloc arena and a zone that names no file, so glibc makes the calls the
+            // musl build the policy is derived from makes (confine::CONFINED_VMM_ENV).
+            cmd.envs(crate::confine::CONFINED_VMM_ENV.iter().copied());
+        }
         if std::env::var("FCVM_NO_SECCOMP").is_ok() {
             warn!("Seccomp disabled via FCVM_NO_SECCOMP - reduced security");
             cmd.arg("--no-seccomp");
+        }
+
+        // The guest's memory stays out of NUMA balancing for its first minute.
+        if crate::commands::common::firecracker_takes_numa_window(firecracker_bin) {
+            cmd.arg("--numa-balancing-after-secs")
+                .arg(NUMA_BALANCING_AFTER_SECS.to_string());
         }
 
         // Additional firecracker args from RuntimeConfig (passed explicitly by caller)
@@ -387,6 +774,9 @@ impl VmManager {
                 user_namespace_path: self.user_namespace_path.clone(),
                 net_namespace_path: self.net_namespace_path.clone(),
                 mount_redirects: self.mount_redirects.clone(),
+                keep_fds,
+                decision: self.decision.clone(),
+                tap_owner: self.tap_owner.clone(),
             },
         )?;
 
@@ -418,6 +808,7 @@ impl VmManager {
 
         self.process = Some(spawned.child);
         self.stderr_reader = Some(spawned.stderr_reader);
+        self.start_log_follower();
 
         // Wait for socket to be ready
         self.wait_for_socket().await?;
@@ -579,6 +970,122 @@ impl VmManager {
         }
     }
 
+    /// After a confined VMM was reaped, however it ended (it exits on its own after its
+    /// SIGSYS handler logs the syscall, or fcvm kills it when a restore it was serving
+    /// fails): if its policy stopped it, say so at ERROR, naming the thread and the syscall
+    /// from Firecracker's log, so a syscall the policy misses fails loudly and names itself.
+    async fn report_confinement_stop(&self) {
+        let Some(path) = self.confined_log() else {
+            return;
+        };
+        // One bounded read of the log's end (confine::last_trapped_syscall), on the blocking
+        // pool: the reap returns after it, so the report is never lost, and no runtime
+        // worker waits on the file. A pool that is shutting down leaves the read here.
+        let read = {
+            let path = path.to_owned();
+            tokio::task::spawn_blocking(move || crate::confine::last_trapped_syscall(&path))
+        };
+        let trapped = match read.await {
+            Ok(trapped) => trapped,
+            Err(_) => crate::confine::last_trapped_syscall(path),
+        };
+        self.log_confinement_stop(trapped);
+    }
+
+    /// [`Self::report_confinement_stop`] for the reap that cannot wait
+    /// ([`Self::try_wait`]): the same bounded read, made in place.
+    fn report_confinement_stop_now(&self) {
+        if let Some(path) = self.confined_log() {
+            self.log_confinement_stop(crate::confine::last_trapped_syscall(path));
+        }
+    }
+
+    /// The Firecracker log of a confined VMM.
+    fn confined_log(&self) -> Option<&Path> {
+        self.decision.confinement()?;
+        self.log_path.as_deref()
+    }
+
+    fn log_confinement_stop(&self, trapped: Option<crate::confine::TrappedSyscall>) {
+        if let Some(trapped) = trapped {
+            error!(
+                target: "vm",
+                vm_id = %self.vm_id,
+                thread = %trapped.thread,
+                syscall = trapped.number,
+                "{}",
+                crate::confine::trapped_syscall_report(&trapped)
+            );
+        }
+    }
+
+    /// For a confined VMM, once Firecracker has built the VM (a boot or a snapshot load):
+    /// every thread of the process runs under a seccomp filter of its own (more filters
+    /// than fcvm's own threads have, which a child inherits), or an error names the threads
+    /// that do not. Firecracker installs each thread's filter as the thread starts
+    /// and reports nothing about it: an empty program in the filter file, a launch that
+    /// passed no filter, or a thread that started before its class's filter would otherwise
+    /// run unfiltered under a VM recorded as confined. The threads get
+    /// [`SECCOMP_VERIFY_DEADLINE`] to install them, since the API call that builds the VM
+    /// can return before a new thread has run its first instruction. The caller must not
+    /// let the guest run on after an error: a boot, whose guest is already running, goes
+    /// through [`Self::verify_confined`], which kills the VMM; a restore checks before it
+    /// resumes the guest, and its failure path kills the VMM.
+    pub async fn check_confined(&self) -> Result<()> {
+        if self.decision.confinement().is_none() {
+            return Ok(());
+        }
+        let pid = self.pid()?;
+        // What fcvm itself runs under is inherited by the VMM and is no filter of its own.
+        let inherited = tokio::task::spawn_blocking(crate::confine::own_seccomp_filters)
+            .await
+            .context("the read of fcvm's own seccomp filters did not finish")??;
+        let started = std::time::Instant::now();
+        loop {
+            // /proc reads, on the blocking pool; made here if the pool is shutting down.
+            let threads = tokio::task::spawn_blocking(move || {
+                crate::confine::unfiltered_threads(pid, inherited)
+            })
+            .await
+            .unwrap_or_else(|_| crate::confine::unfiltered_threads(pid, inherited));
+            match threads {
+                Ok(unfiltered) if unfiltered.is_empty() => {
+                    info!(
+                        target: "vm",
+                        vm_id = %self.vm_id,
+                        waited_ms = started.elapsed().as_millis(),
+                        "every thread of the confined VMM runs under its seccomp filter"
+                    );
+                    return Ok(());
+                }
+                Ok(unfiltered) if started.elapsed() >= SECCOMP_VERIFY_DEADLINE => bail!(
+                    "the VMM of {} is confined, and these threads run without a seccomp \
+                     filter of their own {:?} after Firecracker built the VM (fcvm itself \
+                     runs under {inherited}, which each inherits): {}",
+                    self.vm_id,
+                    SECCOMP_VERIFY_DEADLINE,
+                    unfiltered.join(", ")
+                ),
+                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                Err(error) => bail!(
+                    "the VMM of {} is confined, and its threads cannot be read: {error:#}",
+                    self.vm_id
+                ),
+            }
+        }
+    }
+
+    /// [`Self::check_confined`], killing the VMM when it fails.
+    pub async fn verify_confined(&mut self) -> Result<()> {
+        let Err(error) = self.check_confined().await else {
+            return Ok(());
+        };
+        if let Err(kill) = self.kill().await {
+            warn!(target: "vm", vm_id = %self.vm_id, error = %kill, "killing the unfiltered VMM");
+        }
+        Err(error.context("the confined VMM was killed"))
+    }
+
     /// Non-blocking check if the VM process has exited.
     /// Returns Some(ExitStatus) if the process has exited, None if still running.
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
@@ -590,6 +1097,8 @@ impl VmManager {
                 Some(status) => {
                     self.process = None;
                     self.memory_in_use = None;
+                    self.stop_log_follower();
+                    self.report_confinement_stop_now();
                     Ok(Some(status))
                 }
                 None => Ok(None),
@@ -612,9 +1121,50 @@ impl VmManager {
             // Process exited naturally, clear the handle
             self.process = None;
             self.memory_in_use = None;
+            self.stop_log_follower();
+            self.report_confinement_stop().await;
             Ok(status)
         } else {
             bail!("VM process not running")
+        }
+    }
+
+    /// Starts repeating the VMM's ERROR lines from its log, if it has one. `start` has
+    /// stopped the previous process's follower.
+    fn start_log_follower(&mut self) {
+        let Some(path) = self.log_path.clone() else {
+            return;
+        };
+        let follower = Arc::new(Mutex::new(FirecrackerLogFollower::new(
+            path,
+            self.vm_id.clone(),
+        )));
+        let polled = Arc::clone(&follower);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(FIRECRACKER_LOG_POLL).await;
+                let polled = Arc::clone(&polled);
+                let read = tokio::task::spawn_blocking(move || {
+                    if let Ok(mut follower) = polled.lock() {
+                        follower.poll(false);
+                    }
+                });
+                if read.await.is_err() {
+                    return;
+                }
+            }
+        });
+        self.log_follower = Some((follower, task));
+    }
+
+    /// Stops the follower and reads the log once more, so an error logged just before the VMM
+    /// exited is repeated too.
+    fn stop_log_follower(&mut self) {
+        if let Some((follower, task)) = self.log_follower.take() {
+            task.abort();
+            if let Ok(mut follower) = follower.lock() {
+                follower.poll(true);
+            }
         }
     }
 
@@ -637,10 +1187,17 @@ impl VmManager {
     /// The bulk of the wait is the kernel reclaiming the guest's address space, so this
     /// returning means the guest memory is genuinely released — not just signalled.
     pub async fn reap(&mut self) {
-        if let Some(mut process) = self.process.take() {
+        let reaped = if let Some(mut process) = self.process.take() {
             let _ = process.wait().await;
-        }
+            true
+        } else {
+            false
+        };
         self.memory_in_use = None;
+        self.stop_log_follower();
+        if reaped {
+            self.report_confinement_stop().await;
+        }
     }
 
     /// SIGKILL the Firecracker process and reap it. For callers that have nothing else to
@@ -696,6 +1253,7 @@ impl VmManager {
 
 impl Drop for VmManager {
     fn drop(&mut self) {
+        self.stop_log_follower();
         // Clean up socket on drop
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
@@ -721,12 +1279,411 @@ fn log_firecracker_line(clean: &str, is_stderr: bool) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every function that reaps the Firecracker process reports a syscall the confined
+    /// policy stopped, whatever the exit status: on an x64 runner fcvm killed a VMM its
+    /// policy had stopped (the restore it served failed first), and the exit-status check
+    /// that stood here said nothing.
+    #[test]
+    fn every_reap_of_the_vmm_reports_a_trapped_syscall() {
+        let source = include_str!("vm.rs");
+        let body = |signature: &str| {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature}"));
+            let rest = &source[start..];
+            &rest[..rest.find("\n    }\n").unwrap()]
+        };
+        let code = &source[..source.find(concat!("#[cfg", "(test)]")).unwrap()];
+        let reaps = code.matches(concat!(".wait", "()")).count()
+            + code.matches(concat!(".try", "_wait()")).count()
+            - code.matches(concat!("self.try", "_wait()")).count();
+        let reapers = [
+            "pub fn try_wait(&mut self)",
+            "pub async fn wait(&mut self)",
+            "pub async fn reap(&mut self)",
+        ];
+        assert_eq!(
+            reaps,
+            reapers.len(),
+            "a new place reaps the VMM: add it here"
+        );
+        for signature in reapers {
+            assert!(
+                body(signature).contains(concat!("self.report_confinement", "_stop")),
+                "{signature} does not report a trapped syscall"
+            );
+        }
+    }
+
+    /// The launch that hands a VMM the confined filter also gives it the confined
+    /// environment: one malloc arena. Without it glibc grows a thread's own arena with
+    /// mprotect, which the policy's api and vcpu classes do not list: a large boot plan
+    /// stopped the VMM (tests/test_sanity.rs, test_large_boot_plan_rootless).
+    #[test]
+    fn a_confined_launch_sets_the_confined_environment() {
+        let source = include_str!("vm.rs");
+        let code = &source[..source.find(concat!("#[cfg", "(test)]")).unwrap()];
+        let filter = code
+            .find(concat!("cmd.arg(\"--seccomp", "-filter\")"))
+            .expect("the launch passes the confined filter");
+        let block = &code[filter..];
+        let block = &block[..block.find("\n        }\n").unwrap()];
+        assert!(
+            block.contains(concat!("cmd.envs(crate::confine::CONFINED", "_VMM_ENV")),
+            "the confined launch does not set the confined environment: {block}"
+        );
+        assert!(crate::confine::CONFINED_VMM_ENV.contains(&("MALLOC_ARENA_MAX", "1")));
+        // A zone that names no file: glibc then reads no zone file at the first log line,
+        // which the api and vcpu classes could not do (lseek, read).
+        assert!(crate::confine::CONFINED_VMM_ENV.contains(&("TZ", "<UTC>0")));
+    }
+
+    /// A confined manager refuses launch arguments that turn seccomp off or set a filter,
+    /// before it touches its log or socket, whatever the caller resolved.
+    #[tokio::test]
+    async fn a_confined_launch_refuses_arguments_that_override_seccomp() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("firecracker.log");
+        std::fs::write(&log, "kept").unwrap();
+        let mut vm = VmManager::new(
+            "confined-args".to_string(),
+            dir.path().join("api.sock"),
+            Some(log.clone()),
+            crate::confine::Decision::for_test(Some(crate::confine::Confinement {
+                landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
+                layers: vec![crate::confine::Layer::Process],
+                core_limit: 1,
+                seccomp: None,
+            })),
+        );
+        for args in ["--no-seccomp", "--enable-nv2 --seccomp-filter /x.bpf"] {
+            let error = vm
+                .start(
+                    std::path::Path::new("/nonexistent/firecracker"),
+                    None,
+                    Some(args),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("which confinement owns"), "{args}: {error}");
+        }
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "kept");
+    }
+
     use super::*;
     use crate::utils::DirEventSource;
     use std::future::{poll_fn, Future};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::pin::Pin;
     use std::task::Poll;
+
+    const BLOCK_ENOSPC: &str = "2026-11-23T00:09:21.211902195 [anonymous-instance:main:ERROR:src/vmm/src/devices/virtio/block/virtio/request.rs:121] Failed to execute Out virtio block request: FileEngine(Sync(Transfer(IOError(Os { code: 28, kind: StorageFull, message: \"No space left on device\" }))))";
+    const INFO_LINE: &str = "2026-11-23T00:04:33.374854932 [anonymous-instance:main:INFO:src/vmm/src/devices/virtio/device.rs:228] [Block:rootfs] notifying queues";
+
+    /// The lines one [`FirecrackerLogErrors::read_new`] adds, for a read that must succeed.
+    fn read_new_lines<F: std::io::Read + std::io::Seek>(
+        errors: &mut FirecrackerLogErrors,
+        file: &mut F,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        errors.read_new(file, &mut lines).unwrap();
+        lines
+    }
+
+    #[test]
+    fn firecracker_error_lines_are_picked_by_their_level() {
+        assert!(is_firecracker_error_line(BLOCK_ENOSPC));
+        assert!(!is_firecracker_error_line(INFO_LINE));
+        // The level is the third field of the origin, not any "ERROR" in the message.
+        assert!(!is_firecracker_error_line(
+            "2026-11-23T00:04:33.37 [anonymous-instance:main:WARN:src/x.rs:1] saw ERROR: in a message"
+        ));
+        assert!(!is_firecracker_error_line("ERROR without an origin"));
+    }
+
+    #[test]
+    fn firecracker_log_errors_returns_each_complete_error_line_once() {
+        let mut file = std::io::Cursor::new(Vec::new());
+        let mut errors = FirecrackerLogErrors::default();
+        file.get_mut()
+            .extend_from_slice(format!("{INFO_LINE}\n{}", &BLOCK_ENOSPC[..40]).as_bytes());
+        assert!(read_new_lines(&mut errors, &mut file).is_empty());
+        file.get_mut()
+            .extend_from_slice(format!("{}\n{INFO_LINE}\n", &BLOCK_ENOSPC[40..]).as_bytes());
+        assert_eq!(
+            read_new_lines(&mut errors, &mut file),
+            vec![BLOCK_ENOSPC.to_string()]
+        );
+        assert!(read_new_lines(&mut errors, &mut file).is_empty());
+    }
+
+    #[test]
+    fn firecracker_log_errors_counts_the_errors_past_the_cap() {
+        let lines: String = (0..REPEATED_FIRECRACKER_ERRORS + 5)
+            .map(|_| format!("{BLOCK_ENOSPC}\n"))
+            .collect();
+        let mut file = std::io::Cursor::new(lines.into_bytes());
+        let mut errors = FirecrackerLogErrors::default();
+        assert_eq!(
+            read_new_lines(&mut errors, &mut file).len(),
+            REPEATED_FIRECRACKER_ERRORS
+        );
+        assert_eq!(errors.counted, 5);
+    }
+
+    /// Serves `inner` until a read starts at or past `fail_at`, then fails every read.
+    struct FailingLog {
+        inner: std::io::Cursor<Vec<u8>>,
+        fail_at: u64,
+    }
+
+    impl std::io::Read for FailingLog {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.inner.position() >= self.fail_at {
+                return Err(std::io::Error::other("injected read failure"));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl std::io::Seek for FailingLog {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn read_rest_keeps_the_errors_it_read_before_a_failed_read() {
+        let backlog = format!("{INFO_LINE}\n")
+            .repeat((FIRECRACKER_LOG_READ_MAX as usize / (INFO_LINE.len() + 1)) + 10);
+        let mut file = FailingLog {
+            inner: std::io::Cursor::new(format!("{BLOCK_ENOSPC}\n{backlog}").into_bytes()),
+            fail_at: FIRECRACKER_LOG_READ_MAX,
+        };
+        let mut errors = FirecrackerLogErrors::default();
+        let mut lines = Vec::new();
+        let read = errors.read_rest(&mut file, &mut lines);
+        assert_eq!(lines, vec![BLOCK_ENOSPC.to_string()]);
+        assert!(read.is_err());
+    }
+
+    #[test]
+    fn read_rest_keeps_the_errors_read_inside_the_piece_that_fails() {
+        let head = format!("{BLOCK_ENOSPC}\n");
+        let mut file = FailingLog {
+            inner: std::io::Cursor::new(format!("{head}{INFO_LINE}\n").into_bytes()),
+            fail_at: head.len() as u64,
+        };
+        let mut errors = FirecrackerLogErrors::default();
+        let mut lines = Vec::new();
+        let read = errors.read_rest(&mut file, &mut lines);
+        assert_eq!(lines, vec![BLOCK_ENOSPC.to_string()]);
+        assert!(read.is_err());
+    }
+
+    #[test]
+    fn the_follower_keeps_trying_a_log_it_could_not_open() {
+        if nix::unistd::geteuid().is_root() {
+            // Root opens a mode-000 file, so the refusal this test needs cannot happen.
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut follower = FirecrackerLogFollower::new(path.clone(), "vm-test".to_string());
+        let refused = follower.poll(false);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            follower.poll(false).is_empty(),
+            "the refusal is reported once"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&path, format!("{BLOCK_ENOSPC}\n")).unwrap();
+        assert_eq!(
+            follower.poll(true),
+            vec![format!("Firecracker logged an error: {BLOCK_ENOSPC}")]
+        );
+    }
+
+    #[test]
+    fn the_last_poll_says_when_the_log_never_appeared() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut follower =
+            FirecrackerLogFollower::new(dir.path().join("firecracker.log"), "vm-test".to_string());
+        assert!(follower.poll(false).is_empty());
+        let last = follower.poll(true);
+        assert_eq!(last.len(), 1, "{last:?}");
+        assert!(last[0].contains("never created"), "{last:?}");
+    }
+
+    #[test]
+    fn the_follower_says_once_when_its_log_is_not_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
+        std::fs::create_dir(&path).unwrap();
+        let mut follower = FirecrackerLogFollower::new(path, "vm-test".to_string());
+        let first = follower.poll(false);
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].contains("not a regular file"), "{first:?}");
+        assert!(follower.poll(true).is_empty());
+    }
+
+    #[test]
+    fn the_follower_reports_a_fifo_without_blocking_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let mut follower = FirecrackerLogFollower::new(path.clone(), "vm-test".to_string());
+        let (done, polled) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(follower.poll(true));
+        });
+        let result = polled.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            // A regression that blocks in open: release it so the thread can finish.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path);
+        }
+        let messages = result.expect("polling a FIFO with no writer blocked");
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].contains("not a regular file"), "{messages:?}");
+    }
+
+    #[test]
+    fn a_failed_read_reports_its_errors_before_the_failure() {
+        let messages = read_messages(
+            vec![BLOCK_ENOSPC.to_string()],
+            Err(std::io::Error::other("injected read failure")),
+        );
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(
+            messages[0],
+            format!("Firecracker logged an error: {BLOCK_ENOSPC}")
+        );
+        assert!(messages[1].starts_with("cannot read Firecracker's log (injected read failure)"));
+    }
+
+    #[test]
+    fn the_last_poll_reaches_an_error_behind_a_large_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
+        let backlog = format!("{INFO_LINE}\n")
+            .repeat((FIRECRACKER_LOG_READ_MAX as usize / (INFO_LINE.len() + 1)) + 10);
+        std::fs::write(&path, format!("{backlog}{BLOCK_ENOSPC}\n")).unwrap();
+        let mut follower = FirecrackerLogFollower::new(path, "vm-test".to_string());
+        assert_eq!(
+            follower.poll(true),
+            vec![format!("Firecracker logged an error: {BLOCK_ENOSPC}")]
+        );
+    }
+
+    #[test]
+    fn firecracker_log_errors_read_rest_reads_a_log_that_shrank_from_its_start() {
+        let mut file = std::io::Cursor::new(format!("{INFO_LINE}\n{INFO_LINE}\n").into_bytes());
+        let mut errors = FirecrackerLogErrors::default();
+        assert!(read_new_lines(&mut errors, &mut file).is_empty());
+        let short = "t [i:main:ERROR:f.rs:1] x";
+        *file.get_mut() = format!("{short}\n").into_bytes();
+        let mut lines = Vec::new();
+        errors.read_rest(&mut file, &mut lines).unwrap();
+        assert_eq!(lines, vec![short.to_string()]);
+    }
+
+    #[test]
+    fn a_poll_after_the_last_one_reads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
+        std::fs::write(&path, format!("{INFO_LINE}\n")).unwrap();
+        let mut follower = FirecrackerLogFollower::new(path.clone(), "vm-test".to_string());
+        assert!(follower.poll(true).is_empty());
+        // A read the stopped follower's task had already queued runs after the relaunch emptied
+        // the log and the next process wrote an error: that error is the new follower's.
+        let short = "t [i:main:ERROR:f.rs:1] new";
+        assert!(short.len() < INFO_LINE.len());
+        std::fs::write(&path, format!("{short}\n")).unwrap();
+        assert!(follower.poll(false).is_empty());
+    }
+
+    #[test]
+    fn start_stops_the_old_follower_then_empties_the_log_then_starts_the_new_one() {
+        let src = include_str!("vm.rs");
+        let start = &src[src.find("    pub async fn start(").unwrap()..];
+        let start = &start[..start.find("\n    }\n").unwrap()];
+        let at = |needle: &str| {
+            start
+                .find(needle)
+                .unwrap_or_else(|| panic!("start() no longer contains {needle}"))
+        };
+        assert!(
+            at("self.stop_log_follower();") < at("clear_log_before_launch(")
+                && at("clear_log_before_launch(")
+                    < at(".context(\"spawning Firecracker process\")")
+                && at(".context(\"spawning Firecracker process\")")
+                    < at("self.start_log_follower();"),
+            "start() must stop the old follower, empty the log, spawn, then start the new follower"
+        );
+    }
+
+    #[test]
+    fn a_relaunch_repeats_only_the_new_processs_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
+        std::fs::write(&path, format!("{BLOCK_ENOSPC}\n{INFO_LINE}\n")).unwrap();
+        clear_log_before_launch(&path).unwrap();
+        // Firecracker writes from the start of the file without truncating it.
+        let short = "t [i:main:ERROR:f.rs:1] new";
+        let mut log = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut log, format!("{short}\n").as_bytes()).unwrap();
+        let mut errors = FirecrackerLogErrors::default();
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            read_new_lines(&mut errors, &mut file),
+            vec![short.to_string()]
+        );
+        clear_log_before_launch(&dir.path().join("missing.log")).unwrap();
+        assert!(!dir.path().join("missing.log").exists());
+    }
+
+    #[test]
+    fn the_last_poll_reports_the_counted_errors_after_a_failed_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
+        std::fs::write(
+            &path,
+            format!("{BLOCK_ENOSPC}\n").repeat(REPEATED_FIRECRACKER_ERRORS + 5),
+        )
+        .unwrap();
+        let mut follower = FirecrackerLogFollower::new(path, "vm-test".to_string());
+        assert_eq!(follower.poll(false).len(), REPEATED_FIRECRACKER_ERRORS);
+        // Reading a directory fails with EISDIR.
+        follower.file = Some(std::fs::File::open(dir.path()).unwrap());
+        assert!(follower.poll(false)[0].starts_with("cannot read Firecracker's log"));
+        let last = follower.poll(true);
+        assert_eq!(
+            last,
+            vec!["Firecracker logged 5 more errors than are repeated here; they are in its log until a relaunch empties it"]
+        );
+    }
+
+    #[test]
+    fn firecracker_log_errors_reads_a_truncated_log_from_its_start() {
+        let mut file = std::io::Cursor::new(format!("{INFO_LINE}\n{INFO_LINE}\n").into_bytes());
+        let mut errors = FirecrackerLogErrors::default();
+        assert!(read_new_lines(&mut errors, &mut file).is_empty());
+        let short = "t [i:main:ERROR:f.rs:1] x";
+        assert!(short.len() + 1 < 2 * (INFO_LINE.len() + 1));
+        *file.get_mut() = format!("{short}\n").into_bytes();
+        file.set_position(0);
+        assert_eq!(
+            read_new_lines(&mut errors, &mut file),
+            vec![short.to_string()]
+        );
+    }
 
     #[derive(Clone, Copy)]
     enum ProbeStep {
@@ -819,7 +1776,12 @@ mod tests {
             .stderr(std::process::Stdio::null());
         let child = command.spawn().expect("spawn live child");
 
-        let mut vm = VmManager::new("wait-test".to_string(), socket_path, None);
+        let mut vm = VmManager::new(
+            "wait-test".to_string(),
+            socket_path,
+            None,
+            crate::confine::Decision::for_test(None),
+        );
         vm.process = Some(child);
         vm
     }
@@ -909,6 +1871,7 @@ mod tests {
             "refused-test".to_string(),
             dir.path().join("api.sock"),
             None,
+            crate::confine::Decision::for_test(None),
         );
         vm.process = Some(child);
 
@@ -965,7 +1928,12 @@ mod tests {
             .expect("chmod fake firecracker");
 
         let socket_path = dir.path().join("api.sock");
-        let mut vm = VmManager::new("test-vm".to_string(), socket_path, None);
+        let mut vm = VmManager::new(
+            "test-vm".to_string(),
+            socket_path,
+            None,
+            crate::confine::Decision::for_test(None),
+        );
 
         let err = vm
             .start(&fake_fc, None, None)
@@ -1022,6 +1990,7 @@ mod tests {
             "test-vm".to_string(),
             dir.path().join("api.sock"),
             Some(dir.path().join("firecracker.log")),
+            crate::confine::Decision::for_test(None),
         );
         vm.firecracker_log_level = requested.map(str::to_string);
         let started = vm.start(&fake_fc, None, None).await;
@@ -1243,7 +2212,12 @@ mod tests {
     async fn a_memory_mark_needs_a_running_vmm() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let memory = memory_file(dir.path());
-        let mut vm = VmManager::new("mark-test".to_string(), dir.path().join("api.sock"), None);
+        let mut vm = VmManager::new(
+            "mark-test".to_string(),
+            dir.path().join("api.sock"),
+            None,
+            crate::confine::Decision::for_test(None),
+        );
         vm.mark_memory_in_use(&memory)
             .await
             .expect_err("a mark without a VMM process");
@@ -1289,5 +2263,624 @@ mod tests {
             super::log_firecracker_line(ordinary, false);
         });
         assert!(!console_target.contains("FATAL"), "{console_target:?}");
+    }
+
+    /// (An alias: `a_decision_is_made_only_here` reads every source file for the type's
+    /// name followed by a brace.)
+    type Confined = crate::confine::Decision;
+
+    fn confined_enforce() -> Confined {
+        crate::confine::Decision::for_test(Some(crate::confine::Confinement {
+            landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
+            layers: vec![
+                crate::confine::Layer::Process,
+                crate::confine::Layer::Seccomp,
+            ],
+            core_limit: crate::confine::core_limit_for(crate::confine::core_hard_limit()),
+            seccomp: Some(crate::confine::SeccompMode::Enforce),
+        }))
+    }
+
+    /// A temporary directory only its owner can write. `tempfile` makes one with the
+    /// umask's mode, which is group-writable under a umask of 002, and a filter in such a
+    /// directory is refused.
+    fn store_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    /// An executable stand-in for Firecracker at `dir/firecracker` running `script`. The
+    /// launch first asks the binary for its version (`firecracker_takes_numa_window`); the
+    /// stand-in answers that with nothing, and runs `script` only when launched as the VMM.
+    fn stand_in(dir: &Path, script: &str) -> PathBuf {
+        let path = dir.join("firecracker");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n[ \"$1\" = --version ] && exit 0\n{script}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// `filter` under the enforce filter's name beside `firecracker`, with a record of
+    /// `recorded`'s digest when given.
+    fn install_filter(firecracker: &Path, filter: &[u8], recorded: Option<&[u8]>) {
+        let path = crate::confine::filter_path(firecracker, crate::confine::SeccompMode::Enforce);
+        crate::confine::write_store_file(&path, filter).unwrap();
+        if let Some(recorded) = recorded {
+            crate::confine::write_store_file(
+                &crate::confine::filter_digest_path(&path),
+                crate::confine::filter_bytes_digest(recorded).as_bytes(),
+            )
+            .unwrap();
+        }
+    }
+
+    /// A confined launch whose filter is not the one `fcvm setup` recorded is refused
+    /// before the previous log is cleared, the old socket is removed or anything is
+    /// spawned: a missing filter, a file that only has the filter's name, and a file whose
+    /// record is of other bytes. So is a confined decision that names no seccomp mode.
+    #[tokio::test]
+    async fn a_confined_launch_refuses_a_filter_setup_did_not_record() {
+        let dir = store_dir();
+        let ran = dir.path().join("ran");
+        let firecracker = stand_in(dir.path(), &format!("touch '{}'\nexit 2", ran.display()));
+        let log = dir.path().join("firecracker.log");
+        let socket = dir.path().join("api.sock");
+        let refusal = |decision: crate::confine::Decision| {
+            let (log, socket, firecracker) = (log.clone(), socket.clone(), firecracker.clone());
+            async move {
+                std::fs::write(&log, "kept").unwrap();
+                std::fs::write(&socket, "previous").unwrap();
+                let mut vm = VmManager::new(
+                    "confined".to_string(),
+                    socket.clone(),
+                    Some(log.clone()),
+                    decision,
+                );
+                let error = format!(
+                    "{:#}",
+                    vm.start(&firecracker, None, None).await.unwrap_err()
+                );
+                assert_eq!(std::fs::read_to_string(&log).unwrap(), "kept", "{error}");
+                assert_eq!(
+                    std::fs::read_to_string(&socket).unwrap(),
+                    "previous",
+                    "{error}"
+                );
+                error
+            }
+        };
+
+        let missing = refusal(confined_enforce()).await;
+        assert!(
+            missing.contains("the confined seccomp filter is unusable"),
+            "{missing}"
+        );
+        install_filter(&firecracker, b"three empty programs", None);
+        let unrecorded = refusal(confined_enforce()).await;
+        assert!(
+            unrecorded.contains("the digest fcvm setup records"),
+            "{unrecorded}"
+        );
+        install_filter(
+            &firecracker,
+            b"three empty programs",
+            Some(b"the compiled filter"),
+        );
+        let replaced = refusal(confined_enforce()).await;
+        assert!(
+            replaced.contains("is not the one setup compiled"),
+            "{replaced}"
+        );
+
+        // With a filter that would pass: a decision that names no seccomp mode.
+        install_filter(
+            &firecracker,
+            b"the compiled filter",
+            Some(b"the compiled filter"),
+        );
+        let modeless = refusal(crate::confine::Decision::for_test(Some(
+            crate::confine::Confinement {
+                landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
+                layers: vec![crate::confine::Layer::Process],
+                core_limit: 1,
+                seccomp: None,
+            },
+        )))
+        .await;
+        assert!(modeless.contains("names no seccomp mode"), "{modeless}");
+        assert!(!ran.exists(), "a refused launch ran the VMM");
+    }
+
+    /// A rootless namespace holder for a confined stand-in to enter.
+    async fn holder() -> (tokio::process::Child, u32) {
+        crate::commands::common::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder")
+    }
+
+    async fn drop_holder(mut holder: tokio::process::Child, pid: u32) {
+        let _ = holder.start_kill();
+        let _ = holder.wait().await;
+        crate::companion::forget(pid);
+        crate::network::netns_agent::forget(pid);
+    }
+
+    /// What the VMM is handed is the verified bytes in a descriptor it inherits, not the
+    /// store path: the stand-in reads its `--seccomp-filter` argument after the file in the
+    /// store was replaced, and gets what the launch verified. It also gets the confined
+    /// environment.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_confined_launch_hands_the_vmm_the_bytes_it_verified() {
+        let dir = store_dir();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let go = dir.path().join("go");
+        // Waits for the test to replace the stored filter, then reads its argument.
+        let firecracker = stand_in(
+            dir.path(),
+            &format!(
+                "printf '%s\\n' \"$@\" > '{out}/argv'\n\
+                 printf '%s %s\\n' \"$MALLOC_ARENA_MAX\" \"$TZ\" > '{out}/env'\n\
+                 : > '{out}/started'\n\
+                 n=0; while [ ! -e '{go}' ] && [ $n -lt 500 ]; do sleep 0.01; n=$((n+1)); done\n\
+                 while [ $# -gt 0 ]; do\n\
+                 if [ \"$1\" = --seccomp-filter ]; then cat \"$2\" > '{out}/filter'; fi\n\
+                 shift\n\
+                 done\n\
+                 exit 2",
+                out = out.display(),
+                go = go.display()
+            ),
+        );
+        install_filter(
+            &firecracker,
+            b"the compiled filter",
+            Some(b"the compiled filter"),
+        );
+        let (holder_child, holder_pid) = holder().await;
+        let mut vm = VmManager::new(
+            "confined".to_string(),
+            dir.path().join("api.sock"),
+            Some(dir.path().join("firecracker.log")),
+            confined_enforce(),
+        );
+        vm.set_user_namespace_path(format!("/proc/{holder_pid}/ns/user").into());
+        let replace = {
+            let (out, go, firecracker) = (out.clone(), go.clone(), firecracker.clone());
+            tokio::task::spawn_blocking(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !out.join("started").exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                install_filter(
+                    &firecracker,
+                    b"three empty programs",
+                    Some(b"three empty programs"),
+                );
+                std::fs::write(&go, "").unwrap();
+            })
+        };
+        let started = vm.start(&firecracker, None, None).await;
+        replace.await.unwrap();
+        drop_holder(holder_child, holder_pid).await;
+        assert!(started.is_err(), "the stand-in exits, so the start fails");
+
+        let argv = std::fs::read_to_string(out.join("argv")).unwrap_or_else(|e| {
+            panic!("the stand-in did not run ({e}): {:#}", started.unwrap_err())
+        });
+        let argv: Vec<&str> = argv.lines().collect();
+        let at = argv.iter().position(|a| *a == "--seccomp-filter").unwrap();
+        assert!(argv[at + 1].starts_with("/proc/self/fd/"), "{argv:?}");
+        assert_eq!(
+            std::fs::read(out.join("filter")).unwrap(),
+            b"the compiled filter",
+            "the VMM read other bytes than the launch verified"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("env")).unwrap(),
+            "1 <UTC>0\n"
+        );
+    }
+
+    const FAKE_VMM_ENV: &str = "FCVM_FAKE_VMM_CHILD";
+
+    /// Put every thread of this process under one more seccomp filter that allows every
+    /// syscall (and so under `no_new_privs`).
+    fn allow_everything_on_every_thread() {
+        let allow = [libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        }];
+        let program = libc::sock_fprog {
+            len: 1,
+            filter: allow.as_ptr().cast_mut(),
+        };
+        // SAFETY: prctl with integers, and seccomp with a program that outlives the call.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            let rc = libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_SET_MODE_FILTER,
+                libc::SECCOMP_FILTER_FLAG_TSYNC,
+                &program as *const libc::sock_fprog,
+            );
+            assert_eq!(rc, 0, "seccomp: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    /// A process that answers on an API socket as a VMM would and runs no guest: under an
+    /// allow-all seccomp filter on every thread (`filtered`) or under none (`unfiltered`).
+    /// It is a test so that a stand-in script can exec this binary as the VMM; run any
+    /// other way it returns.
+    #[test]
+    fn fake_vmm_child() {
+        let Ok(spec) = std::env::var(FAKE_VMM_ENV) else {
+            return;
+        };
+        let (mode, socket) = spec.split_once(' ').unwrap();
+        if mode == "filtered" {
+            allow_everything_on_every_thread();
+        }
+        let _listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    }
+
+    /// A confined manager whose VMM is [`fake_vmm_child`] in `mode`, started.
+    async fn confined_fake_vmm(dir: &Path, mode: &str, holder_pid: u32) -> VmManager {
+        let dir = dir.join(mode);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.join("api.sock");
+        let firecracker = stand_in(
+            &dir,
+            &format!(
+                "{env}='{mode} {socket}' exec '{exe}' --exact firecracker::vm::tests::fake_vmm_child \
+                 --nocapture --test-threads=1",
+                env = FAKE_VMM_ENV,
+                socket = socket.display(),
+                exe = std::env::current_exe().unwrap().display()
+            ),
+        );
+        install_filter(
+            &firecracker,
+            b"the compiled filter",
+            Some(b"the compiled filter"),
+        );
+        let mut vm = VmManager::new(
+            format!("fake-{mode}"),
+            socket,
+            Some(dir.join("firecracker.log")),
+            confined_enforce(),
+        );
+        vm.set_user_namespace_path(format!("/proc/{holder_pid}/ns/user").into());
+        vm.start(&firecracker, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("starting the {mode} stand-in: {e:#}"));
+        vm
+    }
+
+    /// Once the VM is built, a confined VMM with a thread under no seccomp filter is killed
+    /// and the start fails naming the thread; one whose threads all run under a filter
+    /// passes. Firecracker installs nothing for an empty program and says nothing, so this
+    /// is the only place such a start is caught.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_confined_vmm_with_an_unfiltered_thread_is_killed() {
+        let dir = store_dir();
+        let (holder_child, holder_pid) = holder().await;
+        let checked = check_the_fake_vmms(dir.path(), holder_pid).await;
+        drop_holder(holder_child, holder_pid).await;
+        checked.assert_under(crate::confine::own_seccomp_filters().unwrap());
+
+        // An unconfined VMM is not checked.
+        let mut open = VmManager::new(
+            "open".to_string(),
+            dir.path().join("open.sock"),
+            None,
+            crate::confine::Decision::for_test(None),
+        );
+        open.verify_confined().await.unwrap();
+    }
+
+    /// What [`VmManager::verify_confined`] made of two stand-in VMMs: one that puts its
+    /// threads under a filter of its own, and one that installs nothing.
+    struct FakeVmmsChecked {
+        filtered: Result<()>,
+        filtered_still_runs: bool,
+        unfiltered: Result<()>,
+        unfiltered_pid: u32,
+        unfiltered_killed: bool,
+    }
+
+    impl FakeVmmsChecked {
+        /// The first passed and runs on; the second was refused, named with the `own`
+        /// filters it inherited from this process and no more, and killed.
+        fn assert_under(self, own: u32) {
+            self.filtered.unwrap();
+            assert!(
+                self.filtered_still_runs,
+                "a VMM that passed the check was killed"
+            );
+            let refused = format!("{:#}", self.unfiltered.unwrap_err());
+            let state = if own == 0 { 0 } else { 2 };
+            assert!(
+                refused.contains("run without a seccomp filter of their own")
+                    && refused.contains(&format!("Seccomp: {state}, Seccomp_filters: {own})"))
+                    && refused.contains(&format!("fcvm itself runs under {own},"))
+                    && refused.contains("the confined VMM was killed"),
+                "{refused}"
+            );
+            assert!(
+                self.unfiltered_killed,
+                "the unfiltered VMM {} is still running",
+                self.unfiltered_pid
+            );
+        }
+    }
+
+    async fn check_the_fake_vmms(dir: &Path, holder_pid: u32) -> FakeVmmsChecked {
+        let mut filtered = confined_fake_vmm(dir, "filtered", holder_pid).await;
+        let passed = filtered.verify_confined().await;
+        let filtered_still_runs = filtered.pid().is_ok();
+        let _ = filtered.kill().await;
+
+        let mut unfiltered = confined_fake_vmm(dir, "unfiltered", holder_pid).await;
+        let unfiltered_pid = unfiltered.pid().unwrap();
+        let refused = unfiltered.verify_confined().await;
+        let unfiltered_killed = unfiltered.pid().is_err()
+            && !Path::new(&format!("/proc/{unfiltered_pid}/task")).exists();
+        let _ = unfiltered.kill().await;
+        FakeVmmsChecked {
+            filtered: passed,
+            filtered_still_runs,
+            unfiltered: refused,
+            unfiltered_pid,
+            unfiltered_killed,
+        }
+    }
+
+    const FILTERED_FCVM_ENV: &str = "FCVM_FILTERED_FCVM_CHILD";
+
+    /// The child of [`a_vmm_with_only_the_filters_fcvm_runs_under_is_killed`]: this process
+    /// puts itself under a filter that allows everything, as fcvm runs under a systemd
+    /// unit's `SystemCallFilter=` or a container's default profile, and then checks the
+    /// two stand-ins. Run any other way it has no parent to answer and returns.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_filtered_fcvm_child() {
+        if std::env::var_os(FILTERED_FCVM_ENV).is_none() {
+            return;
+        }
+        let dir = store_dir();
+        // The holder first: its ID mapping uses setuid helpers, which no_new_privs stops.
+        let (holder_child, holder_pid) = holder().await;
+        allow_everything_on_every_thread();
+        let own = crate::confine::own_seccomp_filters().unwrap();
+        assert!(own >= 1, "this process runs under {own} filters");
+        let checked = check_the_fake_vmms(dir.path(), holder_pid).await;
+        drop_holder(holder_child, holder_pid).await;
+        checked.assert_under(own);
+        println!("CHECKED-UNDER-A-FILTER {own}");
+    }
+
+    /// Where fcvm itself runs under a seccomp filter, every child shows `Seccomp: 2` and
+    /// fcvm's filter count without installing anything. Such a VMM is not confined: the
+    /// check requires more filters than fcvm's own threads have, and kills it. (It passed
+    /// when the check asked for filter mode and one filter.)
+    #[test]
+    fn a_vmm_with_only_the_filters_fcvm_runs_under_is_killed() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "firecracker::vm::tests::a_filtered_fcvm_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(FILTERED_FCVM_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("CHECKED-UNDER-A-FILTER "),
+            "the child under a filter: {}\nstdout: {stdout}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Both ways a VM is built check the confined VMM's threads before the guest runs: a
+    /// boot after InstanceStart, a restore between the snapshot load and the resume.
+    #[test]
+    fn a_confined_vmm_is_checked_after_the_vm_is_built_on_both_paths() {
+        let check = concat!("verify", "_confined().await");
+        let restore_check = concat!("check", "_confined().await");
+        let boot = include_str!("../hypervisor/firecracker.rs");
+        let body = &boot[boot.find("async fn boot(&mut self)").unwrap()..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        let start = body.find("InstanceAction::InstanceStart").unwrap();
+        assert!(
+            body[start..].contains(check),
+            "boot() does not check the confined VMM after InstanceStart: {body}"
+        );
+
+        let restore = include_str!("../commands/common.rs");
+        let load = restore.find(".load_snapshot(SnapshotLoad {").unwrap();
+        let checked = load
+            + restore[load..]
+                .find(restore_check)
+                .expect("the restore checks the VMM");
+        let resume = load
+            + restore[load..]
+                .find(".patch_vm_state(ApiVmState {")
+                .expect("the restore resumes the VM");
+        let drive = load
+            + restore[load..]
+                .find(".patch_drive(")
+                .expect("the restore patches the root drive");
+        assert!(
+            checked < drive && drive < resume,
+            "the restore patches the drive or resumes the guest before it checks the \
+             confined VMM"
+        );
+
+        // In `snapshot run`: the filter preflight, then the restore (the launch, the load
+        // and the check above), then the wait for the guest's acknowledgement. A start the
+        // check kills fails inside the restore, so it has no acknowledgement to take back,
+        // and whatever the command does once the guest has acknowledged comes after it.
+        let run = include_str!("../commands/snapshot.rs");
+        let run = &run[run.find("async fn cmd_snapshot_run_inner(").unwrap()..];
+        let at = |what: &str| run.find(what).unwrap_or_else(|| panic!("no {what}"));
+        let steps = [
+            at("require_confined_filter(&decision, &runtime_config)"),
+            at("super::common::restore_from_snapshot("),
+            at("wait_for_restore_completion("),
+        ];
+        assert!(
+            steps.windows(2).all(|pair| pair[0] < pair[1]),
+            "the preflight, the restore and the wait for the acknowledgement are out of \
+             order: {steps:?}"
+        );
+    }
+
+    /// The report of a trapped syscall reads the end of the log off the runtime's workers:
+    /// the awaiting reaps go through the blocking pool, and nothing reads the whole file.
+    #[test]
+    fn the_stop_report_reads_the_end_of_the_log_off_the_runtime() {
+        let source = include_str!("vm.rs");
+        let code = &source[..source.find(concat!("#[cfg", "(test)]\nmod tests")).unwrap()];
+        let report = &code[code
+            .find("async fn report_confinement_stop(&self)")
+            .unwrap()..];
+        let report = &report[..report.find("\n    }\n").unwrap()];
+        assert!(
+            report.contains("spawn_blocking") && report.contains("last_trapped_syscall"),
+            "{report}"
+        );
+        assert!(
+            !code.contains(concat!("read_to", "_string(path)")),
+            "something reads a whole log into memory"
+        );
+    }
+
+    /// Trap, exit and report, end to end with the real Firecracker: a copy of the default
+    /// build runs under the confined policy less `accept4` for its API thread, compiled by
+    /// the store's `seccompiler-bin` and installed with its digest, so the launch verifies
+    /// it and hands it over as it does the real one. The first connection to the API socket
+    /// makes the API thread call `accept4`: the kernel traps it, Firecracker's handler logs
+    /// the syscall and exits, and the reap reports the thread and the syscall at ERROR.
+    /// Needs `fcvm setup` (the Firecracker of the policy's commit and its compiler).
+    #[cfg(feature = "integration-fast")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_trapped_syscall_stops_the_vmm_and_is_reported() {
+        use crate::confine::{SeccompMode, TrappedSyscall};
+        let profile = crate::setup::get_kernel_profile("default")
+            .unwrap()
+            .expect("the default kernel profile");
+        let store = crate::setup::get_configured_firecracker_for_profile(&profile, "default")
+            .await
+            .unwrap()
+            .expect("the default profile's Firecracker");
+        let dir = store_dir();
+        let firecracker = dir.path().join("firecracker-copy");
+        std::fs::copy(&store, &firecracker).unwrap();
+
+        let mut policy: serde_json::Value =
+            serde_json::from_str(&crate::confine::seccomp_policy(SeccompMode::Enforce)).unwrap();
+        let api = policy["api"]["filter"].as_array_mut().unwrap();
+        let before = api.len();
+        api.retain(|rule| rule["syscall"] != "accept4");
+        assert!(api.len() < before, "the api class does not list accept4");
+        let policy_path = dir.path().join("policy.json");
+        std::fs::write(&policy_path, policy.to_string()).unwrap();
+        let compiled = dir.path().join("compiled.bpf");
+        let status = std::process::Command::new(crate::confine::seccompiler_path(&store))
+            .arg("--input-file")
+            .arg(&policy_path)
+            .args(["--target-arch", crate::confine::SECCOMP_ARCH])
+            .arg("--output-file")
+            .arg(&compiled)
+            .status()
+            .expect("running the store's seccompiler-bin");
+        assert!(status.success(), "seccompiler-bin: {status}");
+        let filter = std::fs::read(&compiled).unwrap();
+        install_filter(&firecracker, &filter, Some(&filter));
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let subscriber = {
+            let captured = captured.clone();
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || Capture(captured.clone()))
+                .finish()
+        };
+        let _logging = tracing::subscriber::set_default(subscriber);
+
+        let (holder_child, holder_pid) = holder().await;
+        let log = dir.path().join("firecracker.log");
+        let mut vm = VmManager::new(
+            "trapped".to_string(),
+            dir.path().join("api.sock"),
+            Some(log.clone()),
+            confined_enforce(),
+        );
+        vm.set_user_namespace_path(format!("/proc/{holder_pid}/ns/user").into());
+        // The launch's own probe of the API socket is the connection that traps, so the
+        // start may see the socket answer first or the process exit first.
+        let started = vm.start(&firecracker, None, None).await;
+        let status = match &started {
+            Ok(()) => Some(
+                tokio::time::timeout(std::time::Duration::from_secs(30), vm.wait())
+                    .await
+                    .expect("the trapped VMM did not exit")
+                    .unwrap(),
+            ),
+            Err(_) => None,
+        };
+        vm.reap().await;
+        drop_holder(holder_child, holder_pid).await;
+
+        let firecracker_log = std::fs::read_to_string(&log).unwrap_or_default();
+        let trapped = crate::confine::last_trapped_syscall(&log);
+        assert_eq!(
+            trapped,
+            Some(TrappedSyscall {
+                thread: "fc_api".into(),
+                number: libc::SYS_accept4 as u64,
+            }),
+            "start: {started:?}; Firecracker's log: {firecracker_log}"
+        );
+        if let Some(status) = status {
+            assert!(!status.success(), "the trapped VMM exited with {status}");
+        }
+        let reported = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        let expected = format!(
+            "Firecracker was stopped by its confinement policy: its fc_api thread made syscall {}",
+            libc::SYS_accept4
+        );
+        assert_eq!(
+            reported.matches(&expected).count(),
+            1,
+            "the reap reports the trap once, at ERROR: {reported}"
+        );
+        assert!(
+            reported
+                .lines()
+                .any(|line| line.contains("ERROR") && line.contains(&expected)),
+            "{reported}"
+        );
     }
 }

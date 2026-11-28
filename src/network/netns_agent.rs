@@ -1,0 +1,1355 @@
+//! The rootless namespace holder: `fcvm __netns-agent`.
+//!
+//! One process per rootless VM namespace. It creates the user and network namespaces, keeps
+//! them alive for as long as it runs, and serves its owner over the socket it was started
+//! with. A holder that can act inside its namespaces saves every other process the
+//! `nsenter` fork and exec it would need to get there.
+//!
+//! The agent is one thread. `unshare(CLONE_NEWUSER)` refuses a process with more, so a
+//! binary's `main` calls [`main_if_agent`] before it does anything else, and the serve loop
+//! never blocks on anything but its owner's next request.
+//!
+//! Start, with the owner being the process that spawned the agent:
+//!
+//! | agent | owner |
+//! |---|---|
+//! | `unshare(CLONE_NEWUSER \| CLONE_NEWNET)`, arm `PR_SET_PDEATHSIG`, send `unshared` | |
+//! | | write the uid and gid maps, send `mapped` |
+//! | check it is uid 0 in the namespace, send `ready` | |
+//!
+//! Then requests, one message each way:
+//!
+//! | request | reply |
+//! |---|---|
+//! | `tcp4`, `tcp6` | `ok` with a non-blocking, unconnected TCP socket made in the namespace |
+//! | `build` and a [`Shape`] as JSON | `ok` once the namespace's links exist as the shape says |
+//! | `adopt` with a socket | `ok`: the agent now also serves `tcp4` and `tcp6` on that socket |
+//! | `queue` | `ok` with the queue the VMM's TAP is attached by, when the shape made it attached |
+//! | `reset` | `ok` once nothing a VM's use of the namespace left is in it ([`reset`]) |
+//! | `fingerprint` and the VMM's TAP | `ok` and the namespace's [`fingerprint`](super::fingerprint) |
+//!
+//! An adopted socket is a second channel, for a process the owner lends the namespace to
+//! (the pool's lessee): it gets sockets and nothing else, so it cannot rebuild or reset a
+//! namespace it does not own. The agent drops an adopted channel when its peer closes it and
+//! at every `reset`.
+//!
+//! A socket belongs to the network namespace it was made in for its whole life, so the
+//! owner connects it to a guest address without entering the namespace.
+//!
+//! The agent exits when the owner's end of the channel closes (the owner dropped it or
+//! exited) and the kernel kills it when the thread that spawned it exits
+//! (`PR_SET_PDEATHSIG`). The namespaces go when their last process does.
+
+use anyhow::{bail, Context, Result};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
+use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+
+/// The first argument of an agent's command line: `fcvm __netns-agent <channel fd> <owner
+/// pid>`.
+pub const SUBCOMMAND: &str = "__netns-agent";
+
+/// The agent's `comm`, so `ps`, `pgrep` and a process tree name it apart from the fcvm that
+/// owns it.
+pub const COMM: &std::ffi::CStr = c"fcvm-netns";
+
+const UNSHARED: &[u8] = b"unshared";
+const MAPPED: &[u8] = b"mapped";
+const READY: &[u8] = b"ready";
+const OK: &[u8] = b"ok";
+const TCP4: &[u8] = b"tcp4";
+const TCP6: &[u8] = b"tcp6";
+
+const BUILD: &[u8] = b"build ";
+const ADOPT: &[u8] = b"adopt";
+const QUEUE: &[u8] = b"queue";
+const RESET: &[u8] = b"reset";
+const FINGERPRINT: &[u8] = b"fingerprint ";
+
+/// The longest message either side sends. Every message is one `sendmsg` of fewer bytes
+/// than this on a `SOCK_SEQPACKET` socket, so one `recvmsg` returns exactly one message.
+const MAX_MESSAGE: usize = 16 * 1024;
+
+/// A connected pair of `SOCK_SEQPACKET` sockets, both close-on-exec: the owner's end and
+/// the agent's. Sequenced packets keep message boundaries, and a closed peer reads as
+/// end-of-file, which a datagram pair does not report.
+pub fn channel() -> std::io::Result<(UnixStream, UnixStream)> {
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: `fds` is two descriptors long, which is what socketpair writes.
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: socketpair returned two new descriptors nothing else owns.
+    Ok(unsafe {
+        (
+            UnixStream::from_raw_fd(fds[0]),
+            UnixStream::from_raw_fd(fds[1]),
+        )
+    })
+}
+
+fn send(channel: &UnixStream, message: &[u8]) -> std::io::Result<()> {
+    // SAFETY: the buffer outlives the call; MSG_NOSIGNAL turns a closed peer into EPIPE.
+    let sent = unsafe {
+        libc::send(
+            channel.as_raw_fd(),
+            message.as_ptr().cast(),
+            message.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    };
+    if sent < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The most descriptors one packet can carry here. A packet that carries more is cut short
+/// by the kernel, which closes the ones that do not fit.
+pub const MAX_PACKET_FDS: usize = 4;
+
+/// One packet from `socket` into `buffer`: how many bytes it had, and the descriptors that
+/// came with it. Zero bytes and no descriptor is end-of-file.
+///
+/// Every descriptor arrives close-on-exec (`MSG_CMSG_CLOEXEC`): the flag is set by the
+/// kernel as it installs the descriptor. Set afterwards with `fcntl`, a child this process
+/// forks in between would inherit the descriptor. A socket made in a VM's namespace that
+/// leaks into another VM's holder, pasta or VMM keeps that namespace alive and its
+/// connection to the guest open.
+pub fn receive_packet(
+    socket: &UnixStream,
+    buffer: &mut [u8],
+) -> std::io::Result<(usize, Vec<OwnedFd>)> {
+    // Room for the control message of MAX_PACKET_FDS descriptors: a 16-byte header and
+    // four bytes each, in 8-byte units so the header is aligned.
+    let mut control = [0u64; 2 + MAX_PACKET_FDS.div_ceil(2)];
+    let mut iov = libc::iovec {
+        iov_base: buffer.as_mut_ptr().cast(),
+        iov_len: buffer.len(),
+    };
+    // SAFETY: msghdr is plain data, valid when zeroed.
+    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+    header.msg_iov = &mut iov;
+    header.msg_iovlen = 1;
+    header.msg_control = control.as_mut_ptr().cast();
+    header.msg_controllen = std::mem::size_of_val(&control) as _;
+    // SAFETY: `header` names `buffer` and `control`, both writable for the lengths given
+    // and alive for the whole call.
+    let len = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut header, libc::MSG_CMSG_CLOEXEC) };
+    if len < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut fds = Vec::new();
+    // SAFETY: the kernel filled `control` up to `msg_controllen` with well-formed control
+    // messages, which the CMSG macros walk. Each descriptor in an SCM_RIGHTS message is new
+    // in this process and owned by nothing else.
+    unsafe {
+        let mut message = libc::CMSG_FIRSTHDR(&header);
+        while !message.is_null() {
+            if (*message).cmsg_level == libc::SOL_SOCKET && (*message).cmsg_type == libc::SCM_RIGHTS
+            {
+                let bytes = (*message).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let data = libc::CMSG_DATA(message).cast::<RawFd>();
+                for at in 0..bytes / std::mem::size_of::<RawFd>() {
+                    fds.push(OwnedFd::from_raw_fd(data.add(at).read_unaligned()));
+                }
+            }
+            message = libc::CMSG_NXTHDR(&header, message);
+        }
+    }
+    // A packet longer than `buffer`, or with more descriptors than the control buffer
+    // holds, arrives cut: the kernel drops the rest of the data and closes the descriptors
+    // that did not fit, and says so only in these flags. The ones that did fit are closed
+    // here with `fds`.
+    if header.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "a packet was truncated on receipt: it is over {} bytes or carries over \
+                 {MAX_PACKET_FDS} descriptors",
+                buffer.len()
+            ),
+        ));
+    }
+    Ok((len as usize, fds))
+}
+
+/// One message and the descriptor that came with it, or `None` at end-of-file.
+fn receive(channel: &UnixStream) -> std::io::Result<Option<(Vec<u8>, Option<OwnedFd>)>> {
+    let mut buffer = [0u8; MAX_MESSAGE];
+    let (len, mut fds) = receive_packet(channel, &mut buffer)?;
+    if len == 0 && fds.is_empty() {
+        return Ok(None);
+    }
+    // A message carries at most one descriptor; any other is closed here.
+    fds.truncate(1);
+    Ok(Some((buffer[..len].to_vec(), fds.pop())))
+}
+
+/// A TCP socket made in the calling process's network namespace: non-blocking and
+/// close-on-exec, not yet connected.
+fn tcp_socket(family: libc::c_int) -> std::io::Result<OwnedFd> {
+    // SAFETY: socket takes no pointers.
+    let fd = unsafe {
+        libc::socket(
+            family,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: socket returned a new descriptor nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The links of a rootless VM's namespace: the VMM's TAP and, behind pasta, pasta's TAP, on
+/// one bridge that holds the namespace's address.
+///
+/// Both TAPs are persistent: the VMM and pasta attach to devices that already exist and are
+/// already on the bridge, and their exit detaches them without removing a device or a
+/// bridge port.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Shape {
+    /// The VMM's TAP.
+    pub tap: String,
+    /// pasta's TAP. `None` in a namespace with no pasta and no route out.
+    pub pasta_tap: Option<String>,
+    pub bridge: String,
+    /// The bridge's MAC, pinned so every namespace answers for its address with the same one.
+    pub bridge_mac: [u8; 6],
+    pub bridge_address: std::net::Ipv4Addr,
+    pub bridge_prefix: u8,
+    /// The MTU of every link. `None` leaves each at the kernel's default.
+    pub mtu: Option<u32>,
+    /// Make the VMM's TAP attached: the holder keeps the queue open
+    /// ([`super::rtnl::add_attached_tap`]) and a VMM uses the device through a copy of that
+    /// descriptor. Otherwise the TAP is persistent and detached, and a VMM attaches to it
+    /// by name.
+    #[serde(default)]
+    pub tap_attached: bool,
+}
+
+/// Build `shape` in the calling process's network namespace, which must hold nothing but
+/// its loopback. The first step that fails is the error, named as the step.
+///
+/// One netlink request per step, each one `rtnl_mutex` hold: the bridge with its MAC, its
+/// MTU and address generation mode while it is down, each TAP with its MTU, its place on the
+/// bridge and its up flag, then the bridge's up flag, then the address. Nothing under /proc/sys is opened: a lookup there walks an entry
+/// for every other network namespace under one global lock. Nothing in the namespace
+/// forwards at L3 (the TAPs are bridged, and pasta reaches the guest from inside the
+/// namespace), so `ip_forward` stays as it is.
+///
+/// Returns the queue of the VMM's TAP when the shape asks for it attached.
+pub fn build(shape: &Shape) -> Result<Option<OwnedFd>> {
+    use super::rtnl::{add_tap, link_index, LinkChange, Rtnl};
+    let mut rtnl = Rtnl::open().context("opening a netlink socket")?;
+    let index = |name: &str| link_index(name).with_context(|| format!("finding {name}"));
+
+    let up = LinkChange {
+        up: true,
+        ..Default::default()
+    };
+    rtnl.set_link(index("lo")?, &up)
+        .context("bringing loopback up")?;
+    let bridge = &shape.bridge;
+    rtnl.add_bridge(bridge, shape.bridge_mac)
+        .with_context(|| format!("creating bridge {bridge}"))?;
+    let bridge_index = index(bridge)?;
+    // The bridge's IPv6 address generation goes off in a request of its own, while the
+    // bridge is down. In one request with the up flag the kernel brings the link up first,
+    // and a bridge that has a carrier at that moment gets a link-local address before the
+    // mode is applied. It can have one: a TAP that was just detached still reads as
+    // operational until the kernel's link watch worker has run, so the bridge counts it as a
+    // live port. The address then runs duplicate detection out of the VMM's TAP.
+    //
+    // The MTU is explicit, though the bridge would take its ports' smallest: a bridge whose
+    // MTU was set no longer follows its ports, so this is the value whatever joins it later.
+    let bridge_quiet = LinkChange {
+        mtu: shape.mtu,
+        master: None,
+        up: false,
+        no_ipv6_link_local: true,
+    };
+    rtnl.set_link(bridge_index, &bridge_quiet)
+        .with_context(|| format!("configuring bridge {bridge}"))?;
+    // pasta's TAP first, then the VMM's, as the ports were added when pasta made its own.
+    // A detached TAP takes its mode in the request that brings it up: nothing is attached
+    // to it, so it has no carrier and no queueing discipline yet, and the kernel generates
+    // no address for such a link. An attached TAP has a carrier from the start, so like the
+    // bridge it gets its mode in a request of its own while it is down: brought up in the
+    // same request it took a link-local address and sent a router solicitation out of its
+    // own queue, to whichever VM read it first.
+    let mut queue = None;
+    for tap in shape.pasta_tap.iter().chain(std::iter::once(&shape.tap)) {
+        if shape.tap_attached && *tap == shape.tap {
+            queue = Some(
+                super::rtnl::add_attached_tap(tap)
+                    .with_context(|| format!("creating TAP device {tap} with its queue"))?,
+            );
+            let tap_quiet = LinkChange {
+                mtu: shape.mtu,
+                master: None,
+                up: false,
+                no_ipv6_link_local: true,
+            };
+            rtnl.set_link(index(tap)?, &tap_quiet)
+                .with_context(|| format!("configuring TAP device {tap}"))?;
+        } else {
+            add_tap(tap).with_context(|| format!("creating TAP device {tap}"))?;
+        }
+        let port = LinkChange {
+            mtu: shape.mtu,
+            master: Some(bridge_index),
+            up: true,
+            no_ipv6_link_local: true,
+        };
+        rtnl.set_link(index(tap)?, &port)
+            .with_context(|| format!("putting {tap} on bridge {bridge}"))?;
+    }
+    rtnl.set_link(bridge_index, &up)
+        .with_context(|| format!("bringing bridge {bridge} up"))?;
+    rtnl.add_address(bridge_index, shape.bridge_address, shape.bridge_prefix)
+        .with_context(|| {
+            format!(
+                "adding {}/{} to bridge {bridge}",
+                shape.bridge_address, shape.bridge_prefix
+            )
+        })?;
+    Ok(queue)
+}
+
+/// Remove what a VM's use of the namespace can leave in it, so the next VM starts from what
+/// the build made. Nothing here is a list of things a VM is known to change: each step
+/// empties one kind of kernel state whole, and [`fingerprint`](super::fingerprint) then
+/// checks the namespace against the one taken when it was built.
+///
+/// - every adopted channel is dropped: the lessee is gone;
+/// - every TCP socket is destroyed ([`super::sock_destroy`]), so nothing retransmits to the
+///   next guest;
+/// - every resolved neighbour entry is deleted, so no MAC a guest answered with survives,
+///   and every address the bridge learned on a port, which the kernel would otherwise
+///   drop up to a second after the port lost its carrier;
+/// - every IPv4 address but loopback's is removed and added again, which makes its routes
+///   anew: a path MTU from a guest's ICMP "fragmentation needed", or a redirect, is kept on
+///   the route. Any other route through that link goes with its last address. IPv6 has no
+///   such step; a kept IPv6 path MTU shows in the fingerprint and gets the namespace
+///   destroyed.
+///
+/// Not reset: the namespace's TCP metrics (the round-trip time and congestion window the
+/// kernel remembers per destination). Deleting them takes `CAP_NET_ADMIN` in the initial
+/// user namespace, and they are not sent to a guest.
+pub fn reset(lessees: &mut Vec<UnixStream>) -> Result<()> {
+    use super::rtnl::{Rtnl, RTM_GETNEIGH};
+    const NDA_DST: u16 = 1;
+    const NUD_NOARP: u16 = 0x40;
+    lessees.clear();
+    // Sockets first: a socket that retransmits after the neighbours are gone would make the
+    // kernel look for the guest again and leave a new entry.
+    super::sock_destroy::destroy_tcp_sockets().context("destroying the namespace's TCP sockets")?;
+    let mut rtnl = Rtnl::open().context("opening a netlink socket")?;
+    for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
+        let mut header = [0u8; 12];
+        header[0] = family;
+        let entries = rtnl
+            .dump(RTM_GETNEIGH, &header)
+            .context("listing neighbours")?;
+        for entry in entries {
+            let p = &entry.payload;
+            if p.len() < 12 || u16::from_ne_bytes([p[8], p[9]]) & NUD_NOARP != 0 {
+                continue;
+            }
+            let index = u32::from_ne_bytes([p[4], p[5], p[6], p[7]]);
+            let Some((_, address)) = entry.attrs(12).into_iter().find(|(k, _)| *k == NDA_DST)
+            else {
+                continue;
+            };
+            match rtnl.del_neighbour(index, family, address) {
+                Ok(()) => {}
+                // Expired between the listing and here.
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(error) => return Err(error).context("deleting a neighbour"),
+            }
+        }
+    }
+    const NDA_MASTER: u16 = 9;
+    const NTF_SELF: u8 = 0x02;
+    const NUD_PERMANENT: u16 = 0x80;
+    let mut header = [0u8; 12];
+    header[0] = libc::AF_BRIDGE as u8;
+    let learned = rtnl
+        .dump(RTM_GETNEIGH, &header)
+        .context("listing the bridge's learned addresses")?;
+    // The bridges that have learned an address: an entry of a bridge's table names its
+    // bridge, and one that is not a port's own or added to stay was learned. Each such
+    // bridge is told once to forget what it learned, which is a link change; deleting the
+    // entries one by one is refused in a user namespace on Linux 6.14
+    // (`Rtnl::flush_learned_addresses`).
+    let mut bridges = std::collections::BTreeSet::new();
+    for entry in learned {
+        let p = &entry.payload;
+        if p.len() < 12
+            || p[10] & NTF_SELF != 0
+            || u16::from_ne_bytes([p[8], p[9]]) & (NUD_PERMANENT | NUD_NOARP) != 0
+        {
+            continue;
+        }
+        if let Some((_, master)) = entry.attrs(12).into_iter().find(|(k, _)| *k == NDA_MASTER) {
+            if let Ok(index) = <[u8; 4]>::try_from(master) {
+                bridges.insert(u32::from_ne_bytes(index));
+            }
+        }
+    }
+    for bridge in bridges {
+        rtnl.flush_learned_addresses(bridge)
+            .context("having a bridge forget its learned addresses")?;
+    }
+    rtnl.renew_addresses()
+        .context("renewing the namespace's addresses")?;
+    Ok(())
+}
+
+fn answer(channel: &UnixStream, result: Result<Vec<u8>>) -> std::io::Result<()> {
+    let reply = match result {
+        Ok(mut body) => {
+            let mut reply = OK.to_vec();
+            reply.append(&mut body);
+            reply
+        }
+        Err(error) => format!("err {error:#}").into_bytes(),
+    };
+    send(channel, &fitted(reply))
+}
+
+/// `reply` as it is sent. An `ok` reply that is over the size of a message is replaced by
+/// an `err`: cut short it would read as a whole answer, and a fingerprint that lost its
+/// tail would compare as a namespace with less in it. An `err` reply is cut: its head says
+/// what failed.
+fn fitted(mut reply: Vec<u8>) -> Vec<u8> {
+    if reply.len() <= MAX_MESSAGE {
+        return reply;
+    }
+    if reply.starts_with(b"err ") {
+        reply.truncate(MAX_MESSAGE);
+        return reply;
+    }
+    format!(
+        "err the reply is {} bytes, over the {MAX_MESSAGE} a message holds",
+        reply.len()
+    )
+    .into_bytes()
+}
+
+/// Answer a request that is not served with `err <reason>`, cut to what a reply may hold.
+fn refuse(channel: &UnixStream, reason: &str) -> std::io::Result<()> {
+    send(channel, &fitted(format!("err {reason}").into_bytes()))
+}
+
+/// Answer a request for a socket (`tcp4`, `tcp6`); anything else is refused.
+fn serve_socket(channel: &UnixStream, request: &[u8]) -> std::io::Result<()> {
+    let family = match request {
+        TCP4 => libc::AF_INET,
+        TCP6 => libc::AF_INET6,
+        other => {
+            // The request is echoed, and one near the size limit would make a reply over
+            // it, which the client would take for a truncated packet.
+            let reason = format!("unknown request {:?}", String::from_utf8_lossy(other));
+            return refuse(channel, &reason);
+        }
+    };
+    match tcp_socket(family) {
+        Ok(socket) => channel
+            .send_with_fd(OK, socket.as_raw_fd())
+            .map(drop)
+            .map_err(|error| std::io::Error::from_raw_os_error(error.errno())),
+        Err(error) => send(channel, format!("err socket: {error}").as_bytes()),
+    }
+}
+
+/// Answer the owner's requests, and the socket requests of the channels it had adopted,
+/// until the owner's end of its channel closes.
+///
+/// A request the agent cannot serve is answered with `err <reason>` and the agent keeps
+/// serving: one bad request must not take the namespace down. An adopted channel that
+/// fails or closes is dropped; only the owner's channel ends the agent.
+pub fn serve(owner: &UnixStream) -> Result<()> {
+    let mut lessees: Vec<UnixStream> = Vec::new();
+    // The queue of the VMM's TAP, when the namespace was built with it attached.
+    let mut queue: Option<OwnedFd> = None;
+    loop {
+        let mut fds: Vec<libc::pollfd> = std::iter::once(owner)
+            .chain(lessees.iter())
+            .map(|channel| libc::pollfd {
+                fd: channel.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: `fds` is a valid array of its own length for the whole call.
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("waiting for a request");
+        }
+        // Lessees first and from the last one down, so removing one keeps the indices of
+        // those not yet looked at. The owner's request may replace the whole list.
+        for at in (0..lessees.len()).rev() {
+            if fds[at + 1].revents == 0 {
+                continue;
+            }
+            let served = match receive(&lessees[at]) {
+                Ok(Some((request, _))) => serve_socket(&lessees[at], &request).is_ok(),
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    refuse(&lessees[at], &error.to_string()).is_ok()
+                }
+                Ok(None) | Err(_) => false,
+            };
+            if !served {
+                lessees.remove(at);
+            }
+        }
+        if fds[0].revents == 0 {
+            continue;
+        }
+        let received = match receive(owner) {
+            Ok(received) => received,
+            // A request the kernel cut on receipt (over the size limit, or with more
+            // descriptors than a request carries) is one bad request: it is refused and the
+            // namespace stays.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                refuse(owner, &error.to_string()).context("refusing a cut request")?;
+                continue;
+            }
+            Err(error) => return Err(error).context("reading a request"),
+        };
+        let Some((request, passed)) = received else {
+            return Ok(());
+        };
+        match request.as_slice() {
+            request if request.starts_with(BUILD) => {
+                let built = serde_json::from_slice::<Shape>(&request[BUILD.len()..])
+                    .context("reading the shape")
+                    .and_then(|shape| build(&shape))
+                    .map(|made| queue = made);
+                answer(owner, built.map(|()| Vec::new())).context("answering a build")?;
+            }
+            QUEUE => match &queue {
+                Some(queue) => owner
+                    .send_with_fd(OK, queue.as_raw_fd())
+                    .map(drop)
+                    .map_err(|error| std::io::Error::from_raw_os_error(error.errno()))
+                    .context("sending the queue")?,
+                None => send(
+                    owner,
+                    b"err the namespace was not built with an attached TAP",
+                )
+                .context("answering a queue request")?,
+            },
+            ADOPT => {
+                // A lessee's channel is non-blocking on this side: a lessee that asks and
+                // never reads would otherwise fill its queue and hold the holder in a send,
+                // and with it the pool's reset of this namespace. A reply that cannot be
+                // queued drops the lessee (`served` below).
+                //
+                // A new lessee starts with an empty TAP queue. Whatever the namespace sent
+                // towards a VMM since the last one read it is still there: the kernel
+                // purges a queue when it is closed, and this one stays open.
+                let adopted = passed
+                    .context("the request carried no socket")
+                    .and_then(|socket| {
+                        if let Some(queue) = &queue {
+                            super::rtnl::drain_tap(queue).context("emptying the TAP's queue")?;
+                        }
+                        let socket = UnixStream::from(socket);
+                        socket
+                            .set_nonblocking(true)
+                            .context("making the lessee's channel non-blocking")?;
+                        lessees.push(socket);
+                        Ok(())
+                    });
+                answer(owner, adopted.map(|()| Vec::new())).context("answering an adopt")?;
+            }
+            RESET => {
+                answer(owner, reset(&mut lessees).map(|()| Vec::new()))
+                    .context("answering a reset")?;
+            }
+            request if request.starts_with(FINGERPRINT) => {
+                let tap = String::from_utf8_lossy(&request[FINGERPRINT.len()..]).into_owned();
+                let text = super::fingerprint::fingerprint(&tap).map(|text| {
+                    let mut body = b" ".to_vec();
+                    body.extend_from_slice(text.as_bytes());
+                    body
+                });
+                answer(owner, text).context("answering a fingerprint")?;
+            }
+            other => serve_socket(owner, other).context("answering a socket request")?,
+        }
+    }
+}
+
+/// Set once [`main_if_agent`] has run in this process: its executable can be an agent.
+static CAN_BE_AGENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The first call of a binary's `main`. When the process was started as an agent this runs
+/// it and returns its result for `main` to return; otherwise it returns `None` and records
+/// that this executable is one [`executable`] can start agents from.
+pub fn main_if_agent() -> Option<Result<()>> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(std::ffi::OsStr::new(SUBCOMMAND)) {
+        CAN_BE_AGENT.store(true, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    let number = |what: &str, arg: Option<std::ffi::OsString>| {
+        arg.as_deref()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|text| text.parse::<u32>().ok())
+            .with_context(|| format!("{SUBCOMMAND}: missing or malformed {what}"))
+    };
+    Some((|| {
+        let channel = number("channel descriptor", args.next())?;
+        let owner = number("owner pid", args.next())?;
+        run(channel as RawFd, owner)
+    })())
+}
+
+/// The executable to start an agent from: this process's own when its `main` begins with
+/// [`main_if_agent`], otherwise the `fcvm` beside it or one directory up (a test binary in
+/// `target/<profile>/deps`).
+pub fn executable() -> Result<std::path::PathBuf> {
+    executable_for(
+        CAN_BE_AGENT.load(std::sync::atomic::Ordering::Relaxed),
+        || std::env::current_exe().context("finding this executable"),
+    )
+}
+
+fn executable_for(
+    can_be_agent: bool,
+    current: impl FnOnce() -> Result<std::path::PathBuf>,
+) -> Result<std::path::PathBuf> {
+    if can_be_agent {
+        // The file this process runs from, through the kernel's own link to it. The path
+        // it was started by can name another file by now (a rebuilt or upgraded binary), or
+        // none; a VM started later must still get an agent of this process's own build.
+        return Ok("/proc/self/exe".into());
+    }
+    let current = current()?;
+    let mut tried = Vec::new();
+    for dir in current.ancestors().skip(1).take(2) {
+        let candidate = dir.join("fcvm");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        tried.push(candidate.display().to_string());
+    }
+    bail!(
+        "no fcvm binary to start the namespace agent from: {} does not run one itself, and \
+         none of {} exists (build fcvm first)",
+        current.display(),
+        tried.join(", ")
+    )
+}
+
+/// `fcvm __netns-agent <channel fd> <owner pid>`: create the namespaces, hold them, serve
+/// the owner. Runs on the process's only thread.
+pub fn run(channel: RawFd, owner: u32) -> Result<()> {
+    // First, so the process is findable by name for its whole life.
+    // SAFETY: COMM is a NUL-terminated string that outlives the call.
+    unsafe { libc::prctl(libc::PR_SET_NAME, COMM.as_ptr()) };
+    // SAFETY: the owner left the agent's end of the channel open across the exec on this
+    // descriptor, and nothing else in this process has opened it.
+    let channel = unsafe { UnixStream::from_raw_fd(channel) };
+    // SAFETY: fcntl with F_SETFD takes no pointers. The owner cleared the flag for the exec.
+    unsafe { libc::fcntl(channel.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    // SAFETY: unshare takes no pointers.
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
+        bail!(
+            "unshare(CLONE_NEWUSER | CLONE_NEWNET): {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // After the unshare, so no credential change can clear it, and checked against the
+    // owner: an owner that died before this line has already reparented the agent, and no
+    // signal would come.
+    // SAFETY: prctl with these arguments takes no pointers.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+        bail!(
+            "arming the parent-death signal: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    if std::os::unix::process::parent_id() != owner {
+        bail!("the owner ({owner}) exited before the agent started");
+    }
+    send(&channel, UNSHARED).context("telling the owner the namespaces exist")?;
+    match receive(&channel).context("waiting for the owner to write the id maps")? {
+        Some((message, _)) if message == MAPPED => {}
+        Some((message, _)) => bail!(
+            "the owner sent {:?} instead of the id maps",
+            String::from_utf8_lossy(&message)
+        ),
+        None => return Ok(()),
+    }
+    // SAFETY: geteuid takes no arguments.
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 {
+        bail!("the id maps leave the agent as uid {euid} in its namespace, not 0");
+    }
+    send(&channel, READY).context("telling the owner the agent is ready")?;
+    serve(&channel)
+}
+
+/// The owner's end of an agent's channel. Requests are serialized: the agent answers one
+/// at a time, so a second caller waits for the first reply.
+pub struct Client {
+    channel: tokio::io::unix::AsyncFd<UnixStream>,
+    /// Held for one request and its reply. The count is the replies the agent still owes
+    /// to requests whose callers stopped waiting ([`Client::exchange`]).
+    turn: tokio::sync::Mutex<u32>,
+}
+
+impl Client {
+    /// Wrap the owner's end. Must be called inside a tokio runtime.
+    pub fn new(channel: UnixStream) -> std::io::Result<Self> {
+        channel.set_nonblocking(true)?;
+        // SAFETY: the `AsyncFd` owns the stream, which closes only on drop, and nothing
+        // replaces it through `get_mut`.
+        let channel =
+            unsafe { tokio::io::unix::AsyncFd::register(channel) }.map_err(std::io::Error::from)?;
+        Ok(Self {
+            channel,
+            turn: tokio::sync::Mutex::new(0),
+        })
+    }
+
+    async fn send(&self, message: &[u8]) -> std::io::Result<()> {
+        loop {
+            let mut guard = self.channel.writable().await?;
+            match guard.try_io(|channel| send(channel.get_ref(), message)) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    /// The agent's next message. End-of-file is an error here: the agent is gone.
+    async fn receive(&self) -> std::io::Result<(Vec<u8>, Option<OwnedFd>)> {
+        loop {
+            let mut guard = self.channel.readable().await?;
+            match guard.try_io(|channel| receive(channel.get_ref())) {
+                Ok(result) => {
+                    return result?.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "the namespace agent closed its channel",
+                        )
+                    })
+                }
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    /// One request, with a descriptor if `passed`, and the agent's reply to it.
+    ///
+    /// The agent answers in order, one reply per request. A caller that is dropped between
+    /// the two (a probe that timed out) leaves its reply in the channel, and the next
+    /// request would read it as its own: a socket where a fingerprint was asked for. So a
+    /// request that has been sent is counted until its reply has been read, and a request
+    /// first reads and discards the replies owed to callers that left. A descriptor in a
+    /// discarded reply is closed.
+    async fn exchange(
+        &self,
+        request: &[u8],
+        passed: Option<RawFd>,
+    ) -> std::io::Result<(Vec<u8>, Option<OwnedFd>)> {
+        let mut owed = self.turn.lock().await;
+        while *owed > 0 {
+            self.receive().await?;
+            *owed -= 1;
+        }
+        match passed {
+            None => self.send(request).await?,
+            Some(fd) => self.send_with_fd(request, fd).await?,
+        }
+        *owed += 1;
+        let reply = self.receive().await?;
+        *owed -= 1;
+        Ok(reply)
+    }
+
+    /// Wait for the agent to say its namespaces exist.
+    pub async fn unshared(&self) -> Result<()> {
+        self.expect(UNSHARED).await
+    }
+
+    /// Tell the agent its id maps are written and wait for it to confirm it is ready.
+    pub async fn mapped(&self) -> Result<()> {
+        let (message, _) = self
+            .exchange(MAPPED, None)
+            .await
+            .context("sending 'mapped' and waiting for the agent's 'ready'")?;
+        if message != READY {
+            bail!(
+                "the namespace agent said {:?} instead of 'ready'",
+                String::from_utf8_lossy(&message)
+            );
+        }
+        Ok(())
+    }
+
+    async fn expect(&self, word: &[u8]) -> Result<()> {
+        let (message, _) = self.receive().await.with_context(|| {
+            format!(
+                "waiting for the agent's '{}'",
+                String::from_utf8_lossy(word)
+            )
+        })?;
+        if message != word {
+            bail!(
+                "the namespace agent said {:?} instead of '{}'",
+                String::from_utf8_lossy(&message),
+                String::from_utf8_lossy(word)
+            );
+        }
+        Ok(())
+    }
+
+    /// Have the agent build `shape` in its namespace ([`build`]).
+    pub async fn build(&self, shape: &Shape) -> Result<()> {
+        let mut request = BUILD.to_vec();
+        serde_json::to_writer(&mut request, shape).context("encoding the shape")?;
+        anyhow::ensure!(
+            request.len() <= MAX_MESSAGE,
+            "the shape is too long to send"
+        );
+        let (reply, _) = self
+            .exchange(&request, None)
+            .await
+            .context("asking for a build")?;
+        match reply.strip_prefix(b"err ") {
+            Some(reason) => bail!("{}", String::from_utf8_lossy(reason)),
+            None if reply == OK => Ok(()),
+            None => bail!(
+                "the namespace agent answered a build with {:?}",
+                String::from_utf8_lossy(&reply)
+            ),
+        }
+    }
+
+    /// One request and its reply's body after `ok`. `err <reason>` is this call's error.
+    async fn request(&self, request: &[u8], passed: Option<RawFd>, what: &str) -> Result<Vec<u8>> {
+        let (reply, _) = self
+            .exchange(request, passed)
+            .await
+            .with_context(|| format!("asking the namespace agent for {what}"))?;
+        if let Some(reason) = reply.strip_prefix(b"err ") {
+            bail!("{}", String::from_utf8_lossy(reason));
+        }
+        match reply.strip_prefix(OK) {
+            Some(body) => Ok(body.to_vec()),
+            None => bail!(
+                "the namespace agent answered {what} with {:?}",
+                String::from_utf8_lossy(&reply)
+            ),
+        }
+    }
+
+    async fn send_with_fd(&self, message: &[u8], fd: RawFd) -> std::io::Result<()> {
+        loop {
+            let mut guard = self.channel.writable().await?;
+            match guard.try_io(|channel| {
+                channel
+                    .get_ref()
+                    .send_with_fd(message, fd)
+                    .map(drop)
+                    .map_err(|error| std::io::Error::from_raw_os_error(error.errno()))
+            }) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    /// The queue the VMM's TAP is attached by, in a namespace built with
+    /// [`Shape::tap_attached`]. The descriptor is a copy: the agent keeps its own.
+    pub async fn queue(&self) -> Result<OwnedFd> {
+        let (reply, queue) = self
+            .exchange(QUEUE, None)
+            .await
+            .context("asking the namespace agent for the TAP's queue")?;
+        if let Some(reason) = reply.strip_prefix(b"err ") {
+            bail!("{}", String::from_utf8_lossy(reason));
+        }
+        queue.context("the namespace agent's reply carried no queue")
+    }
+
+    /// Have the agent serve socket requests on `channel` too: the other end of that socket
+    /// pair goes to the process the namespace is lent to. The agent empties the TAP's queue
+    /// first, when it holds one.
+    pub async fn adopt(&self, channel: &UnixStream) -> Result<()> {
+        self.request(ADOPT, Some(channel.as_raw_fd()), "an adopted channel")
+            .await
+            .map(drop)
+    }
+
+    /// Have the agent remove what a VM's use left in the namespace ([`reset`]).
+    pub async fn reset(&self) -> Result<()> {
+        self.request(RESET, None, "a reset").await.map(drop)
+    }
+
+    /// The namespace's fingerprint ([`super::fingerprint`]); `tap` is the VMM's TAP.
+    pub async fn fingerprint(&self, tap: &str) -> Result<String> {
+        let mut request = FINGERPRINT.to_vec();
+        request.extend_from_slice(tap.as_bytes());
+        let body = self.request(&request, None, "a fingerprint").await?;
+        Ok(String::from_utf8_lossy(&body).trim_start().to_string())
+    }
+
+    /// An unconnected TCP socket made inside the agent's network namespace, for `address`'s
+    /// family.
+    pub async fn tcp_socket(&self, address: &std::net::IpAddr) -> Result<tokio::net::TcpSocket> {
+        let request = if address.is_ipv4() { TCP4 } else { TCP6 };
+        let (message, socket) = self
+            .exchange(request, None)
+            .await
+            .context("asking for a socket")?;
+        if message != OK {
+            bail!(
+                "the namespace agent refused a socket: {}",
+                String::from_utf8_lossy(&message)
+            );
+        }
+        let socket = socket.context("the namespace agent's reply carried no socket")?;
+        // SAFETY: the descriptor is a TCP socket this process now owns alone.
+        Ok(unsafe {
+            tokio::net::TcpSocket::from_raw_fd(std::os::fd::IntoRawFd::into_raw_fd(socket))
+        })
+    }
+}
+
+/// The channels this process holds to the agents it started, by agent PID. The agent's PID
+/// is what a VM's state records (`holder_pid`), so a task that knows only the state finds the
+/// channel here. An entry goes when the holder's owner reaps it ([`forget`]); one whose owner
+/// reaped it without saying so (a failed setup) is pruned by the next [`register`], as
+/// `companion`'s captures are.
+static CLIENTS: std::sync::Mutex<Vec<(u32, std::sync::Arc<Client>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record the channel to the agent `pid`.
+pub fn register(pid: u32, client: std::sync::Arc<Client>) {
+    let mut clients = CLIENTS.lock().unwrap();
+    // A reaped pid has no /proc entry; an unreaped one, zombie included, does.
+    clients.retain(|(agent, _)| {
+        *agent != pid && std::path::Path::new(&format!("/proc/{agent}")).exists()
+    });
+    clients.push((pid, client));
+}
+
+/// The channel to the agent `pid`, when this process started it and has not forgotten it.
+pub fn client(pid: u32) -> Option<std::sync::Arc<Client>> {
+    let clients = CLIENTS.lock().unwrap();
+    clients
+        .iter()
+        .find(|(agent, _)| *agent == pid)
+        .map(|(_, client)| client.clone())
+}
+
+/// Drop the channel to the agent `pid`. Once every clone of it is gone the agent reads
+/// end-of-file and exits.
+pub fn forget(pid: u32) {
+    CLIENTS.lock().unwrap().retain(|(agent, _)| *agent != pid);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Nothing the agent or its netlink code runs opens a path under /proc/sys: a lookup
+    /// there costs time in proportion to the network namespaces alive, under one global
+    /// lock, and the agent runs once per namespace on the start path.
+    #[test]
+    fn the_agent_opens_nothing_under_proc_sys() {
+        for (file, source) in [
+            ("netns_agent.rs", include_str!("netns_agent.rs")),
+            ("rtnl.rs", include_str!("rtnl.rs")),
+            ("fingerprint.rs", include_str!("fingerprint.rs")),
+            ("sock_destroy.rs", include_str!("sock_destroy.rs")),
+        ] {
+            let code = source.split("#[cfg(test)]").next().unwrap();
+            for (number, line) in code.lines().enumerate() {
+                let line = line.trim_start();
+                assert!(
+                    line.starts_with("//") || !line.contains("/proc/sys"),
+                    "{file}:{}: {line}",
+                    number + 1
+                );
+            }
+        }
+    }
+
+    /// The bridge's address generation is turned off before the bridge is brought up, in a
+    /// request of its own. Turned off in the request that brings it up, the bridge got a
+    /// link-local address whenever it had a carrier at that moment, which depends on whether
+    /// the kernel's link watch worker has run since the TAPs were detached: one build in a
+    /// few (`the_holder_builds_the_links_a_rootless_vm_needs` reads the result).
+    #[test]
+    fn the_bridge_stops_generating_addresses_before_it_comes_up() {
+        let source = include_str!("netns_agent.rs");
+        let body = &source[source.find("pub fn build(shape: &Shape)").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let quiet = body
+            .find("let bridge_quiet = LinkChange {")
+            .expect("no quiet request");
+        let request = &body[quiet..quiet + body[quiet..].find("};").unwrap()];
+        assert!(request.contains("up: false"), "{request}");
+        assert!(request.contains("no_ipv6_link_local: true"), "{request}");
+        let sent = body
+            .find("rtnl.set_link(bridge_index, &bridge_quiet)")
+            .unwrap();
+        let ports = body.find("add_tap(tap)").unwrap();
+        let up = body.find("rtnl.set_link(bridge_index, &up)").unwrap();
+        assert!(
+            sent < ports && ports < up,
+            "the bridge's requests are out of order"
+        );
+        assert_eq!(
+            body.matches("rtnl.set_link(bridge_index").count(),
+            2,
+            "another request to the bridge"
+        );
+    }
+
+    /// An attached TAP has a carrier before it is up, so its address generation is turned
+    /// off in a request that leaves it down, sent before the one that puts it on the bridge
+    /// and brings it up. In one request it took a link-local address and solicited routers
+    /// through its own queue (`the_next_tenant_gets_no_frame_from_the_last` reads the queue
+    /// of a namespace nothing has used).
+    #[test]
+    fn an_attached_tap_stops_generating_addresses_before_it_comes_up() {
+        let source = include_str!("netns_agent.rs");
+        let body = &source[source.find("pub fn build(shape: &Shape)").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let made = body.find("add_attached_tap(tap)").expect("no attached TAP");
+        let quiet = body
+            .find("let tap_quiet = LinkChange {")
+            .expect("no quiet request for the attached TAP");
+        let request = &body[quiet..quiet + body[quiet..].find("};").unwrap()];
+        assert!(request.contains("up: false"), "{request}");
+        assert!(request.contains("no_ipv6_link_local: true"), "{request}");
+        let sent = body
+            .find("rtnl.set_link(index(tap)?, &tap_quiet)")
+            .expect("the quiet request is not sent");
+        let port = body.find("rtnl.set_link(index(tap)?, &port)").unwrap();
+        assert!(
+            made < sent && sent < port,
+            "the attached TAP's requests are out of order"
+        );
+    }
+
+    /// A descriptor the agent sends arrives close-on-exec. Without the flag, a holder,
+    /// pasta or VMM this process starts while a probe is in flight inherits a socket made
+    /// in another VM's namespace and keeps that namespace alive.
+    #[tokio::test]
+    async fn a_socket_from_the_agent_is_close_on_exec() {
+        let (client, _agent) = serving();
+        let socket = client
+            .tcp_socket(&"127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        // SAFETY: fcntl with F_GETFD takes no pointers.
+        let flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD: {}", std::io::Error::last_os_error());
+        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+    }
+
+    /// A packet's descriptors all arrive, each close-on-exec, and a closed peer reads as
+    /// zero bytes with none.
+    #[test]
+    fn a_packet_carries_its_descriptors_close_on_exec() {
+        let (a, b) = channel().unwrap();
+        let files: Vec<std::fs::File> = (0..MAX_PACKET_FDS)
+            .map(|_| std::fs::File::open("/dev/null").unwrap())
+            .collect();
+        let raw: Vec<RawFd> = files.iter().map(|file| file.as_raw_fd()).collect();
+        a.send_with_fds(&[&b"hello"[..]], &raw).unwrap();
+        let mut buffer = [0u8; 16];
+        let (len, fds) = receive_packet(&b, &mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"hello");
+        assert_eq!(fds.len(), MAX_PACKET_FDS);
+        for fd in &fds {
+            // SAFETY: fcntl with F_GETFD takes no pointers.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0, "F_GETFD: {}", std::io::Error::last_os_error());
+            assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+        }
+        drop(a);
+        let (len, fds) = receive_packet(&b, &mut buffer).unwrap();
+        assert_eq!((len, fds.len()), (0, 0));
+    }
+
+    /// A packet with more descriptors than `receive_packet` has room for, or more bytes
+    /// than the caller's buffer, is an error: the kernel drops what does not fit, and a
+    /// caller handed the rest would act on part of a message.
+    #[test]
+    fn a_truncated_packet_is_an_error() {
+        let (a, b) = channel().unwrap();
+        let files: Vec<std::fs::File> = (0..MAX_PACKET_FDS + 1)
+            .map(|_| std::fs::File::open("/dev/null").unwrap())
+            .collect();
+        let raw: Vec<RawFd> = files.iter().map(|file| file.as_raw_fd()).collect();
+        a.send_with_fds(&[&b"hello"[..]], &raw).unwrap();
+        let mut buffer = [0u8; 16];
+        let refused = receive_packet(&b, &mut buffer).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+        assert!(refused.to_string().contains("truncated"), "{refused}");
+
+        a.send_with_fds(&[&[7u8; 17][..]], &[]).unwrap();
+        let refused = receive_packet(&b, &mut buffer).unwrap_err();
+        assert!(refused.to_string().contains("over 16 bytes"), "{refused}");
+
+        // The channel still carries the next packet whole.
+        a.send_with_fds(&[&b"next"[..]], &raw[..1]).unwrap();
+        let (len, fds) = receive_packet(&b, &mut buffer).unwrap();
+        assert_eq!((&buffer[..len], fds.len()), (&b"next"[..], 1));
+    }
+
+    /// An fcvm starts its agents from the file it is itself running from, whatever its
+    /// path names now.
+    #[test]
+    fn an_agent_capable_binary_starts_agents_from_its_own_file() {
+        let from = executable_for(true, || panic!("the path is not looked at")).unwrap();
+        assert_eq!(from, std::path::Path::new("/proc/self/exe"));
+        let missing = executable_for(false, || Ok("/nonexistent/deps/test-binary".into()));
+        assert!(format!("{:#}", missing.unwrap_err()).contains("/nonexistent/fcvm"));
+    }
+
+    /// A caller that stops waiting for its reply does not put the next request out of
+    /// step. Here a probe is dropped after its request for a socket was sent; the agent
+    /// answers it anyway, and the fingerprint asked for next gets the fingerprint's reply,
+    /// not the socket's.
+    #[tokio::test]
+    async fn a_request_whose_caller_left_does_not_shift_the_next_reply() {
+        let (owner, agent) = channel().unwrap();
+        let client = std::sync::Arc::new(Client::new(owner).unwrap());
+        let agent = std::sync::Arc::new(agent);
+        let next_request = |agent: std::sync::Arc<UnixStream>| async move {
+            tokio::task::spawn_blocking(move || receive(&agent).unwrap().unwrap().0)
+                .await
+                .unwrap()
+        };
+
+        let probe = tokio::spawn({
+            let client = client.clone();
+            async move { client.tcp_socket(&"127.0.0.1".parse().unwrap()).await }
+        });
+        assert_eq!(next_request(agent.clone()).await, TCP4);
+        probe.abort();
+        assert!(probe.await.unwrap_err().is_cancelled());
+
+        let fingerprint = tokio::spawn({
+            let client = client.clone();
+            async move { client.fingerprint("tap").await }
+        });
+        // The agent answers the first request, then reads and answers the second.
+        let socket = tcp_socket(libc::AF_INET).unwrap();
+        agent.send_with_fd(OK, socket.as_raw_fd()).unwrap();
+        assert_eq!(next_request(agent.clone()).await, b"fingerprint tap");
+        send(&agent, b"ok the fingerprint").unwrap();
+        assert_eq!(fingerprint.await.unwrap().unwrap(), "the fingerprint");
+
+        // And the request after that is in step too.
+        let again = tokio::spawn({
+            let client = client.clone();
+            async move { client.reset().await }
+        });
+        assert_eq!(next_request(agent.clone()).await, RESET);
+        send(&agent, OK).unwrap();
+        again.await.unwrap().unwrap();
+    }
+
+    /// A reply over the size of a message is an error, never a reply with its tail cut
+    /// off: a fingerprint short of its last lines would compare as a namespace with less in
+    /// it.
+    #[test]
+    fn a_reply_that_does_not_fit_is_an_error_not_a_cut_reply() {
+        let fits = [OK, &vec![b'x'; MAX_MESSAGE - OK.len()][..]].concat();
+        assert_eq!(fitted(fits.clone()), fits);
+        let over = [OK, &vec![b'x'; MAX_MESSAGE - OK.len() + 1][..]].concat();
+        let reply = String::from_utf8(fitted(over)).unwrap();
+        assert!(
+            reply.starts_with(&format!("err the reply is {} bytes", MAX_MESSAGE + 1)),
+            "{reply}"
+        );
+        let long_error = [&b"err "[..], &vec![b'e'; MAX_MESSAGE][..]].concat();
+        let cut = fitted(long_error);
+        assert_eq!(cut.len(), MAX_MESSAGE);
+        assert!(cut.starts_with(b"err eee"));
+    }
+
+    /// A lessee that asks and never reads its replies is dropped when its queue is full,
+    /// and the holder goes on serving its owner. With a blocking send the holder stopped
+    /// there, and the pool's reset of the namespace with it.
+    #[test]
+    fn a_lessee_that_never_reads_is_dropped_and_the_owner_is_served() {
+        let (owner, agent) = channel().unwrap();
+        let serving = std::thread::spawn(move || serve(&agent));
+        let (lessee, adopted) = channel().unwrap();
+        owner.send_with_fd(ADOPT, adopted.as_raw_fd()).unwrap();
+        assert_eq!(receive(&owner).unwrap().unwrap().0, OK);
+        drop(adopted);
+
+        // Requests the holder answers with an error of about their own size, unread.
+        lessee.set_nonblocking(true).unwrap();
+        let request = vec![b'q'; 4096];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut dropped = false;
+        while !dropped && std::time::Instant::now() < deadline {
+            match send(&lessee, &request) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                // The holder closed its end.
+                Err(_) => dropped = true,
+            }
+        }
+        assert!(
+            dropped,
+            "the holder kept a lessee whose replies it could not queue"
+        );
+
+        owner
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        send(&owner, TCP4).unwrap();
+        let (reply, socket) = receive(&owner).unwrap().expect("a reply to the owner");
+        assert_eq!((reply.as_slice(), socket.is_some()), (OK, true));
+        drop(owner);
+        serving.join().unwrap().unwrap();
+    }
+
+    /// One bad request does not take the namespace down: a request over the size limit is
+    /// answered with `err` and the agent serves the next one, on the owner's channel and on
+    /// an adopted one. A request it does not know is echoed in a reply that fits.
+    #[test]
+    fn an_oversize_or_unknown_request_is_refused_and_the_agent_serves_on() {
+        let (owner, agent) = channel().unwrap();
+        let serving = std::thread::spawn(move || serve(&agent));
+        let ask = |channel: &UnixStream, request: &[u8]| {
+            send(channel, request).unwrap();
+            receive(channel).unwrap().expect("a reply")
+        };
+        let refused = |reply: &[u8], what: &str| {
+            let text = String::from_utf8_lossy(reply).into_owned();
+            assert!(text.starts_with("err ") && text.contains(what), "{text}");
+            assert!(reply.len() <= MAX_MESSAGE);
+        };
+
+        let (reply, _) = ask(&owner, &vec![b'x'; MAX_MESSAGE + 1]);
+        refused(&reply, "truncated");
+        let (reply, _) = ask(&owner, &vec![b'q'; MAX_MESSAGE]);
+        refused(&reply, "unknown request");
+        let (reply, socket) = ask(&owner, TCP4);
+        assert_eq!((reply.as_slice(), socket.is_some()), (OK, true));
+
+        let (lessee, adopted) = channel().unwrap();
+        owner.send_with_fd(ADOPT, adopted.as_raw_fd()).unwrap();
+        assert_eq!(receive(&owner).unwrap().unwrap().0, OK);
+        drop(adopted);
+        let (reply, _) = ask(&lessee, &vec![b'x'; MAX_MESSAGE + 1]);
+        refused(&reply, "truncated");
+        let (reply, _) = ask(&lessee, &vec![b'q'; MAX_MESSAGE]);
+        refused(&reply, "unknown request");
+        let (reply, socket) = ask(&lessee, TCP6);
+        assert_eq!((reply.as_slice(), socket.is_some()), (OK, true));
+
+        drop(owner);
+        serving.join().unwrap().unwrap();
+    }
+
+    /// The serve loop on a thread, in this process's own namespaces: the protocol without
+    /// the unshare.
+    fn serving() -> (Client, std::thread::JoinHandle<Result<()>>) {
+        let (owner, agent) = channel().unwrap();
+        let thread = std::thread::spawn(move || serve(&agent));
+        (Client::new(owner).unwrap(), thread)
+    }
+
+    #[tokio::test]
+    async fn a_socket_from_the_agent_connects_like_any_other() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, thread) = serving();
+        let socket = client.tcp_socket(&address.ip()).await.unwrap();
+        let (connected, accepted) = tokio::join!(socket.connect(address), listener.accept());
+        assert_eq!(
+            connected.unwrap().local_addr().unwrap(),
+            accepted.unwrap().1
+        );
+        drop(client);
+        thread.join().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_agent_stops_when_its_owner_closes_the_channel() {
+        let (client, thread) = serving();
+        drop(client);
+        thread.join().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_request_is_refused_and_the_agent_keeps_serving() {
+        let (client, thread) = serving();
+        client.send(b"reboot").await.unwrap();
+        let (reply, socket) = client.receive().await.unwrap();
+        assert!(reply.starts_with(b"err unknown request"), "{reply:?}");
+        assert!(socket.is_none());
+        let address: std::net::IpAddr = "::1".parse().unwrap();
+        client.tcp_socket(&address).await.unwrap();
+        drop(client);
+        thread.join().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_each_get_their_own_socket() {
+        let (client, thread) = serving();
+        let client = std::sync::Arc::new(client);
+        let address: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let client = client.clone();
+            tasks.spawn(async move { client.tcp_socket(&address).await });
+        }
+        // Held until the end: a closed descriptor's number is free to be handed out again.
+        let mut sockets = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            sockets.push(result.unwrap().unwrap());
+        }
+        let fds: std::collections::BTreeSet<RawFd> =
+            sockets.iter().map(|socket| socket.as_raw_fd()).collect();
+        assert_eq!(fds.len(), 32, "a descriptor was handed out twice");
+        drop(client);
+        thread.join().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dead_agent_is_an_error_not_a_hang() {
+        let (owner, agent) = channel().unwrap();
+        drop(agent);
+        let client = Client::new(owner).unwrap();
+        let address: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let error = client.tcp_socket(&address).await.unwrap_err();
+        assert!(format!("{error:#}").contains("socket"), "{error:#}");
+    }
+}

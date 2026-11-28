@@ -12,6 +12,7 @@ pub(crate) use holes::flush_for_hole_walk;
 pub use holes::{for_each_data_run, try_for_each_data_run};
 pub(crate) use release::staging_tag;
 pub use release::{mark_in_use, release_idle_snapshots, release_unless_in_use, Released};
+pub(crate) use server::MAX_CLONES_ENV;
 pub use server::{
     preflight_clone_hugepages, record_window_from_env, FaultAround, Prefetch, ReplayLimit,
     ReplayThreads, ServeShape, UffdBacking, UffdServer, DEFAULT_PREFETCH_RECORD_WINDOW,

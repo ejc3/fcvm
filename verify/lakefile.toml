@@ -1,0 +1,23 @@
+name = "WakeVerify"
+defaultTargets = ["WakeVerify", "breaks", "hostops"]
+
+# A warning fails the build: `sorry` is a warning, and so is a `#guard_msgs` that Lean could
+# only partly check.
+leanOptions = { warningAsError = true }
+
+# The guest vCPU wake-up path (namespace `Wake`). `globs` builds every file of the directory,
+# imported by the root or not, so no file escapes the build or the axiom sweep.
+[[lean_lib]]
+name = "WakeVerify"
+globs = ["WakeVerify.*"]
+
+# `lake exe breaks`: the exhaustive search of every rule book for lost wake-ups.
+[[lean_exe]]
+name = "breaks"
+root = "Search"
+
+# `lake exe hostops <kernel>`: the model's kernel rules as operations and expected states, for
+# the C harness that drives the kernel's own functions (harness/run.sh).
+[[lean_exe]]
+name = "hostops"
+root = "HostOps"
