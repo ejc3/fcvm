@@ -3319,33 +3319,15 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   extent (2.57 s for a 128 GiB memory image of 2,969,599 extents). Where the store cannot make a subvolume (not
   btrfs, or btrfs behind a FUSE map in a nested guest) `disk/` is an ordinary directory and the clone reflinks the
   disk as before, and so does an unprivileged clone of a snapshot another user made (a snapshot keeps every inode's
-  owner, so it would get a disk it cannot write or remove). A disk of at most 4096 extents (`REFLINK_MAX_EXTENTS`,
-  counted with FIEMAP) is reflinked while one of the snapshot's 8 reflink slots (`REFLINK_SLOTS`: `flock`ed
-  `reflink-slot-N.lock` files beside `disk/`, taken without waiting and freed by the kernel when the clone's process
-  exits) is free, and takes the subvolume snapshot when all 8 are held. Both costs are measured: the subvolume
-  snapshot's commit, and the parent directory lock it holds through the commit, took 193 ms p50 and 1.8 s p99 with
-  four restores and four snapshots at once on a fleet host, against 17 ms and 192 ms for a reflink of a 684-extent
-  disk; but every clone of a snapshot reflinks the same source file and btrfs holds that inode's lock for the whole
-  reflink, so reflinks of one snapshot run one at a time, 4.6 ms each for an 871-extent disk, about 240 per second
-  at any concurrency. With 8 queued the last waits about 8 x 4.6 = 37 ms, under the subvolume median, and the fleet
-  relaunches 8 tiles of one snapshot at once, which stay on reflinks; deeper queues take subvolume snapshots, which
-  share no lock. A slot that frees in the middle of a burst is not taken: a
-  clone that takes the subvolume snapshot holds a read lock (`F_OFD_SETLK`) on one byte, drawn at random among 64, of
-  `subvolume-snapshot.lock` beside the slots, for its snapshot and 100 ms after it (`SUBVOLUME_SNAPSHOT_LINGER`: the
-  snapshots that share a commit end together, and the clones that arrive next must still find the burst), and a clone
-  with a free slot takes the subvolume snapshot too while at least 4 of the 64 bytes are held (`SNAPSHOT_BURST`).
-  `subvolume_snapshot_burst` counts the held bytes with `F_OFD_GETLK`, which takes no lock. The kernel answers with
-  the first lock in the way in the order the locks were taken, not the lowest byte, so the count asks both sides of
-  every byte it finds. Clones that drew the same byte count as one: 4 clones hold 4 different bytes in 91 draws of
-  100, and 5 hold at least 4 in 99. A reflink joins a transaction for every
-  extent and waits out each commit that starts meanwhile, and the commits carry what the reflinks dirtied, so the two
-  paths running together slow each other. Fewer held bytes than 4 are a clone or two that found every slot held; the
-  clones after them reflink, as before the mark, which matters where a subvolume snapshot is the slower path (a host
-  writing snapshots at the same time). A burst lasts while about 4 clones arrive per snapshot duration plus 100 ms.
-  On the disk piece (bench/start-rate/pieces RESULTS.md, c8g.metal-48xl, stock kernel 7.0.0-1013-aws,
-  none held), clones per second at C=1, 8, 128 and 512 were 286, 237, 1263 to 1689 and 1641 to 1977 with the slots,
-  against 286, 236, 235 and 256 for reflinks only and 128 to 140, 561 to 640, 1287 to 1316 and 1779 to 1943 for
-  subvolume snapshots only. The C=8 reflink p50 there was 47 ms, not the 37 ms the arithmetic gives. `rm -rf` removes
+  owner, so it would get a disk it cannot write or remove). Every other clone takes the subvolume snapshot, a small
+  disk included. On fcvm's host kernel (7.3.3-fcvm, one local NVMe device, a standalone microbenchmark of 2000
+  operations, 2026-11-28) reflinks of an 871-extent file ran one after another at 230 to 250 per second at every
+  concurrency from 1 to 512, from one file, 16 reflinked copies or 16 byte copies alike: they serialize on the root of
+  the one subvolume tree the clones land in (`btrfs_lock_root_node < btrfs_insert_replace_extent < btrfs_clone`), and
+  unlinking reflinked files queues on the same tree (150 to 300 per second). Subvolume snapshots ran at 1,500 per
+  second alone (against 250 for reflinks), 7,000 at 16 at once and 13,800 at 128, because the snapshots that wait
+  together share one commit. Through fcvm at C=512 the 8 clones of 2000 that took a reflink slot, when there were slots, took 4.8 to
+  7.8 s each, the start's p99 tail. `rm -rf` removes
   subvolumes, so teardown is unchanged, but btrfs reclaims a removed subvolume's space on its cleaner thread after the rmdir returns, where an unlinked reflink
   freed its space at once; `df` right after many clone teardowns can read high for a while.
 - Each snapshot directory is a btrfs subvolume too, and a diff snapshot is staged as a subvolume snapshot of its

@@ -248,6 +248,9 @@ source file serializes part of it; the rest is not attributed yet.
 
 ### 4. disk: reflink while one of 8 slots is free, else a subvolume snapshot (#2014)
 
+Measured on the stock host kernel 7.0.0-1013-aws, which fcvm no longer uses. The rule this section describes is
+gone: every clone of a snapshot disk subvolume now takes the subvolume snapshot (see `.claude/CLAUDE.md`).
+
 The rest is the source inode's lock: every clone of a snapshot reflinks the same file, and
 `btrfs_remap_file_range` holds that inode's lock (`lock_two_nondirectories`) for the whole
 reflink. Under bpftrace, 1000 clones at C=128 spent 514.6 s in reflinks, 510.3 s of it waiting
