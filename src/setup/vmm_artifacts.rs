@@ -44,6 +44,17 @@ pub struct VmmArtifact {
     pub sha256: String,
 }
 
+/// The architectures `vmm.yml` publishes builds for (`std::env::consts::ARCH`).
+pub const PUBLISHED_ARCHES: &[&str] = &["x86_64", "aarch64"];
+
+/// The libc tags `vmm.yml` publishes builds for, each with what decides it: its host legs run
+/// on GitHub's Ubuntu 24.04 runners, whose glibc the self-hosted Host and Host-Root lanes share,
+/// and its container legs in the test image built from `Containerfile` on Debian bookworm, the
+/// Container lanes' image. A host with any other libc finds no build named as it names its own,
+/// and setup builds that VMM locally.
+pub const PUBLISHED_LIBCS: &[(&str, &str)] =
+    &[("ubuntu-24.04", "libc-2.39"), ("bookworm", "libc-2.36")];
+
 impl VmmArtifacts {
     /// The recorded build installed as `name`.
     pub fn find(&self, name: &str) -> Option<&VmmArtifact> {
