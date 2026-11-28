@@ -308,6 +308,12 @@ async function startDense(size: number, over: Record<string, number> = {}): Prom
   await expect.poll(async () => (await mockPotato()).round?.size ?? null, { timeout: 10_000 }).toBe(size);
 }
 type Rect = { x: number; y: number; width: number; height: number };
+/** The arc's label exists only while a throw is in flight, so its presence and its box are read in one task of the page: a count() followed by boundingBox() can find it gone between the two. */
+const arcLabelBox = (page: Page) =>
+  page.evaluate(() => {
+    const el = document.querySelector('[data-testid="potato-arc-label"]');
+    return el ? (el.getBoundingClientRect().toJSON() as Rect) : null;
+  });
 const apart = (a: Rect, b: Rect) => a.x + a.width <= b.x + 1 || b.x + b.width <= a.x + 1 || a.y + a.height <= b.y + 1 || b.y + b.height <= a.y + 1;
 
 test("density: the CPU slots hold the machines that are not asleep, grouped and labelled, never more than the allotment", async ({ page }) => {
@@ -338,9 +344,8 @@ test("density: the slots stand in the ring's centre on a large screen, clear of 
     for (const t of boxes) expect(apart(centre, t), "the slots clear every tile").toBe(true);
     expect(centre.x).toBeGreaterThanOrEqual(stage.x);
     expect(centre.x + centre.width).toBeLessThanOrEqual(stage.x + stage.width);
-    const label = page.getByTestId("potato-arc-label");
-    if (await label.count()) {
-      const l = (await label.boundingBox())!;
+    const l = await arcLabelBox(page);
+    if (l) {
       expect(apart(l, centre), "the arc's label clears the slots").toBe(true);
       for (const t of boxes) expect(apart(l, t), "the arc's label clears the tiles").toBe(true);
     }
@@ -375,9 +380,8 @@ for (const [vw, vh] of [[1440, 900], [1280, 800]] as const) {
         const c = (await cpus.boundingBox())!;
         const inRing = (await page.locator(".potato-centre").count()) > 0;
         if (inRing) for (const t of boxes) expect(apart(c, t), "the slots clear every tile").toBe(true);
-        const label = page.getByTestId("potato-arc-label");
-        if (await label.count()) {
-          const l = (await label.boundingBox())!;
+        const l = await arcLabelBox(page);
+        if (l) {
           if (inRing) expect(apart(l, c), "the arc's label clears the slots").toBe(true);
           for (const t of boxes) expect(apart(l, t), "the arc's label clears the tiles").toBe(true);
         }
