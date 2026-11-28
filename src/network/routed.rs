@@ -108,7 +108,7 @@ fn lease_address_sweeping(
     use std::io::{Read, Seek, Write};
     use std::os::unix::fs::MetadataExt;
 
-    std::fs::create_dir_all(dir).with_context(|| {
+    crate::paths::ensure_dir(dir).with_context(|| {
         format!(
             "creating the IPv6 address lease directory {}",
             dir.display()

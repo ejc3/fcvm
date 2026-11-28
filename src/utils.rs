@@ -1012,7 +1012,7 @@ fn create_mount_targets(redirects: &MountRedirects) -> anyhow::Result<()> {
             continue;
         }
         if !mountpoint.exists() {
-            std::fs::create_dir_all(mountpoint)
+            crate::paths::ensure_dir(mountpoint)
                 .context("creating mountpoint directory for mount redirect")?;
         }
     }

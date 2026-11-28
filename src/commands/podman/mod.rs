@@ -746,9 +746,16 @@ async fn verify_prepared_snapshot_in(
 ) -> Result<Option<PreparedSnapshot>> {
     let snapshot_key = target.name.as_str();
     let snapshot_dir = snapshot_root.join(snapshot_key);
-    tokio::fs::create_dir_all(snapshot_root)
+    // Looked up first: a mkdir of a directory that exists still takes its parent's lock for
+    // writing, and every launch comes through here.
+    if !tokio::fs::metadata(snapshot_root)
         .await
-        .context("creating snapshot directory")?;
+        .is_ok_and(|metadata| metadata.is_dir())
+    {
+        crate::paths::ensure_dir_async(snapshot_root)
+            .await
+            .context("creating snapshot directory")?;
+    }
     let generation_lock = super::common::acquire_snapshot_dir_lock(&snapshot_dir, false).await?;
 
     let config_path = snapshot_dir.join("config.json");
@@ -1070,6 +1077,14 @@ fn run_host_ipv6(env: &[String]) -> Option<std::net::Ipv6Addr> {
     }
 }
 
+/// The read-only `HOST:GUEST:ro` specs among a run's `--map`.
+fn read_only_maps(maps: &[String]) -> Vec<String> {
+    maps.iter()
+        .filter(|spec| spec.split(':').nth(2) == Some("ro"))
+        .cloned()
+        .collect()
+}
+
 /// The `snapshot run` arguments that restore this run from a cached snapshot.
 ///
 /// `publish` is this run's own `--publish`, so the clone listens where this run asked,
@@ -1099,7 +1114,10 @@ fn snapshot_restore_args(
             args.publish.clone()
         },
         publish_limit_per_source: args.publish_limit_per_source,
-        map: Vec::new(),
+        // This run's read-only maps, which the pre-start key holds by guest path only: the
+        // clone serves each from this run's directory. A read-write map's host path is in
+        // the key, so the snapshot's is this run's.
+        map: read_only_maps(&args.map),
         ipv6_prefix: launch_ipv6_prefix(args),
         ipv6_address: args.ipv6_address,
         // This run's HOST_IPV6, which the snapshot key leaves out: the restored guest
@@ -1450,9 +1468,14 @@ async fn export_localhost_image_disk(
 
     // Use content-addressable cache: /mnt/fcvm-btrfs/image-cache/{digest}/
     let image_cache_dir = paths::image_cache_dir();
-    tokio::fs::create_dir_all(&image_cache_dir)
+    if !tokio::fs::metadata(&image_cache_dir)
         .await
-        .context("creating image-cache directory")?;
+        .is_ok_and(|metadata| metadata.is_dir())
+    {
+        crate::paths::ensure_dir_async(&image_cache_dir)
+            .await
+            .context("creating image-cache directory")?;
+    }
 
     // Lock per-digest to prevent concurrent exports of the same image
     let lock_file = lock_image_cache_entries(&image_cache_dir, &digest)?;
@@ -2100,7 +2123,30 @@ async fn prepare_vm_for_lifecycle(
         }
 
         // Check for pre-start snapshot (container loaded but not initialized)
-        if restores_pre_start(&lifecycle) && check_podman_snapshot(&key).await.is_some() {
+        let pre_start = if restores_pre_start(&lifecycle) {
+            check_podman_snapshot(&key).await
+        } else {
+            None
+        };
+        // The pre-start key holds a read-only map by its guest path, and a hit serves it from
+        // this run's directory. If that directory lacks a file the snapshot's guest holds,
+        // the restore would answer EIO for it, so this run boots cold and takes no snapshot;
+        // the snapshot under the key stays (#2239).
+        let unservable = match &pre_start {
+            Some(snapshot) => snapshot
+                .memory_path
+                .parent()
+                .map(|generation| {
+                    super::snapshot::moved_volumes_missing_paths(
+                        &snapshot.metadata.volumes,
+                        &read_only_maps(&args.map),
+                        generation,
+                    )
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        if pre_start.is_some() && unservable.is_empty() {
             info!(
                 snapshot_key = %key,
                 image = %args.image,
@@ -2156,37 +2202,62 @@ async fn prepare_vm_for_lifecycle(
             }
         }
 
-        info!(
-            snapshot_key = %key,
-            image = %args.image,
-            startup_snapshot_key = %startup_key,
-            "Snapshot miss, will create snapshot after image load"
-        );
-        failpoint::hit_async("cache.miss").await;
-        // A cold boot's first snapshot is a full one. A prepare fails without its startup
-        // snapshot and a --gpu run without its pre-start snapshot, so both are refused here
-        // when it cannot fit. Any other run only skips caching when its snapshot is refused.
-        if let Some(target) = prepare_target.as_mut() {
-            target.free_at_start = check_snapshot_space_before_boot(
-                "podman prepare's startup snapshot",
-                args.mem,
-                false,
-                Some(target),
-            )
-            .await?;
-        } else if !args.gpu.is_empty() {
-            check_snapshot_space_before_boot(
-                "the pre-start snapshot that --gpu restores with its devices attached",
-                args.mem,
-                false,
-                None,
-            )
-            .await?;
+        if let Some((volume, path)) = unservable.first() {
+            // A prepare is a snapshot, and a --gpu run restores its devices from one: neither
+            // can boot cold without it.
+            if lifecycle.is_prepare() || !args.gpu.is_empty() {
+                bail!(
+                    "the pre-start snapshot {key}'s guest holds {volume}/{path}, which this \
+                     run's read-only map of {volume} lacks; map a directory that holds it"
+                );
+            }
+            info!(
+                snapshot_key = %key,
+                volume = %volume,
+                path = %path,
+                missing = unservable.len(),
+                "the pre-start snapshot's guest holds a file this run's read-only map lacks; \
+                 booting cold and taking no snapshot"
+            );
+            on_disk_dir_staging(&mut disk_dir_staging, |s| s.stage()).await?;
         }
-        // The cold boot builds each read-only --disk-dir image from a private copy, and
-        // refuses one whose content is no longer what the key names.
-        on_disk_dir_staging(&mut disk_dir_staging, |s| s.stage()).await?;
-        (Some(config), Some(key), Some(startup_base), prepare_target)
+        if unservable.is_empty() {
+            info!(
+                snapshot_key = %key,
+                image = %args.image,
+                startup_snapshot_key = %startup_key,
+                "Snapshot miss, will create snapshot after image load"
+            );
+            failpoint::hit_async("cache.miss").await;
+            // A cold boot's first snapshot is a full one. A prepare fails without its startup
+            // snapshot and a --gpu run without its pre-start snapshot, so both are refused here
+            // when it cannot fit. Any other run only skips caching when its snapshot is refused.
+            if let Some(target) = prepare_target.as_mut() {
+                target.free_at_start = check_snapshot_space_before_boot(
+                    "podman prepare's startup snapshot",
+                    args.mem,
+                    false,
+                    Some(target),
+                )
+                .await?;
+            } else if !args.gpu.is_empty() {
+                check_snapshot_space_before_boot(
+                    "the pre-start snapshot that --gpu restores with its devices attached",
+                    args.mem,
+                    false,
+                    None,
+                )
+                .await?;
+            }
+            // The cold boot builds each read-only --disk-dir image from a private copy, and
+            // refuses one whose content is no longer what the key names.
+            on_disk_dir_staging(&mut disk_dir_staging, |s| s.stage()).await?;
+        }
+        if unservable.is_empty() {
+            (Some(config), Some(key), Some(startup_base), prepare_target)
+        } else {
+            (None, None, None, None)
+        }
     } else {
         if std::env::var("FCVM_NO_SNAPSHOT")
             .map(|v| !v.is_empty())
@@ -2460,7 +2531,7 @@ async fn prepare_vm_for_lifecycle(
             let absolute_dir = socket_path
                 .parent()
                 .expect("a custom vsock socket path always has a parent");
-            tokio::fs::create_dir_all(absolute_dir)
+            crate::paths::ensure_dir_async(absolute_dir)
                 .await
                 .with_context(|| format!("creating vsock dir: {:?}", absolute_dir))?;
             Ok(socket_path)
@@ -4705,6 +4776,21 @@ mod tests {
         let gpu = snapshot_restore_args(&args, "k", Some("k".to_string()), (None, None));
         assert_eq!(gpu.startup_snapshot_base_key, None);
         assert_eq!(gpu.gpu, ["0000:01:00.0"]);
+    }
+
+    /// A pre-start snapshot is shared by runs that map one guest path read-only from
+    /// different host directories (its key holds no read-only host path, #2239), so a hit
+    /// serves each read-only map from this run's own directory, through `snapshot run --map`.
+    /// A read-write map is not moved: its host path is in the key, so it is the snapshot's.
+    #[test]
+    fn a_pre_start_hit_serves_the_runs_own_read_only_maps() {
+        let mut args = test_args();
+        args.map = vec![
+            "/run/b/cfg:/root/.config/fcvm:ro".to_string(),
+            "/data:/data".to_string(),
+        ];
+        let restore = snapshot_restore_args(&args, "k", Some("k".to_string()), (None, None));
+        assert_eq!(restore.map, ["/run/b/cfg:/root/.config/fcvm:ro"]);
     }
 
     /// A cache hit restores through `snapshot run`, where a clone chooses where it

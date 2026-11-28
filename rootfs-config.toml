@@ -199,6 +199,99 @@ commit = "96d35ac08e49bdb3b88d26109e054fa314f5804d"
 repo = "cloud-hypervisor/cloud-hypervisor"
 commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
 
+# Published builds of the pinned VMMs above (src/setup/vmm_artifacts.rs). vmm.yml builds each
+# Firecracker pin of a published kernel profile and the Cloud Hypervisor pin from source, per
+# architecture and libc, on GitHub-hosted runners, publishes each binary as a release asset of
+# `repo` named for its store file, and pushes the entries below to a vmm-digests/ branch.
+# Setup installs an entry whose name is the one it would build, checked against `sha256`, and
+# builds locally when there is none. A pin change builds locally until its entries land.
+[vmm_artifacts]
+repo = "ejc3/fcvm"
+
+[[vmm_artifacts.files]]
+name = "cloud-hypervisor-243d1c8ffff4.bin"
+commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
+arch = "x86_64"
+libc = "libc-2.39"
+sha256 = "d8999c7baf176ec124cd48bb4cb5dffe5a584a4e105f0e416232ed27383e35b3"
+
+[[vmm_artifacts.files]]
+name = "cloud-hypervisor-af878066d491.bin"
+commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
+arch = "x86_64"
+libc = "libc-2.36"
+sha256 = "adb7e3ec2521514c8a3d361e2647f0b81b7ecaaf2eba8eaa998ddb52e811354c"
+
+[[vmm_artifacts.files]]
+name = "cloud-hypervisor-b857d4ccd8bc.bin"
+commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
+arch = "aarch64"
+libc = "libc-2.36"
+sha256 = "0588ddf36dbdf419ed1e500548dec6809ec9bb7048b218b9d74db9247b8fc4aa"
+
+[[vmm_artifacts.files]]
+name = "cloud-hypervisor-f65bbba51d6a.bin"
+commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
+arch = "aarch64"
+libc = "libc-2.39"
+sha256 = "3d9121a05b45dc55b2f937ac147bec7d90a5805b0faecd3b7e6c45cad92ce963"
+
+[[vmm_artifacts.files]]
+name = "firecracker-default-22be8e6e2431.bin"
+commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
+arch = "x86_64"
+libc = "libc-2.36"
+sha256 = "fa4138bfdcd89835d666a2309687cfa2486b4f5030e058a9244f8238be990862"
+
+[[vmm_artifacts.files]]
+name = "firecracker-default-56214b50b7a5.bin"
+commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
+arch = "aarch64"
+libc = "libc-2.39"
+sha256 = "b98c7e646b1df3c6b94ff4d19e17d7160a4ec82ed702fac85da4580dc8ba892a"
+
+[[vmm_artifacts.files]]
+name = "firecracker-default-cbb3df61508a.bin"
+commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
+arch = "aarch64"
+libc = "libc-2.36"
+sha256 = "ea144a8afba92f3915a05a6b117c18a5a67b1a70eb10d351f2b5f33857969be9"
+
+[[vmm_artifacts.files]]
+name = "firecracker-default-f8cb4eaa1956.bin"
+commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
+arch = "x86_64"
+libc = "libc-2.39"
+sha256 = "bcbefd56b5c163d22b21b8ca234dc0876d0e83eac4edf59549e7047c4ad867c8"
+
+[[vmm_artifacts.files]]
+name = "firecracker-nested-32142642e8b2.bin"
+commit = "af888e7aec38fe4727fd75878aaed017a3113028"
+arch = "x86_64"
+libc = "libc-2.36"
+sha256 = "814abae267fddad546677ec23731bb71dc73bf0a079a234c178411bc94d05d89"
+
+[[vmm_artifacts.files]]
+name = "firecracker-nested-a419eeec6fe9.bin"
+commit = "af888e7aec38fe4727fd75878aaed017a3113028"
+arch = "x86_64"
+libc = "libc-2.39"
+sha256 = "fa0383038131ab113bc029720cf0580624fed5663fbd3800443d4140d0a549eb"
+
+[[vmm_artifacts.files]]
+name = "firecracker-nested-bfef5f6122d9.bin"
+commit = "8750b52190681dbc6fbf633243e1793b1841290d"
+arch = "aarch64"
+libc = "libc-2.36"
+sha256 = "09c92382893aa1ad240aaf1911a6cec4f64c1fcee5e219f88e2fae3b05bddedc"
+
+[[vmm_artifacts.files]]
+name = "firecracker-nested-ceaab5b7a449.bin"
+commit = "8750b52190681dbc6fbf633243e1793b1841290d"
+arch = "aarch64"
+libc = "libc-2.39"
+sha256 = "b307855f7cbfe8530d17dd6a8e07a725b1da93082fa649b680c14b8ab5d81dd9"
+
 # Rootfs Modification Plan
 #
 # The SHA256 of the generated setup script determines the image name: layer2-{sha}.raw
@@ -373,13 +466,15 @@ remove_dirs = [
 # "# CONFIG_INET_DIAG is not set", which leaves SOCK_DESTROY unavailable and no
 # way to retire a restored clone's snapshot-time sockets. kernel_sha is the
 # verified content hash of build_inputs and lets installed binaries resolve the
-# release artifact without retaining a source checkout. The pin follows the
+# release artifact without retaining a source checkout. kernel_artifact_sha256 is
+# the SHA-256 of the released vmlinux; setup refuses a download with any other. The pin follows the
 # deployable-profile rule above.
 [kernel_profiles.default.arm64]
 description = "Default fcvm guest kernel"
 kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "ca1837829fd0"
+kernel_artifact_sha256 = "28115c483723c3f8a7e3cc86958084cfd121223f6ea7beb09716154d868b8aab"
 build_inputs = [
     "kernel/default-arm64.build.toml",
     "kernel/default.conf",
@@ -397,6 +492,7 @@ description = "Default fcvm guest kernel (x86_64)"
 kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "cb9d7ff723d3"
+kernel_artifact_sha256 = "d3768ed71d18647617bfeec9bcb45b6f6c75835d51a22d3be41e0a23d5dc43df"
 build_inputs = [
     "kernel/default-amd64.build.toml",
     "kernel/default-x86.conf",
@@ -566,7 +662,8 @@ description = "Nested virtualization support for running VMs inside VMs"
 guest_kvm = true
 kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "2889ae84beea"
+kernel_sha = "bb3a9cf0f7cc"
+kernel_artifact_sha256 = "6a0a3e0cbe7623593fbc62c3c51ba82ab72761c91a873b180a86652627201a1f"
 
 # Build configuration - these files determine when kernel needs rebuilding
 # SHA is computed from contents of all files matching these patterns
@@ -625,6 +722,7 @@ guest_kvm = true
 kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "6544a8efc8d3"
+kernel_artifact_sha256 = "91663ff28780213635e539f4dd92f3bfd50b7265fba4c060a291b2ad3b5a2c55"
 
 # Build configuration - these files determine when kernel needs rebuilding
 build_inputs = [
@@ -672,6 +770,7 @@ description = "Kernel with FUSE and btrfs support for efficient container storag
 kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "b1dd099392e5"
+kernel_artifact_sha256 = "464accf3e4d36668921442202fbd58f474349ff9df083aba90a2933966a86385"
 
 # The patches are build inputs: the build applies them, so the tag has to
 # change when one of them does.
@@ -697,6 +796,7 @@ description = "Kernel with FUSE and btrfs support for efficient container storag
 kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "e710148cf2c4"
+kernel_artifact_sha256 = "6ead06a21e9329bed557b15fb4d234ba48bee8f66083c891b59f114be0f04d5c"
 
 # The patches are build inputs: the build applies them, so the tag has to
 # change when one of them does.

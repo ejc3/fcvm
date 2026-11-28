@@ -1,18 +1,41 @@
-From 33634d2b8c69d4b358862eea56b0a4b4764035e6 Mon Sep 17 00:00:00 2001
+From 7801adaf75c250fd4e0c9501b064e9c7bcaeab06 Mon Sep 17 00:00:00 2001
 From: ejc3 <ejc3@users.noreply.github.com>
-Date: Sat, 7 Nov 2026 14:52:16 +0000
-Subject: [PATCH] arm64: let arm64.nv2 raise ID_AA64MMFR4_EL1.NV_frac
+Date: Sat, 28 Nov 2026 01:53:42 +0000
+Subject: [PATCH] arm64: make arm64.nv2 set ID_AA64MMFR4_EL1.NV_frac to
+ NV2_ONLY
 
-The arm64.nv2 boot parameter overrides ID_AA64MMFR4_EL1.NV_frac to 2
-(NV2_ONLY), so an L1 guest kernel sees the NV2 support its host KVM
-emulates. At virtual EL2 the guest's ID register reads bypass TID3 trapping
-and see the hardware value, so without the override L1 KVM reports
-KVM_CAP_ARM_EL2=0 and cannot run L2.
+The arm64.nv2 boot parameter overrides ID_AA64MMFR4_EL1.NV_frac so that an L1
+guest kernel sees the NV2 support its host KVM emulates. At virtual EL2 the
+guest's ID register reads bypass TID3 trapping and see the hardware value, so
+without the override L1 KVM reports KVM_CAP_ARM_EL2=0 and cannot run L2.
+
+The value is 1, NV2_ONLY. The field's encoding (arch/arm64/tools/sysreg) is
+0 NV_NV2, 1 NV2_ONLY, 2 NV2P1, 3 NV3. This alias used to set 2, which told
+every guest that booted with it that the CPU has FEAT_NV2p1
+(ARM64_HAS_NV2P1), on hardware and under a host KVM that have not.
+
+Measured on a c8gd.metal-24xl, host and guest kernels 7.3.3 (fcvm #2249),
+with CNTVCT_EL0 read at EL0 against the timekeeping cycle_last in the vDSO
+data page. With the value 2, L1's boot log shows "FEAT_NV2p1" and in L2,
+which L1's KVM runs at virtual EL2, the counter user space reads is behind
+the one the kernel keeps time with by L1's counter at L2's creation: 9 to
+73 s over 8 runs. The vDSO's difference then wraps through the 56-bit
+clocksource mask and overflows, so vDSO clocks in L2 are up to 2^41 ns
+from the kernel's and jump by multiples of 2^33 ns when NTP moves the
+multiplier. The same happens when the VMM sets no counter offset for L2
+(KVM's default virtual offset is enough). With the value 1, L1 does not
+detect FEAT_NV2p1 and the two agree to 5 to 15 ms in L1, L2 and L3, as on
+the host.
+
+Which FEAT_NV2p1-conditional path in L1's KVM does it has not been traced.
+The ones that differ in 7.3.3: timer_set_traps() writes a guest's counter
+and timer traps to CNTKCTL_EL1 instead of CNTHCTL_EL2; the save of a guest
+hypervisor's CNTHCTL_EL2 takes all of CNTKCTL_EL1; CPACR_EL1 is no longer
+trapped for a guest hypervisor and CPTR_EL2 is saved from it.
 
 Linux 7.3 already carries the id_aa64mmfr4 override register, so this adds
 only the arm64.nv2 alias and makes E2H0 and NV_frac FTR_HIGHER_SAFE, which
 lets an override raise them.
-
 ---
  arch/arm64/kernel/cpufeature.c        | 6 ++++--
  arch/arm64/kernel/pi/idreg-override.c | 1 +
@@ -37,14 +60,14 @@ index 3ae3ad1..7d478a8 100644
  };
  
 diff --git a/arch/arm64/kernel/pi/idreg-override.c b/arch/arm64/kernel/pi/idreg-override.c
-index acaf562..0e852fa 100644
+index acaf562..cf8ecdf 100644
 --- a/arch/arm64/kernel/pi/idreg-override.c
 +++ b/arch/arm64/kernel/pi/idreg-override.c
 @@ -263,6 +263,7 @@ static const struct {
  	{ "arm64.nolva",		"id_aa64mmfr2.varange=0" },
  	{ "arm64.no32bit_el0",		"id_aa64pfr0.el0=1" },
  	{ "arm64.nompam",		"id_aa64pfr0.mpam=0 id_aa64pfr1.mpam_frac=0" },
-+	{ "arm64.nv2",			"id_aa64mmfr4.nv_frac=2" },
++	{ "arm64.nv2",			"id_aa64mmfr4.nv_frac=1" },
  };
  
  static int __init parse_hexdigit(const char *p, u64 *v)

@@ -561,7 +561,7 @@ impl SnapshotManager {
 
         // Create snapshot directory
         let snapshot_dir = self.snapshots_dir.join(&config.name);
-        fs::create_dir_all(&snapshot_dir)
+        crate::paths::ensure_dir_async(&snapshot_dir)
             .await
             .context("creating snapshot directory")?;
 

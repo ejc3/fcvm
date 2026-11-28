@@ -4,6 +4,7 @@ pub mod nvidia;
 pub mod pasta;
 pub mod rootfs;
 pub mod storage;
+pub mod vmm_artifacts;
 
 use anyhow::{bail, Context, Result};
 use nix::fcntl::{Flock, FlockArg, OFlag};

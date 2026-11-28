@@ -72,7 +72,7 @@ pub(crate) fn content_hash(config: &LibseccompConfig) -> String {
 /// The release, how it is configured, the architecture it is compiled for and the
 /// C library whose headers it is compiled against. The download sources are not
 /// part of it: the checksum names the source.
-fn content_hash_for(config: &LibseccompConfig, arch: &str, libc_tag: &str) -> String {
+pub(crate) fn content_hash_for(config: &LibseccompConfig, arch: &str, libc_tag: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"fcvm-libseccomp-v1\0");
     let fields = [
