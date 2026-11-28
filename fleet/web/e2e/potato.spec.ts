@@ -291,8 +291,14 @@ test("potato: hovering a tile shows its readout beside it, and it leaves with th
   await expect(readout).toHaveCount(0);
   await tile.hover();
   await expect(readout).toBeVisible();
-  const label = (await tile.getAttribute("aria-label"))!;
-  await expect(readout.locator(".head")).toHaveText(label.split(". ")[0]!);
+  // The head and the label both carry a live duration ("asleep 312 ms"), so they are read in one
+  // task of the page, where no render can come between the two reads. A label read first and
+  // compared later went stale while the head kept counting (Fleet Web on 774a3257e).
+  const same = await tile.evaluate((el) => {
+    const head = document.querySelector('[data-testid="potato-readout"] .head')?.textContent ?? null;
+    return { head, label: (el.getAttribute("aria-label") ?? "").split(". ")[0] };
+  });
+  expect(same.head, "the readout's head is the first sentence of the tile's label").toBe(same.label);
   await expect(tile).not.toHaveAttribute("title", /.+/);
   // Clear of the tile it describes, and inside the stage.
   const r = (await readout.boundingBox())!;
