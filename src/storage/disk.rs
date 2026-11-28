@@ -546,6 +546,10 @@ pub async fn remove_snapshot_dir(dir: &Path) -> std::io::Result<()> {
         let disk = dir.join(crate::storage::snapshot::SNAPSHOT_DISK_SUBDIR);
         let disk_gone = !is_btrfs_subvolume(&disk) || delete_subvolume(&disk).await;
         if disk_gone && delete_subvolume(dir).await && !dir.exists() {
+            // Dropped now, not with every generation deleted in the next 30 s (#2266).
+            if let Some(parent) = dir.parent() {
+                crate::storage::cleaner::drop_deleted_subvolumes_async(parent).await;
+            }
             return Ok(());
         }
     }

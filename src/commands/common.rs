@@ -2735,6 +2735,13 @@ async fn cleanup_vm_inner(
         "reclaiming the VM's recorded resources",
         crate::reclaim::complete(&vm_id).await,
     );
+    // A snapshot generation deleted while this VM's VMM mapped its memory file is queued for
+    // the btrfs cleaner only now that the VMM has exited: ask for it to be dropped now rather
+    // than with every generation deleted in the next 30 s (#2266). Nothing queued, nothing
+    // asked.
+    if let Some(store) = data_dir.parent() {
+        crate::storage::cleaner::drop_deleted_subvolumes_async(store).await;
+    }
     let disk_us = disk_start.elapsed().as_micros();
 
     info!(

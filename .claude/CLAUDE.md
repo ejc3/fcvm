@@ -3447,6 +3447,17 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   make one) is reflinked as before. An unprivileged user may delete a subvolume only on a filesystem mounted with
   `user_subvol_rm_allowed`; fcvm's own loopback store is mounted with it, and on a btrfs store mounted without it a
   rootless delete falls back to removing the files one by one.
+- **A deleted subvolume is dropped when fcvm deletes it, not at the next 30 s tick** (#2266,
+  `src/storage/cleaner.rs`). The cleaner thread runs when the transaction kthread wakes it, once a commit interval,
+  so every generation a host's snapshot creates deleted in 30 s was dropped in one pass. A dead generation costs the
+  cleaner one data reference drop per extent of its memory file (the diff written into the next generation copied
+  every leaf): 6,008 at the median in `potatobench burst` at 8 wakes and 8 sleeps, about 4 million in 70 trials.
+  The pass held btrfs's metadata reservations at their ceiling for 2 to 4 s, and every restore's `mkdir`, xattr and
+  reflink waited on a reservation ticket behind it, 0.6 to 1.3 s, together. `remove_snapshot_dir` and a VM's teardown
+  (a generation mapped by the VMM is queued only when the VMM exits) count the queued dead subvolumes
+  (`BTRFS_IOC_SUBVOL_SYNC_WAIT`) and, when there are some, ask for a commit (`BTRFS_IOC_START_SYNC`), on whose pass the
+  transaction kthread wakes the cleaner. Remounting the store with `commit=1` (a commit and a cleaner pass every
+  second) measured worse: p50 142 ms and p99 354 ms, against 130 and 172 on the default in the same session.
 - Each write into an in-place diff's memory file costs about the same whatever its length (0.2 to 0.4 ms on a
   file shared with its parent), so the save time follows the number of writes, and a diff of a 128 GiB guest is
   millions of runs of one or two pages. The Firecracker fork therefore writes clean gaps of up to 4 pages with the
