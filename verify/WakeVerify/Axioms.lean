@@ -74,6 +74,10 @@ open Wake
 #guard_msgs in #print axioms design_noLostKick
 /-- info: 'Wake.design_noHang' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in #print axioms design_noHang
+/-- info: 'Wake.design_hasWaker' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms design_hasWaker
+/-- info: 'Wake.design_noMutualSleep' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms design_noMutualSleep
 /-- info: 'Wake.design_noStuckCall' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in #print axioms design_noStuckCall
 /-- info: 'Wake.design_mutualExclusion' depends on axioms: [propext, Quot.sound] -/
@@ -96,6 +100,20 @@ open Wake
 #guard_msgs in #print axioms v733_not_keepsKick
 /-- info: 'Wake.hlt_rechecks' depends on axioms: [propext] -/
 #guard_msgs in #print axioms hlt_rechecks
+/-- info: 'Wake.reachable_inv' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms reachable_inv
+/-- info: 'Wake.unlock_slow_kicks' depends on axioms: [propext] -/
+#guard_msgs in #print axioms unlock_slow_kicks
+/-- info: 'Wake.restore_queues_completion' depends on axioms: [propext] -/
+#guard_msgs in #print axioms restore_queues_completion
+/-- info: 'Wake.v733_entry_clears_kick' depends on axioms: [propext] -/
+#guard_msgs in #print axioms v733_entry_clears_kick
+/-- info: 'Wake.v733Patched_entry_keeps_kick' depends on axioms: [propext] -/
+#guard_msgs in #print axioms v733Patched_entry_keeps_kick
+/-- info: 'Wake.allLabels_complete' depends on axioms: [propext] -/
+#guard_msgs in #print axioms allLabels_complete
+/-- info: 'Wake.replay_reachable' depends on axioms: [propext] -/
+#guard_msgs in #print axioms replay_reachable
 /-- info: 'Wake.design_survives' depends on axioms: [propext] -/
 #guard_msgs in #print axioms design_survives
 /-- info: 'Wake.breaks_pageReady' depends on axioms: [propext] -/

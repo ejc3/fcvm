@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""Build one private host/tile pair through the fixed Fleet AMI broker.
+"""Build one private host/tile pair, or one renders host image, through the fixed Fleet AMI broker.
 
 The CodeBuild project supplies configuration. This program has no EC2 mutation
 client, cannot choose a profile/network/type, and never promotes a template.
+
+Each track is a build of its own (FLEET_AMI_TRACK, `pair` when unset): its own broker
+journal, slots, lease and manifest. The pair is the GPU host and the EC2 tile, which must
+render the same image. `renders` is pages mode's CPU host (fleet/ami/renders, arm64), which
+shares no renderer, slot or manifest field with the pair, so a failure of either track
+publishes nothing of the other and holds nothing of it.
 """
 import concurrent.futures
 import base64
@@ -20,6 +26,12 @@ import time
 
 
 SLOTS = ("host-build", "tile-build", "host-verify", "tile-verify")
+RENDERS_SLOTS = ("renders-build", "renders-verify")
+TRACKS = {"pair": SLOTS, "renders": RENDERS_SLOTS}
+# Proofs the renders validator runs on its cold boot only (pipeline_guest.py RENDERS_PROOFS): the
+# agent check with every case, and the agent unit's own words under its running case. The frame
+# server's viewer acceptance joins them here once it exists.
+RENDERS_COLD_PROOFS = ("renders-agent", "renders-unit")
 ROOT = Path(__file__).resolve().parents[2]
 REMOTE = "/opt/fcvm-image-source"
 GUEST = REMOTE + "/fleet/ami/pipeline_guest.py"
@@ -42,6 +54,22 @@ def viewer_summary(failures):
 def require(value, message):
     if not value:
         raise RuntimeError(message)
+
+
+def failures_summary(items):
+    """A renders validator's failing checks as one line (they are short plain strings already)."""
+    if not isinstance(items, list) or not items:
+        return "no failing check reported"
+    return "; ".join(str(item) for item in items[:40])[:4000]
+
+
+def renders_conf(root):
+    """The renders recipe's renders.conf, read by its own parser (renders/host-check.py)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("renders_host_check", Path(root) / "fleet/ami/renders/host-check.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module, module.read_conf((Path(root) / "fleet/ami/renders/renders.conf").read_text())
 
 
 # The CodeBuild lease and the broker's deadline (ejc3/aws DEADLINE_SECONDS and
@@ -115,6 +143,9 @@ class Pipeline:
         self.broker, self.worker, self.config, self.root = broker, worker, config, Path(root)
         self.clock, self.sleep = clock, sleep
         self.build_id = config["build_id"]
+        self.track = config.get("track", "pair")
+        require(self.track in TRACKS, "unknown image track")
+        self.slots = TRACKS[self.track]
         self.prefix = "runs/" + hashlib.sha256(self.build_id.encode()).hexdigest() + "/"
         self.deadline = 0
         self.instances = {}
@@ -138,7 +169,7 @@ class Pipeline:
     def call(self, action, slot=None, command_id=None):
         require(action in {"launch", "status", "reboot", "stop", "start", "seal", "cleanup", "credentials", "command_status"},
                 "unsupported broker action")
-        require(slot is None or slot in SLOTS, "unsupported broker slot")
+        require(slot is None or slot in self.slots, "unsupported broker slot")
         request = {"action": action, "build_id": self.build_id, "capability": self.config["capability"]}
         if slot:
             request["slot"] = slot
@@ -242,13 +273,17 @@ class Pipeline:
         ]))
         if not slot.endswith("-build"):
             return
-        env = {
+        kind = slot.split("-")[0]
+        # The renders host fetches no certificate at build: only the pair's builders get one.
+        env = {"FCVM_COMMIT": self.config["source_commit"]} if kind == "renders" else {
             "FCVM_COMMIT": self.config["source_commit"],
             "FLEET_TLS_SECRET": self.config["tls_build_arn"],
             "FLEET_SECRET_REGION": self.config["secret_region"],
-            "STORE_S3_REGION": self.config["final_store_region"], "STORE_S3_BUCKET": self.config["final_store_bucket"],
-            "STORE_S3_PREFIX": "factory/" + self.input_sha + "/store/",
         }
+        env.update({
+            "STORE_S3_REGION": self.config["final_store_region"], "STORE_S3_BUCKET": self.config["final_store_bucket"],
+            "STORE_S3_PREFIX": self.store_prefix(kind),
+        })
         lines = "\n".join("export " + name + "=" + shlex.quote(value) for name, value in env.items()) + "\n"
         self.shell(slot, "install -d -m 0700 /var/lib/fleet-ami\ncat > /var/lib/fleet-ami/env <<'FLEET_BUILD_ENV'\n"
             + lines + "FLEET_BUILD_ENV\n")
@@ -343,6 +378,16 @@ class Pipeline:
             # The tile build's image phase needs only this export: it goes on beside the bake.
             renderer_ready.set_result(renderer)
         self.phase(slot, "host", "bake")
+        self.export_store(slot, "host")
+        self.guest(slot, "seal", "host")
+        image = self.seal(slot)
+        return renderer, image
+
+    def store_prefix(self, kind):
+        """Where the published store's parts are, which the image's store.env names."""
+        return "factory/" + self.input_sha + ("/renders/store/" if kind == "renders" else "/store/")
+
+    def export_store(self, slot, kind):
         exported = self.guest(slot, "export-store", self.config["bucket"], self.builder_prefixes[slot], self.config["asset_region"])
         expected = {f"part-{index:02d}.tar.zst" for index in range(16)} | {"dirs.tar.zst", "parts", "sha256.json"}
         require(set(exported.get("objects", {})) == expected, "factory store export is incomplete")
@@ -350,10 +395,92 @@ class Pipeline:
         self.store = {"bucket": self.config["bucket"], "region": self.config["asset_region"],
             "prefix": self.prefix + "store/", "objects": objects,
             "destination": {"bucket": self.config["final_store_bucket"], "region": self.config["final_store_region"],
-                "prefix": "factory/" + self.input_sha + "/store/"}}
-        self.guest(slot, "seal", "host")
-        image = self.seal(slot)
-        return renderer, image
+                "prefix": self.store_prefix(kind)}}
+
+    def build_renders(self):
+        """Pages mode's host image (fleet/ami/renders/build.sh), on its own builder."""
+        slot = "renders-build"
+        self.launch(slot)
+        self.security_update(slot)
+        self.phase(slot, "renders", "prep")
+        # into fcvm's host kernel, with the reference's boot line and the 2 MiB pool reserved
+        self.reboot(slot)
+        self.phase(slot, "renders", "build")
+        self.phase(slot, "renders", "bake")
+        record = self.guest(slot, "renders-record")
+        module, conf = renders_conf(self.root)
+        require(isinstance(record, dict) and set(record) == set(module.RECORD_FIELDS)
+                and record["fcvm_commit"] == self.config["source_commit"]
+                and isinstance(record["kitesurf_commit"], str) and re.fullmatch(r"[0-9a-f]{40}", record["kitesurf_commit"])
+                and isinstance(record["bundle_sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", record["bundle_sha256"])
+                and isinstance(record["kernel_release"], str) and module.RELEASE.fullmatch(record["kernel_release"])
+                and record["boot_params"] == conf["RENDERS_BOOT_PARAMS"]
+                and record["hugepages"] == int(conf["RENDERS_HUGEPAGES"]),
+                "the renders build record does not name this build's commit, an fcvm kernel and the reference boot line")
+        self.export_store(slot, "renders")
+        self.guest(slot, "seal", "renders")
+        return record, self.seal(slot)
+
+    def verify_renders(self, record):
+        """Three boots of the candidate (cold, reboot, stop/start), each the flavor's own check on
+        the kernel its build installed; the agent check on the cold boot."""
+        slot = "renders-verify"
+        self.launch(slot)
+        boots = []
+        for transition in (None, "reboot", "resume"):
+            if transition:
+                self.reboot(slot, stop_start=transition == "resume")
+            cold = transition is None
+            result = self.guest(slot, "verify-renders", *(RENDERS_COLD_PROOFS if cold else ()))
+            require(result.get("guard") is True and result.get("sanitized") is True,
+                    "candidate failed the boot or security proof")
+            require(result.get("launch_path") is True,
+                    "candidate failed the launch-path proof (NIC before cloud-init, EC2 datasource, user data ran)")
+            require(result.get("kernel_release") == record["kernel_release"],
+                    "candidate booted another kernel than the one its build installed")
+            # Each verdict is the guest's own, with the number of failures behind it; a pass
+            # without its count is not a pass.
+            for key, label, what, asked in (("renders_host", "problem", "the renders host check", True),
+                                            ("renders_agent", "failure", "the agent check", cold),
+                                            ("renders_unit", "failure", "the agent unit's own words", cold)):
+                if not asked:
+                    continue
+                count = result.get(key + "_" + label + "_count")
+                require(result.get(key) is True and count == 0,
+                        f"candidate failed {what} ({count if type(count) is int else 'no count of'} {label}s): "
+                        + failures_summary(result.get(key + "_" + label + "s")))
+            require(re.fullmatch(r"[0-9a-f-]{36}", result.get("boot_id", "")), "candidate has no boot identity")
+            boots.append(result["boot_id"])
+        require(len(set(boots)) == 3, "cold boot, reboot and stop/start did not produce three boots")
+        result["boot_ids"] = boots
+        # The record is the last boot's result; the agent check and the unit passed on the cold boot.
+        result["renders_agent"] = result["renders_unit"] = True
+        del result["boot_id"]
+        return result
+
+    def run_renders(self):
+        record, image = self.build_renders()
+        self.cleanup()
+        try:
+            validation = self.verify_renders(record)
+        except BaseException:
+            self.cancelled.set()
+            self.cleanup()
+            raise
+        status = self.call("status")
+        require(status.get("candidates") == {"renders": image["image_id"]}, "broker candidate changed")
+        guard = hashlib.sha256((self.root / "fleet/ami/common/cve-2026-98432-mitigation.py").read_bytes()).hexdigest()
+        manifest = {"version": 1, "track": "renders", "build_id": self.build_id,
+            "source_commit": self.config["source_commit"], "input_sha256": self.input_sha,
+            "source_tree_sha256": self.source_tree_sha,
+            "guard_sha256": guard, "deadline_unix": self.deadline, "store": self.store,
+            "images": {"renders": {"image_id": image["image_id"], "architecture": "arm64",
+                "build": record, "validation": validation}}}
+        self.remaining()
+        self.worker.client("s3", self.config["asset_region"]).put_object(Bucket=self.config["bucket"],
+            Key=self.prefix + "manifest.json", Body=canonical(manifest), ContentType="application/json", IfNoneMatch="*")
+        self.cleanup(wait=False)
+        return manifest
 
     def build_pair(self):
         """The host and tile builds side by side. The tile's launch, prep and reboot need nothing
@@ -501,7 +628,7 @@ class Pipeline:
             return
         def gone():
             values = self.call("status").get("slots", {})
-            require(set(values) <= set(SLOTS), "broker returned unknown slots")
+            require(set(values) <= set(self.slots), "broker returned unknown slots")
             require(set(self.instances) <= set(values), "broker lost a paid slot during cleanup")
             require(all(values[slot].get("instance_id") == instance for slot, instance in self.instances.items()),
                     "broker slot ownership changed during cleanup")
@@ -581,6 +708,8 @@ class Pipeline:
             self.source_tree_sha, self.archive = input_digest(self.root, self.config["source_commit"])
             self.worker.client("s3", self.config["asset_region"]).put_object(Bucket=self.config["bucket"], Key=self.prefix + "source.tar",
                 Body=self.archive, ContentType="application/x-tar", IfNoneMatch="*")
+            if self.track == "renders":
+                return self.run_renders()
             self.initialize_tls()
             renderer, host, tile = self.build_pair()
             require(host.get("image_id") != tile.get("image_id"), "host and tile images are not distinct")
@@ -636,13 +765,15 @@ def main():
     names["capability"] = "FLEET_AMI_CAPABILITY"
     config = {key: os.environ[name] for key, name in names.items()}
     config["document"] = "fcvm-fleet-ami-build"
+    config["track"] = os.environ.get("FLEET_AMI_TRACK", "pair")
     require(config["tls_build_arn"] != config["tls_test_arn"], "build and validation TLS identities must differ")
     base = boto3.Session()
     broker = base.client("lambda", config=Config(retries={"total_max_attempts": 1}, connect_timeout=10, read_timeout=60))
     driver = Pipeline(broker, None, config)
     driver.worker = Worker(driver.call, config["region"], config["build_id"])
     driver.run()
-    print("Fleet image pair built, independently boot-validated and cleaned up; awaiting controlled promotion.")
+    print(("Fleet renders host image" if config["track"] == "renders" else "Fleet image pair")
+          + " built, independently boot-validated and cleaned up; awaiting controlled promotion.")
 
 
 if __name__ == "__main__":

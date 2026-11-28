@@ -265,6 +265,18 @@ pub async fn sweep_fork_snapshots(dir: &Path) {
     }
 }
 
+/// How long a server's `snapshot create` waits for that server's own restore to be recorded
+/// as acknowledged (`--await-restore`). A server is up when its bots have a chunk, which its
+/// guest can serve a few milliseconds before `snapshot run` has the acknowledgement, and a
+/// fork asked for in between is refused without the wait.
+const RESTORE_ACKNOWLEDGEMENT_WAIT_SECS: u64 = 10;
+
+/// Why a server that asked for a copy of `slot` restores the gold snapshot when `slot` has
+/// no running server on this host.
+fn source_not_running(slot: &str) -> String {
+    format!("{slot} does not run on this host")
+}
+
 /// `fcvm snapshot create` of a running server; `stop` for the gold VM only.
 pub fn snapshot_argv(pid: u32, tag: &str, stop: bool) -> Vec<String> {
     let mut a = s(&[
@@ -274,6 +286,8 @@ pub fn snapshot_argv(pid: u32, tag: &str, stop: bool) -> Vec<String> {
         &pid.to_string(),
         "--tag",
         tag,
+        "--await-restore",
+        &RESTORE_ACKNOWLEDGEMENT_WAIT_SECS.to_string(),
     ]);
     if stop {
         a.push("--stop".into());
@@ -1059,15 +1073,24 @@ impl Server {
     /// Stop what runs and start `want`: a fork of another server when it asks for one and that
     /// server runs, else the gold snapshot.
     /// Stop what runs and start `want`: a copy of another server when it asks for a fork,
-    /// `fork_ok` holds (no copy of this generation failed yet) and that server runs here, else
-    /// the gold snapshot.
+    /// no copy of this generation failed yet and that server runs here, else the gold
+    /// snapshot.
+    ///
+    /// `no_copy` is why this generation gets no copy any more, when an earlier attempt
+    /// settled that (the copy failed, or its source did not run here): the server then
+    /// restores from the gold snapshot. Every gold restore that stands in for a copy says
+    /// so in its reports, with the reason, so a tile that shows the gold world where a copy
+    /// was asked for says why in its state. `copying` is set when this attempt is a copy,
+    /// so the caller can tell a failed copy from a failed gold restore.
     async fn relaunch(
         &self,
         live: &mut Option<Live>,
         gold: &str,
         want: &Desired,
-        fork_ok: bool,
+        no_copy: Option<&str>,
+        copying: &mut bool,
     ) -> std::result::Result<Live, String> {
+        let fork_ok = no_copy.is_none();
         let generation = want.generation;
         let t0 = Instant::now();
         let mut timings = BTreeMap::new();
@@ -1083,6 +1106,18 @@ impl Server {
                     .copied()
                     .map(|(pid, place)| (f.clone(), pid, place))
             });
+        *copying = source.is_some();
+        // What the reports of a gold restore that stands in for a copy carry.
+        let instead_of_copy = match &want.fork {
+            Some(f) if source.is_none() && f.index != self.index => Some(format!(
+                "restored from the gold snapshot, not copied from {}: {}",
+                f.slot,
+                no_copy
+                    .map(str::to_string)
+                    .unwrap_or_else(|| source_not_running(&f.slot))
+            )),
+            _ => None,
+        };
         // Dropped on every way out of this function: the copy's snapshot is removed.
         let mut fork_snapshot = None;
         let tag = match source {
@@ -1114,7 +1149,14 @@ impl Server {
                 if want.fork.is_some() {
                     tracing::warn!(target: "fcvm::fleet::minecraft", server = %self.id, fork_ok, "no copy of the fork's source this time; restoring from the gold snapshot");
                 }
-                self.report("restoring", generation, BTreeMap::new(), None, None, None);
+                self.report(
+                    "restoring",
+                    generation,
+                    BTreeMap::new(),
+                    instead_of_copy.clone(),
+                    None,
+                    None,
+                );
                 gold.to_string()
             }
         };
@@ -1195,7 +1237,7 @@ impl Server {
             "running",
             generation,
             timings,
-            None,
+            instead_of_copy,
             None,
             Some(first_chunk_at),
         );
@@ -1233,7 +1275,8 @@ async fn supervise(
     ctx.board.lock().unwrap().remove(&ctx.index);
     let mut live: Option<Live> = None;
     // The generation whose fork failed once: its next attempt restores the gold snapshot.
-    let mut fork_failed: Option<u64> = None;
+    // With why it gets no copy.
+    let mut fork_failed: Option<(u64, String)> = None;
     let mut backoff = ctx.agent.backoff_min;
     let mut retry_after: Option<Duration> = None;
     let mut health_tick = tokio::time::interval(ctx.agent.health_interval);
@@ -1272,8 +1315,14 @@ async fn supervise(
                 }
             }
             let want = desired.borrow_and_update().clone();
+            let no_copy = fork_failed
+                .as_ref()
+                .filter(|(generation, _)| *generation == want.generation)
+                .map(|(_, why)| why.as_str());
+            let settled_before = no_copy.is_some();
+            let mut copying = false;
             let r = tokio::select! {
-                r = ctx.relaunch(&mut live, &tag, &want, fork_failed != Some(want.generation)) => Some(r),
+                r = ctx.relaunch(&mut live, &tag, &want, no_copy, &mut copying) => Some(r),
                 _ = removed(&mut desired) => None,
             };
             match r {
@@ -1281,8 +1330,16 @@ async fn supervise(
                 Some(Ok(l)) => live = Some(l),
                 Some(Err(e)) => {
                     tracing::warn!(target: "fcvm::fleet::minecraft", server = %ctx.id, generation = want.generation, error = %e, "relaunch failed");
-                    if want.fork.is_some() {
-                        fork_failed = Some(want.generation);
+                    // One failed attempt settles that this generation gets no copy. The
+                    // reason kept is why there is no copy: the copy's own failure, or that
+                    // its source did not run here. A gold restore's failure is neither.
+                    if let (Some(f), false) = (&want.fork, settled_before) {
+                        let why = if copying {
+                            e.clone()
+                        } else {
+                            source_not_running(&f.slot)
+                        };
+                        fork_failed = Some((want.generation, why));
                     }
                     let delay = backoff;
                     backoff = (backoff * 2).min(ctx.agent.backoff_max);
@@ -1672,9 +1729,13 @@ mod tests {
             Some("--stop")
         );
         // A fork's snapshot never stops the source it copies.
-        assert!(!snapshot_argv(42, "mc-fork-mc-2-5", false)
-            .iter()
-            .any(|a| a == "--stop"));
+        let fork = snapshot_argv(42, "mc-fork-mc-2-5", false);
+        assert!(!fork.iter().any(|a| a == "--stop"));
+        // It waits for a source whose own restore fcvm has not recorded as acknowledged yet.
+        assert!(
+            fork.windows(2).any(|w| w == ["--await-restore", "10"]),
+            "{fork:?}"
+        );
     }
 
     /// The guest ports a `--publish` list names.

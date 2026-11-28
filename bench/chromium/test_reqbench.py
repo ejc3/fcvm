@@ -15,6 +15,7 @@ import argparse
 import ctypes
 import fcntl
 import hashlib
+import inspect
 import io
 import json
 import math
@@ -45,6 +46,7 @@ import campaign_summary  # noqa: E402
 import records  # noqa: E402
 import reqanalyze  # noqa: E402
 import reqbench  # noqa: E402
+import state_fixture  # noqa: E402
 from unittest import mock as _subreaper_mock  # noqa: E402
 
 # main() makes the harness the subreaper of its descendants' orphans. The test
@@ -353,7 +355,7 @@ cleanup() {{
     exit 0
 }}
 trap cleanup TERM INT
-mkdir -p {quoted_data}
+mkdir -p {quoted_data} "$(dirname {quoted_state})"
 read -r proc_stat < /proc/$$/stat
 proc_stat=${{proc_stat##*) }}
 read -ra proc_fields <<< "$proc_stat"
@@ -436,11 +438,10 @@ class CloneSpawnSignalMask(unittest.TestCase):
         import socket
 
         with tempfile.TemporaryDirectory() as d:
-            state_dir = os.path.join(d, "state")
-            os.makedirs(state_dir)
+            state_dir = state_fixture.make_store(os.path.join(d, "state"))
             vm_id = "vm-22222222222222222222222222222222"
-            state_path = os.path.join(state_dir, f"{vm_id}.json")
-            data_dir = os.path.join(d, "vm-disks", vm_id)
+            state_path = reqbench.vm_state_path(state_dir, vm_id)
+            data_dir = reqbench.vm_runtime_dir(d, vm_id)
             term_path = os.path.join(d, "term-received")
             stub = os.path.join(d, "fcvm-stub")
             write_graceful_clone_stub(
@@ -500,7 +501,7 @@ class TeardownFastReapGuard(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             vm_id = "vm-11111111111111111111111111111111"
             state = os.path.join(d, f"{vm_id}.json")
-            data = os.path.join(d, "vm-disks", vm_id)
+            data = reqbench.vm_runtime_dir(d, vm_id)
             with open(state, "w") as f:
                 json.dump({"vm_id": vm_id}, f)
             os.makedirs(data)
@@ -530,10 +531,10 @@ class TeardownFastReapGuard(unittest.TestCase):
     def test_survivor_blocks_the_reap_and_raises(self):
         with tempfile.TemporaryDirectory() as d:
             state = os.path.join(d, "vm-11111111111111111111111111111111.json")
-            # Shaped exactly as production builds it — `<data_root>/vm-disks/<vm_id>`
+            # Shaped exactly as production builds it — `<data_root>/vm-disks/<bucket>/<vm_id>`
             # — because `reap_disk` now refuses anything that is not strictly below
             # a `vm-disks` root (see ReapDiskPathGuard).
-            data = os.path.join(d, "vm-disks", "vm-11111111111111111111111111111111")
+            data = reqbench.vm_runtime_dir(d, "vm-11111111111111111111111111111111")
             with open(state, "w") as f:
                 json.dump({"vm_id": "vm-11111111111111111111111111111111", "pid": 1}, f)
             os.makedirs(os.path.join(data, "disks"))
@@ -576,7 +577,7 @@ class TeardownFastReapGuard(unittest.TestCase):
         """The guard must not disarm the reap on the normal path."""
         with tempfile.TemporaryDirectory() as d:
             state = os.path.join(d, "vm-11111111111111111111111111111111.json")
-            data = os.path.join(d, "vm-disks", "vm-11111111111111111111111111111111")
+            data = reqbench.vm_runtime_dir(d, "vm-11111111111111111111111111111111")
             with open(state, "w") as f:
                 json.dump({"vm_id": "vm-11111111111111111111111111111111"}, f)
             with open(state + ".lock", "w") as f:
@@ -605,7 +606,7 @@ class TeardownFastReapGuard(unittest.TestCase):
                 "while time.process_time() - t < 0.3: pass\n")
         with tempfile.TemporaryDirectory() as d:
             state = os.path.join(d, "vm-11111111111111111111111111111111.json")
-            data = os.path.join(d, "vm-disks", "vm-11111111111111111111111111111111")
+            data = reqbench.vm_runtime_dir(d, "vm-11111111111111111111111111111111")
             with open(state, "w") as f:
                 json.dump({"vm_id": "vm-11111111111111111111111111111111"}, f)
             with open(state + ".lock", "w") as f:
@@ -642,7 +643,7 @@ class TeardownFastReapGuard(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as d:
             state = os.path.join(d, "vm-11111111111111111111111111111111.json")
-            data = os.path.join(d, "vm-disks", "vm-11111111111111111111111111111111")
+            data = reqbench.vm_runtime_dir(d, "vm-11111111111111111111111111111111")
             with open(state, "w") as f:
                 json.dump({"vm_id": "vm-11111111111111111111111111111111"}, f)
             with open(state + ".lock", "w") as f:
@@ -674,8 +675,8 @@ class ReapDiskPathGuard(unittest.TestCase):
     """`reap_disk` must refuse a data_dir that is not strictly below vm-disks.
 
     RED BEFORE THE FIX: every call site computes
-    `os.path.join(data_root, "vm-disks", state.get("vm_id", ""))`, and an empty
-    vm_id makes that `<data_root>/vm-disks/` — a directory `os.path.isdir` accepts,
+    `vm_runtime_dir(data_root, state.get("vm_id", ""))`, and an empty
+    vm_id makes that `<data_root>/vm-disks/<bucket>/` — a directory `os.path.isdir` accepts,
     which `shutil.rmtree` then empties. That is EVERY VM's disks on the box. Commit
     e1286e3f called this arithmetic catastrophic and guarded only the Rust fixture
     (`an_empty_vm_id_resolves_to_the_shared_disk_root_and_must_be_rejected`); the
@@ -688,17 +689,40 @@ class ReapDiskPathGuard(unittest.TestCase):
             disks = os.path.join(root, "vm-disks")
             vm_a = "vm-44444444444444444444444444444444"
             vm_b = "vm-55555555555555555555555555555555"
-            os.makedirs(os.path.join(disks, vm_a))
-            os.makedirs(os.path.join(disks, vm_b))
-            out: dict = {}
-            reaped = reqbench.reap_disk(out, root, "", os.path.join(disks, ""))
-            self.assertTrue(os.path.isdir(os.path.join(disks, vm_a)),
-                            "another VM's disks were deleted")
-            self.assertTrue(os.path.isdir(os.path.join(disks, vm_b)),
-                            "another VM's disks were deleted")
-            self.assertEqual(reaped, [])
-            self.assertTrue(any("vm-disks" in e for e in out.get("disk_errors", [])),
-                            f"the refusal must be recorded: {out}")
+            os.makedirs(reqbench.vm_runtime_dir(root, vm_a))
+            os.makedirs(reqbench.vm_runtime_dir(root, vm_b))
+            # A VM that shares the empty id's bucket.
+            bucket = os.path.join(disks, reqbench.vm_disks_bucket(""))
+            sibling = os.path.join(bucket, "vm-77777777777777777777777777777777")
+            os.makedirs(sibling)
+            for target in (reqbench.vm_runtime_dir(root, ""), os.path.join(disks, "")):
+                out: dict = {}
+                reaped = reqbench.reap_disk(out, root, "", target)
+                self.assertTrue(os.path.isdir(reqbench.vm_runtime_dir(root, vm_a)),
+                                "another VM's disks were deleted")
+                self.assertTrue(os.path.isdir(reqbench.vm_runtime_dir(root, vm_b)),
+                                "another VM's disks were deleted")
+                self.assertTrue(os.path.isdir(sibling), "a bucket was emptied")
+                self.assertEqual(reaped, [])
+                self.assertTrue(any("vm-disks" in e for e in out.get("disk_errors", [])),
+                                f"the refusal must be recorded: {out}")
+
+    def test_a_flat_or_wrong_bucket_path_is_refused(self):
+        """Only `vm-disks/<the id's own bucket>/<vm_id>` is a VM's directory: the layout
+        before buckets (`vm-disks/<vm_id>`) and another VM's bucket are refused."""
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-88888888888888888888888888888888"
+            state = os.path.join(root, f"{vm_id}.json")
+            own = reqbench.vm_runtime_dir(root, vm_id)
+            wrong = os.path.join(
+                root, "vm-disks",
+                "%02x" % ((int(reqbench.vm_disks_bucket(vm_id), 16) + 1) % 256), vm_id)
+            flat = os.path.join(root, "vm-disks", vm_id)
+            for bad in (flat, wrong):
+                os.makedirs(bad)
+                self.assertEqual(reqbench.safe_vm_data_dir(root, state, bad), "", bad)
+            os.makedirs(own)
+            self.assertEqual(reqbench.safe_vm_data_dir(root, state, own), os.path.realpath(own))
 
     def test_a_lock_already_removed_by_someone_else_is_not_an_error(self):
         """Under concurrent clones another fcvm's stale-state cleanup can delete
@@ -744,7 +768,7 @@ class ReapDiskPathGuard(unittest.TestCase):
                 json.dump({"vm_id": vm_id}, f)
             with open(f"{state}.lock", "w"):
                 pass
-            vm_dir = os.path.join(root, "vm-disks", vm_id)
+            vm_dir = reqbench.vm_runtime_dir(root, vm_id)
             os.makedirs(os.path.join(vm_dir, "disks"))
             for name in ("disks/rootfs.raw", "container-ready", "vsock.sock"):
                 with open(os.path.join(vm_dir, name), "w"):
@@ -771,7 +795,7 @@ class ReapDiskPathGuard(unittest.TestCase):
             json.dump({"vm_id": vm_id, "pid": 4242, "pid_start_time": 99}, f)
         with open(f"{state}.lock", "w"):
             pass
-        vm_dir = os.path.join(root, "vm-disks", vm_id)
+        vm_dir = reqbench.vm_runtime_dir(root, vm_id)
         os.makedirs(os.path.join(vm_dir, "disks"))
         return state, vm_dir
 
@@ -860,7 +884,7 @@ class ReapDiskPathGuard(unittest.TestCase):
             vm_id = "vm-dddddddddddddddddddddddddddddddd"
             state = os.path.join(root, f"{vm_id}.json")
             lock = f"{state}.lock"
-            vm_dir = os.path.join(root, "vm-disks", vm_id)
+            vm_dir = reqbench.vm_runtime_dir(root, vm_id)
             # An fcvm stand-in whose one child dies with it (pdeathsig), so the
             # kill is complete and the reap runs.
             ready = os.path.join(root, "child-ready")
@@ -1025,7 +1049,7 @@ class ReapDiskPathGuard(unittest.TestCase):
             try:
                 with mock.patch.object(reqbench.fcntl, "flock", self._waiting_signal(waiting)):
                     out = reqbench.teardown_normal(
-                        p, p.pid, 5.0, d, state, os.path.join(d, "vm-disks", vm_id),
+                        p, p.pid, 5.0, d, state, reqbench.vm_runtime_dir(d, vm_id),
                         verify_disk_cleanup=True)
             finally:
                 waiting.set()
@@ -1052,7 +1076,7 @@ class ReapDiskPathGuard(unittest.TestCase):
             state = os.path.join(root, f"{vm_id}.json")
             with open(state, "w") as f:
                 json.dump({"vm_id": vm_id}, f)
-            vm_dir = os.path.join(root, "vm-disks", vm_id)
+            vm_dir = reqbench.vm_runtime_dir(root, vm_id)
             os.makedirs(vm_dir)
             with open(os.path.join(vm_dir, "f"), "w"):
                 pass
@@ -1074,17 +1098,17 @@ class ReapDiskPathGuard(unittest.TestCase):
             state = os.path.join(root, f"{vm_id}.json")
             with open(state, "w") as f:
                 json.dump({"vm_id": vm_id}, f)
-            dd = os.path.join(root, "vm-disks", vm_id, "disks")
+            dd = os.path.join(reqbench.vm_runtime_dir(root, vm_id), "disks")
             os.makedirs(dd)
             out: dict = {}
             reaped = reqbench.reap_disk(
-                out, root, state, os.path.join(root, "vm-disks", vm_id)
+                out, root, state, reqbench.vm_runtime_dir(root, vm_id)
             )
             self.assertEqual(
                 reaped,
-                [os.path.join(root, "vm-disks", vm_id), state],
+                [reqbench.vm_runtime_dir(root, vm_id), state],
             )
-            self.assertFalse(os.path.isdir(os.path.join(root, "vm-disks", vm_id)))
+            self.assertFalse(os.path.isdir(reqbench.vm_runtime_dir(root, vm_id)))
             self.assertNotIn("disk_errors", out)
 
 
@@ -1103,7 +1127,7 @@ class ReapExcludesReclaim(unittest.TestCase):
         os.makedirs(os.path.dirname(state))
         with open(state, "w") as f:
             json.dump({"vm_id": self.VM_ID}, f)
-        vm_dir = os.path.join(root, "vm-disks", self.VM_ID)
+        vm_dir = reqbench.vm_runtime_dir(root, self.VM_ID)
         os.makedirs(os.path.join(vm_dir, "disks"))
         for name in ("disks/rootfs.raw", "firecracker.sock", "pasta.pid"):
             with open(os.path.join(vm_dir, name), "w") as f:
@@ -1309,7 +1333,7 @@ class TeardownNormalLeakVerdict(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             vm_id = "vm-11111111111111111111111111111111"
             state = os.path.join(d, "state", f"{vm_id}.json")
-            data = os.path.join(d, "vm-disks", vm_id)
+            data = reqbench.vm_runtime_dir(d, vm_id)
             os.makedirs(os.path.dirname(state))
             os.makedirs(data)
             with open(state, "w") as f:
@@ -1351,7 +1375,7 @@ class TeardownAttributionFailure(unittest.TestCase):
     def _artifacts(self, root):
         vm_id = "vm-11111111111111111111111111111111"
         state = os.path.join(root, f"{vm_id}.json")
-        data = os.path.join(root, "vm-disks", vm_id)
+        data = reqbench.vm_runtime_dir(root, vm_id)
         with open(state, "w") as f:
             json.dump({"vm_id": vm_id}, f)
         os.makedirs(data)
@@ -1425,8 +1449,9 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
         import cdpdrive
 
         with tempfile.TemporaryDirectory() as d:
-            state_dir = os.path.join(d, "state")
-            os.makedirs(state_dir)
+            state_dir = state_fixture.make_store(os.path.join(d, "state"))
+            fast_state = reqbench.vm_state_path(state_dir, "vm-22222222222222222222222222222222")
+            os.makedirs(os.path.dirname(fast_state))
             stub = os.path.join(d, "fcvm-stub")
             child_ready = os.path.join(d, "child-ready")
             with open(stub, "w") as f:
@@ -1436,11 +1461,11 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
                     f"while [ ! -e {child_ready} ]; do sleep 0.01; done\n"
                     "read -r proc_stat < /proc/$$/stat; proc_stat=${proc_stat##*) }; "
                     "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
-                    f"cat > {state_dir}/vm-22222222222222222222222222222222.json <<EOF\n"
+                    f"cat > {fast_state} <<EOF\n"
                     '{"vm_id": "vm-22222222222222222222222222222222", "name": "rb-test-run-0-fast", "pid": $$, '
                     '"pid_start_time": $start, "lifecycle_ready": true, "config": {"network": {"loopback_ip": "127.0.0.1"}}}\n'
                     "EOF\n"
-                    f": > {state_dir}/vm-22222222222222222222222222222222.json.lock\n"
+                    f": > {fast_state}.lock\n"
                     "wait\n"
                 )
             os.chmod(stub, 0o755)
@@ -1483,11 +1508,11 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
         import socket
 
         with tempfile.TemporaryDirectory() as d:
-            state_dir = os.path.join(d, "state")
+            state_dir = state_fixture.make_store(os.path.join(d, "state"))
             vm_id = "vm-22222222222222222222222222222222"
-            data_dir = os.path.join(d, "vm-disks", vm_id)
-            state_path = os.path.join(state_dir, f"{vm_id}.json")
-            os.makedirs(state_dir)
+            data_dir = reqbench.vm_runtime_dir(d, vm_id)
+            state_path = reqbench.vm_state_path(state_dir, vm_id)
+            os.makedirs(os.path.dirname(state_path))
             os.makedirs(data_dir)
             child_ready = os.path.join(d, "child-ready")
             owner_wait_entered = os.path.join(d, "owner-wait-entered")
@@ -1610,11 +1635,11 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
         import socket
 
         with tempfile.TemporaryDirectory() as d:
-            state_dir = os.path.join(d, "state")
+            state_dir = state_fixture.make_store(os.path.join(d, "state"))
             vm_id = "vm-33333333333333333333333333333333"
-            state_path = os.path.join(state_dir, f"{vm_id}.json")
-            os.makedirs(state_dir)
-            os.makedirs(os.path.join(d, "vm-disks", vm_id))
+            state_path = reqbench.vm_state_path(state_dir, vm_id)
+            os.makedirs(os.path.dirname(state_path))
+            os.makedirs(reqbench.vm_runtime_dir(d, vm_id))
             child_ready = os.path.join(d, "child-ready")
             guard_ran = os.path.join(d, "guard-ran")
             stub = os.path.join(d, "fcvm-stub")
@@ -1761,9 +1786,10 @@ class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as d:
-            state_dir = os.path.join(d, "state")
-            disks = os.path.join(d, "vm-disks", "vm-22222222222222222222222222222222")
-            os.makedirs(state_dir)
+            state_dir = state_fixture.make_store(os.path.join(d, "state"))
+            exec_state = reqbench.vm_state_path(state_dir, "vm-22222222222222222222222222222222")
+            os.makedirs(os.path.dirname(exec_state))
+            disks = reqbench.vm_runtime_dir(d, "vm-22222222222222222222222222222222")
             os.makedirs(disks)
             marker = os.path.join(disks, "rootfs.raw")
             with open(marker, "w") as f:
@@ -1785,8 +1811,8 @@ class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
                     "printf '{\"vm_id\": \"vm-22222222222222222222222222222222\", "
                     "\"name\": \"rb-test-run-0-exec\", \"pid\": %s, "
                     "\"pid_start_time\": %s, \"lifecycle_ready\": true}\\n' "
-                    f'"$$" "$start" > {state_dir}/vm-22222222222222222222222222222222.json\n'
-                    f": > {state_dir}/vm-22222222222222222222222222222222.json.lock\n"
+                    f'"$$" "$start" > {exec_state}\n'
+                    f": > {exec_state}.lock\n"
                     "wait\n"
                 )
             os.chmod(stub, 0o755)
@@ -1812,7 +1838,7 @@ class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
                 self.assertIs(rec.get("disk_reap_skipped"), True)
                 self.assertTrue(os.path.exists(marker),
                                 "rootfs of a live child must NOT be reaped")
-                self.assertTrue(os.path.exists(os.path.join(state_dir, "vm-22222222222222222222222222222222.json")),
+                self.assertTrue(os.path.exists(exec_state),
                                 "the state file is the only record that child is ours")
             finally:
                 for pid in rec.get("survivors", {}):
@@ -2413,12 +2439,14 @@ class FindStateIsEventDriven(unittest.TestCase):
     """
 
     def test_waiting_for_the_state_file_costs_no_cpu(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = state_fixture.make_store(os.path.join(tmp, "state"))
             for i in range(8):  # unrelated files, as on a real box
-                with open(os.path.join(d, f"vm-other{i}.json"), "w") as f:
-                    json.dump({"vm_id": f"o{i}", "pid": 900000 + i}, f)
+                state_fixture.write_vm_state(
+                    d, f"vm-other{i}", {"vm_id": f"o{i}", "pid": 900000 + i})
 
-            target = os.path.join(d, "vm-mine.json")
+            target = reqbench.vm_state_path(d, "vm-mine")
+            os.makedirs(os.path.dirname(target), exist_ok=True)
 
             def writer():
                 time.sleep(0.4)
@@ -2432,7 +2460,7 @@ class FindStateIsEventDriven(unittest.TestCase):
                     }, f)
                 os.rename(tmp, target)
 
-            watch = reqbench.DirWatch(d)  # registered BEFORE the writer starts
+            watch = reqbench.StateWatch(d)  # registered BEFORE the writer starts
             th = threading.Thread(target=writer)
             th.start()
             t0 = time.monotonic()
@@ -2467,10 +2495,10 @@ class FindStateIsEventDriven(unittest.TestCase):
         invisible — and a file left behind with a null pid is never removed by
         fcvm's own sweeper either (`cleanup_stale_state` bails on a null pid).
         """
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "vm-x.json")
-            with open(p, "w") as f:
-                json.dump({"vm_id": "vm-x", "pid": None, "name": "rb-1-0-fast"}, f)
+        with tempfile.TemporaryDirectory() as tmp:
+            d = state_fixture.make_store(os.path.join(tmp, "state"))
+            p = state_fixture.write_vm_state(
+                d, "vm-x", {"vm_id": "vm-x", "pid": None, "name": "rb-1-0-fast"})
             path, st = reqbench.scan_state(d, 4242, "rb-1-0-fast")
             self.assertEqual(path, p)
             self.assertEqual(st["vm_id"], "vm-x")
@@ -2479,16 +2507,14 @@ class FindStateIsEventDriven(unittest.TestCase):
 
     def test_pre_spawn_null_state_is_never_adopted_or_reaped(self):
         """A refused clone cannot inherit debris with the same requested name."""
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = state_fixture.make_store(os.path.join(tmp, "state"))
             vm_id = "vm-66666666666666666666666666666666"
-            state_path = os.path.join(d, f"{vm_id}.json")
-            data_dir = os.path.join(d, "vm-disks", vm_id)
+            data_dir = reqbench.vm_runtime_dir(tmp, vm_id)
             name = "rb-reused-run-0-noop"
             os.makedirs(data_dir)
-            with open(state_path, "w") as f:
-                json.dump({"vm_id": vm_id, "pid": None, "name": name}, f)
-            with open(state_path + ".lock", "w") as f:
-                f.write("")
+            state_path = state_fixture.write_vm_state(
+                d, vm_id, {"vm_id": vm_id, "pid": None, "name": name})
 
             before_spawn = reqbench.state_path_baseline(d)
             path, state = reqbench.scan_state(
@@ -2519,9 +2545,8 @@ class FindStateIsEventDriven(unittest.TestCase):
             # A genuinely new null-PID path published after the baseline remains
             # discoverable for diagnostics; the old path never becomes eligible.
             new_vm_id = "vm-77777777777777777777777777777777"
-            new_path = os.path.join(d, f"{new_vm_id}.json")
-            with open(new_path, "w") as f:
-                json.dump({"vm_id": new_vm_id, "pid": None, "name": name}, f)
+            new_path = state_fixture.write_vm_state(
+                d, new_vm_id, {"vm_id": new_vm_id, "pid": None, "name": name})
             self.assertEqual(
                 reqbench.scan_state(
                     d, 4242, name, 123456, before_spawn
@@ -2532,12 +2557,12 @@ class FindStateIsEventDriven(unittest.TestCase):
     def test_refused_clone_retains_pre_spawn_same_name_state(self):
         """The recovery path must not feed stale paths into teardown."""
         with tempfile.TemporaryDirectory() as d:
-            state_dir = os.path.join(d, "state")
+            state_dir = state_fixture.make_store(os.path.join(d, "state"))
             vm_id = "vm-99999999999999999999999999999999"
             name = "rb-reused-run-0-noop"
-            state_path = os.path.join(state_dir, f"{vm_id}.json")
-            data_dir = os.path.join(d, "vm-disks", vm_id)
-            os.makedirs(state_dir)
+            state_path = reqbench.vm_state_path(state_dir, vm_id)
+            data_dir = reqbench.vm_runtime_dir(d, vm_id)
+            os.makedirs(os.path.dirname(state_path))
             os.makedirs(data_dir)
             with open(state_path, "w") as f:
                 json.dump({"vm_id": vm_id, "pid": None, "name": name}, f)
@@ -2574,28 +2599,22 @@ class FindStateIsEventDriven(unittest.TestCase):
 
     def test_reused_pid_with_wrong_start_time_never_owns_or_reaps_state(self):
         """The same numeric PID is not the process identity."""
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = state_fixture.make_store(os.path.join(tmp, "state"))
             p = subprocess.Popen(["sleep", "300"])
             try:
                 start_time = reqbench.proc_stat_fields(p.pid)[3]
                 vm_id = "vm-88888888888888888888888888888888"
                 name = "rb-reused-pid-0-fast"
-                state_path = os.path.join(d, f"{vm_id}.json")
-                data_dir = os.path.join(d, "vm-disks", vm_id)
+                data_dir = reqbench.vm_runtime_dir(tmp, vm_id)
                 os.makedirs(data_dir)
-                with open(state_path, "w") as f:
-                    json.dump(
-                        {
-                            "vm_id": vm_id,
-                            "name": name,
-                            "pid": p.pid,
-                            "pid_start_time": start_time + 1,
-                            "lifecycle_ready": True,
-                        },
-                        f,
-                    )
-                with open(state_path + ".lock", "w") as f:
-                    f.write("")
+                state_path = state_fixture.write_vm_state(d, vm_id, {
+                    "vm_id": vm_id,
+                    "name": name,
+                    "pid": p.pid,
+                    "pid_start_time": start_time + 1,
+                    "lifecycle_ready": True,
+                })
 
                 self.assertIsNone(
                     reqbench.scan_state(
@@ -2607,7 +2626,7 @@ class FindStateIsEventDriven(unittest.TestCase):
                         allow_unowned=False,
                     )[0]
                 )
-                watch = reqbench.DirWatch(d)
+                watch = reqbench.StateWatch(d)
                 try:
                     with self.assertRaisesRegex(TimeoutError, "never recorded"):
                         reqbench.wait_state_owned(
@@ -2639,12 +2658,12 @@ class FindStateIsEventDriven(unittest.TestCase):
     def test_waits_for_post_resume_owner_without_polling_or_early_teardown(self):
         """Port readiness can precede the state file's owner-PID update."""
         with tempfile.TemporaryDirectory() as d:
-            state_path = os.path.join(d, "vm-x.json")
+            store = state_fixture.make_store(os.path.join(d, "state"))
             p = subprocess.Popen(["sleep", "300"])
             start_time = reqbench.proc_stat_fields(p.pid)[3]
-            with open(state_path, "w") as f:
-                json.dump({"vm_id": "vm-x", "pid": None, "name": "rb-x"}, f)
-            watch = reqbench.DirWatch(d)
+            state_path = state_fixture.write_vm_state(
+                store, "vm-x", {"vm_id": "vm-x", "pid": None, "name": "rb-x"})
+            watch = reqbench.StateWatch(store)
 
             def claim_state():
                 time.sleep(0.2)
@@ -2786,10 +2805,12 @@ class ExecArmTimeout(unittest.TestCase):
 
     def test_timeout_is_recorded_and_the_child_is_killed(self):
         with tempfile.TemporaryDirectory() as d:
+            sd = state_fixture.make_store(os.path.join(d, "state"))
             stub = os.path.join(d, "fcvm-stub")
             child_ready = os.path.join(d, "exec-child-ready")
-            state = os.path.join(d, "vm-33333333333333333333333333333333.json")
-            data = os.path.join(d, "vm-disks", "vm-33333333333333333333333333333333")
+            state = reqbench.vm_state_path(sd, "vm-33333333333333333333333333333333")
+            os.makedirs(os.path.dirname(state))
+            data = reqbench.vm_runtime_dir(d, "vm-33333333333333333333333333333333")
             os.makedirs(data)
             with open(stub, "w") as f:
                 f.write(
@@ -2809,7 +2830,7 @@ class ExecArmTimeout(unittest.TestCase):
                 fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
                 snapshot_tag="", serve_pid=1, rust_log="off",
                 timeout=0.3, teardown_timeout=0.2,
-                state_dir=d, data_root=d, run_id="test-run",
+                state_dir=sd, data_root=d, run_id="test-run",
             )
             before = set(reqbench.children_of(os.getpid()))
             rec = reqbench.run_exec_request(args, 0)  # must NOT raise
@@ -2832,8 +2853,10 @@ class ExecArmTimeout(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         stub = os.path.join(d, "fcvm-stub")
         child_ready = os.path.join(d, "exec-child-ready")
-        state = os.path.join(d, "vm-44444444444444444444444444444444.json")
-        os.makedirs(os.path.join(d, "vm-disks", "vm-44444444444444444444444444444444"))
+        sd = state_fixture.make_store(os.path.join(d, "state"))
+        state = reqbench.vm_state_path(sd, "vm-44444444444444444444444444444444")
+        os.makedirs(os.path.dirname(state))
+        os.makedirs(reqbench.vm_runtime_dir(d, "vm-44444444444444444444444444444444"))
         fifo = os.path.join(d, "release")
         os.mkfifo(fifo)
         with open(stub, "w") as f:
@@ -2857,7 +2880,7 @@ class ExecArmTimeout(unittest.TestCase):
             fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
             snapshot_tag="", serve_pid=1, rust_log="off",
             timeout=1.5, teardown_timeout=1.0,
-            state_dir=d, data_root=d, run_id="test-run",
+            state_dir=sd, data_root=d, run_id="test-run",
         )
 
     def test_a_child_that_exits_between_the_two_reads_is_not_a_changed_set(self):
@@ -3307,9 +3330,7 @@ class SnapshotGenerationIdentity(unittest.TestCase):
             with open(manifest_path, "w") as target:
                 target.write("sealed runtime fixture\n")
             fcvm = os.path.join(runtime_bundle, "fcvm")
-            with open(fcvm, "w") as target:
-                target.write("#!/bin/sh\nexit 0\n")
-            os.chmod(fcvm, 0o755)
+            state_fixture.write_fake_fcvm(fcvm, os.path.join(data_root, "state"), data_root)
 
             lock_path = os.path.join(
                 data_root, "snapshots", f"{self.SNAPSHOT}.lock",
@@ -5302,22 +5323,19 @@ class ServeAcknowledgement(unittest.TestCase):
         )
         # serve_uffd_mode needs a live process with a serve state record;
         # this test process stands in for the server.
-        state_dir = os.path.join(data_root, "state")
-        os.makedirs(state_dir)
-        with open(os.path.join(state_dir, "vm-serve.json"), "w") as target:
-            json.dump({"pid": os.getpid(),
-                       "pid_start_time": reqbench.proc_stat_fields(os.getpid())[3],
-                       "config": {"process_type": "serve", "snapshot_name": self.SNAPSHOT,
-                                  "uffd_mode": "copy"}}, target)
+        state_dir = state_fixture.make_store(os.path.join(data_root, "state"))
+        state_fixture.write_vm_state(state_dir, "vm-serve", {
+            "pid": os.getpid(),
+            "pid_start_time": reqbench.proc_stat_fields(os.getpid())[3],
+            "config": {"process_type": "serve", "snapshot_name": self.SNAPSHOT,
+                       "uffd_mode": "copy"}})
         runtime_bundle = os.path.join(data_root, "runtime")
         os.makedirs(runtime_bundle)
         manifest_path = os.path.join(runtime_bundle, "MANIFEST.sha256")
         with open(manifest_path, "w") as target:
             target.write("sealed runtime fixture\n")
         fcvm = os.path.join(runtime_bundle, "fcvm")
-        with open(fcvm, "w") as target:
-            target.write("#!/bin/sh\nexit 0\n")
-        os.chmod(fcvm, 0o755)
+        state_fixture.write_fake_fcvm(fcvm, os.path.join(data_root, "state"), data_root)
         exact_hashes = {
             os.path.realpath(fcvm): "c" * 64,
             os.path.realpath(manifest_path): "d" * 64,
@@ -5740,7 +5758,7 @@ class TeardownProbeGuards(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             state = os.path.join(d, "vm-11111111111111111111111111111111.json")
-            data = os.path.join(d, "vm-disks", "vm-11111111111111111111111111111111")
+            data = reqbench.vm_runtime_dir(d, "vm-11111111111111111111111111111111")
             with open(state, "w") as f:
                 json.dump({"vm_id": "vm-11111111111111111111111111111111"}, f)
             os.makedirs(data)
@@ -5771,7 +5789,7 @@ class TeardownProbeGuards(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             state = os.path.join(d, "vm-11111111111111111111111111111111.json")
-            data = os.path.join(d, "vm-disks", "vm-11111111111111111111111111111111")
+            data = reqbench.vm_runtime_dir(d, "vm-11111111111111111111111111111111")
             with open(state, "w") as f:
                 json.dump({"vm_id": "vm-11111111111111111111111111111111"}, f)
             os.makedirs(data)
@@ -5814,14 +5832,16 @@ class TeardownProbeGuards(unittest.TestCase):
         import teardown_probe
 
         with tempfile.TemporaryDirectory() as d:
-            state_dir = os.path.join(d, "state")
-            os.makedirs(state_dir)
-            os.makedirs(os.path.join(d, "vm-disks", "vm-22222222222222222222222222222222"))
+            state_dir = state_fixture.make_store(os.path.join(d, "state"))
+            os.makedirs(reqbench.vm_runtime_dir(d, "vm-22222222222222222222222222222222"))
             stub = os.path.join(d, "fcvm-stub")
             with open(stub, "w") as f:
                 f.write(
                     "#!/bin/bash\n"
-                    f"cat > {state_dir}/vm-$$.json <<EOF\n"
+                    + f'if [ "$1" = paths ]; then printf \'{{"state_dir": "%s", "data_dir": "%s"}}\\n\' '
+                    + f'{state_dir} {d}; exit 0; fi\n'
+                    + state_fixture.SH_STATE_PATH +
+                    f'cat > "$(fixture_state_path {state_dir} vm-$$)" <<EOF\n'
                     '{"vm_id": "vm-22222222222222222222222222222222", "pid": $$, '
                     '"config": {"network": {"loopback_ip": "127.0.0.1"}}}\n'
                     "EOF\n"
@@ -5901,17 +5921,26 @@ class ReqbenchShell(unittest.TestCase):
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             RESULTS=os.path.join(d, "results"),
-            STATE_DIR=os.path.join(d, "state"),
+            FCVM_FAKE_STATE_DIR=os.path.join(d, "state"),
             ALLOW_BUSY="1",
             RUNID=self.RUN_ID,
             FCVM=fcvm,
             FC_AGENT=fc_agent,
         )
         env.update(extra)
-        os.makedirs(env["STATE_DIR"], exist_ok=True)
+        state_fixture.make_store(env["FCVM_FAKE_STATE_DIR"])
         return env, binx
 
     def _write(self, path, body):
+        # A fake fcvm answers `fcvm paths --json` with the store _env made beside it
+        # (<dir>/state), as the harness asks the binary for its state directory before
+        # anything else. The answer is written into the stub, so a sudo stand-in that
+        # resets the environment does not lose it.
+        shebang = "#!/bin/bash\n"
+        if (os.path.basename(path) == "fcvm" and body.startswith(shebang)
+                and "= paths ]" not in body):
+            state = os.path.join(os.path.dirname(path), "state")
+            body = shebang + state_fixture.sh_fcvm_paths(state) + body[len(shebang):]
         with open(path, "w") as f:
             f.write(body)
         os.chmod(path, 0o755)
@@ -7149,7 +7178,7 @@ case "$1 $2" in
       # beside the snapshot it serves ($3).
       prefetch=on; prev=""
       for a in "$@"; do [ "$prev" = --uffd-prefetch ] && prefetch="$a"; prev="$a"; done
-      [ "$prefetch" = off ] || : > "$(dirname "$STATE_DIR")/snapshots/$3/memory.bin.working-set"
+      [ "$prefetch" = off ] || : > "$(dirname "$FCVM_FAKE_STATE_DIR")/snapshots/$3/memory.bin.working-set"
       echo "Serve PID: $$"; echo "Waiting for VMs"
       sleep 30 & sl=$!
       trap 'echo "torn down serve" >> "$STUB_TEARDOWN_LOG"; kill $sl 2>/dev/null; exit 0' TERM
@@ -7158,7 +7187,8 @@ case "$1 $2" in
       name=""; prev=""
       for a in "$@"; do [ "$prev" = --name ] && name="$a"; prev="$a"; done
       vm_id="vm-$(printf '%s' "$name" | sha256sum | cut -c1-32)"
-      state="$STATE_DIR/$vm_id.json"
+      bucket=$(printf %s "$vm_id" | sha256sum | cut -c1-1); mkdir -p "$FCVM_FAKE_STATE_DIR/vms/$bucket"
+      state="$FCVM_FAKE_STATE_DIR/vms/$bucket/$vm_id.json"
       read -r st < /proc/$$/stat; st=${st##*) }; read -ra f <<< "$st"
       printf '{"vm_id":"%s","name":"%s","pid":%s,"pid_start_time":%s,"config":{"network":{"loopback_ip":"127.0.0.1"}}}\n' \
           "$vm_id" "$name" "$$" "${f[19]}" > "$state"
@@ -7167,9 +7197,9 @@ case "$1 $2" in
       wait $sl; rm -f "$state"; exit 0 ;;
   "ls --json")
       pid=""; [ "${3:-}" = --pid ] && pid="$4"
-      "$STUB_PYTHON" - "$STATE_DIR" "$pid" <<'PY'
+      "$STUB_PYTHON" - "$FCVM_FAKE_STATE_DIR" "$pid" <<'PY'
 import glob, json, os, sys
-rows = [json.load(open(p)) for p in glob.glob(os.path.join(sys.argv[1], "vm-*.json"))]
+rows = [json.load(open(p)) for p in glob.glob(os.path.join(sys.argv[1], "vms", "*", "vm-*.json"))]
 if sys.argv[2]:
     rows = [r for r in rows if str(r["pid"]) == sys.argv[2]]
 print(json.dumps(rows))
@@ -7330,9 +7360,8 @@ exec __PYTHON__ "$@"
                       expect_ips="10.0.2.2", max_load_ms="", backend="uffd",
                       **stub_env):
         data = os.path.join(d, "data")
-        state_dir = os.path.join(data, "state")
+        state_dir = state_fixture.make_store(os.path.join(data, "state"))
         snap = os.path.join(data, "snapshots", "tag-under-test")
-        os.makedirs(state_dir)
         os.makedirs(snap)
         with open(os.path.join(snap, "config.json"), "w") as handle:
             json.dump({"generation_id": "12345678-1234-4234-8234-123456789abc",
@@ -7342,7 +7371,10 @@ exec __PYTHON__ "$@"
         self._write(os.path.join(binx, "python3"),
                     self.DIAG_PYTHON_STUB.replace("__PYTHON__", sys.executable))
         fcvm = os.path.join(d, "fcvm")
-        self._write(fcvm, self.DIAG_FCVM_STUB)
+        shebang = "#!/bin/bash\n"
+        assert self.DIAG_FCVM_STUB.startswith(shebang)
+        self._write(fcvm, shebang + state_fixture.sh_fcvm_paths(state_dir)
+                    + self.DIAG_FCVM_STUB[len(shebang):])
         self._write(os.path.join(d, "fc-agent"), "#!/bin/bash\nexit 0\n")
         env = dict(os.environ)
         # The developer's shell must not decide what the diag renders.
@@ -7353,7 +7385,7 @@ exec __PYTHON__ "$@"
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             TAG="tag-under-test",
-            STATE_DIR=state_dir,
+            FCVM_FAKE_STATE_DIR=state_dir,
             RESULTS=os.path.join(d, "results"),
             RUNID=self.RUN_ID,
             FCVM=fcvm,
@@ -7391,7 +7423,7 @@ exec __PYTHON__ "$@"
     def _diag_sidecar(self, env):
         """Where the fcvm stub's serve publishes a working set for the
         snapshot under test, as the real server would beside the golden."""
-        return os.path.join(os.path.dirname(env["STATE_DIR"]), "snapshots",
+        return os.path.join(os.path.dirname(env["FCVM_FAKE_STATE_DIR"]), "snapshots",
                             "tag-under-test", "memory.bin.working-set")
 
     def test_diag_renders_each_url_on_its_own_clone_and_summarises_the_traces(self):
@@ -7443,7 +7475,7 @@ exec __PYTHON__ "$@"
             self.assertEqual(sorted(self._diag_teardowns(env)),
                              sorted([f"torn down cb-req-diag-{n}-{self.RUN_ID}"
                                      for n in range(1, 5)] + ["torn down serve"]))
-            self.assertEqual(os.listdir(state_dir), [])
+            self.assertEqual(state_fixture.leftover(state_dir), [])
 
     def test_diag_defaults_to_the_run_url_three_times_and_needs_no_expected_ips(self):
         with tempfile.TemporaryDirectory() as d:
@@ -7479,7 +7511,7 @@ exec __PYTHON__ "$@"
             self.assertIn("93.184.216.34", first["detail"])
             for data in summary["urls"].values():
                 self.assertEqual(data["remote_ips"], {"93.184.216.34": 6})
-            self.assertEqual(os.listdir(state_dir), [])
+            self.assertEqual(state_fixture.leftover(state_dir), [])
 
     def test_a_name_that_did_not_resolve_is_a_violation(self):
         with tempfile.TemporaryDirectory() as d:
@@ -7653,7 +7685,7 @@ exec __PYTHON__ "$@"
             self.assertEqual(sorted(self._diag_teardowns(env)),
                              sorted([f"torn down cb-req-diag-{n}-{self.RUN_ID}"
                                      for n in range(1, 5)] + ["torn down serve"]))
-            self.assertEqual(os.listdir(state_dir), [],
+            self.assertEqual(state_fixture.leftover(state_dir), [],
                              "a failed render skipped the clone teardown")
 
     def test_a_missing_trace_is_a_failed_render(self):
@@ -7704,7 +7736,7 @@ exec __PYTHON__ "$@"
             self.assertEqual(len(driver), 2)
             self.assertTrue(all(line.startswith("- wddrive 127.0.0.1:9515 ") for line in driver),
                             driver)
-            self.assertEqual(os.listdir(state_dir), [])
+            self.assertEqual(state_fixture.leftover(state_dir), [])
 
     def test_diag_on_the_file_backend_restores_without_a_serve(self):
         with tempfile.TemporaryDirectory() as d:
@@ -7722,7 +7754,7 @@ exec __PYTHON__ "$@"
             # on this backend; campaign_summary binds the two on it.
             self.assertEqual(summary["uffd_mode"], "file")
             self.assertIsNone(summary["uffd_prefetch"])
-            self.assertEqual(os.listdir(state_dir), [])
+            self.assertEqual(state_fixture.leftover(state_dir), [])
 
     def test_diag_serves_with_working_set_replay_off_and_leaves_no_sidecar(self):
         """The diag's clones fault the golden's pages. Served with replay on,
@@ -9670,7 +9702,8 @@ class FailureProbeCapture(unittest.TestCase):
         exec_log = os.path.join(d, "exec.log")
         sleep_pid_file = os.path.join(d, "sleep.pid")
         stub = os.path.join(d, "fcvm-stub")
-        state_path = os.path.join(state_dir, f"{vm_id}.json")
+        state_path = reqbench.vm_state_path(state_dir, vm_id)
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
         body = probe_stub_source(clone_pid_file, exec_log, sleep_pid_file, exec_mode)
         state = json.dumps({
             "vm_id": vm_id, "name": name, "pid": "PID", "pid_start_time": "START",
@@ -9709,8 +9742,7 @@ class FailureProbeCapture(unittest.TestCase):
         import socket
 
         with tempfile.TemporaryDirectory() as d:
-            state_dir = os.path.join(d, "state")
-            os.makedirs(state_dir)
+            state_dir = state_fixture.make_store(os.path.join(d, "state"))
             server = socket.socket()
             server.bind(("127.0.0.1", 0))
             server.listen(8)
@@ -10400,6 +10432,7 @@ class NoHostIdentifiersInTree(unittest.TestCase):
         "i-" + "0aaaaaaaaaaaaaaa1",
         "i-" + "0aaaaaaaaaaaaaaa2",
         "i-" + "0bbbbbbbbbbbbbbb1",
+        "i-" + "0ccccccccccccccc1",
     }
     # Spelled in pieces so this file does not contain the forbidden keys.
     FIELDS = ("instance" + "_id", "host_" + "ipv4", "host_" + "ipv6")
@@ -10539,6 +10572,292 @@ class CloneEndpointWait(unittest.TestCase):
                 reqbench.wait_clone_endpoint(
                     path, self.EARLY, 9222, time.monotonic() + 30, watch, proc)
             self.assertLess(time.monotonic() - t0, 2.0)
+
+
+
+class FcvmPaths(unittest.TestCase):
+    """The harness takes fcvm's state directory from `fcvm paths --json`, once per run."""
+
+    def setUp(self):
+        reqbench._FCVM_PATHS.clear()
+        self.addCleanup(reqbench._FCVM_PATHS.clear)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+
+    def fake(self, body):
+        path = os.path.join(self.dir, "fcvm")
+        with open(path, "w") as handle:
+            handle.write("#!/bin/bash\n" + body)
+        os.chmod(path, 0o755)
+        return path
+
+    def test_the_answer_is_fcvm_s(self):
+        fcvm = state_fixture.write_fake_fcvm(
+            os.path.join(self.dir, "fcvm"), "/run/example/state", "/data/example")
+        self.assertEqual(reqbench.fcvm_paths(fcvm),
+                         {"state_dir": "/run/example/state", "data_dir": "/data/example"})
+        self.assertEqual(reqbench.fcvm_state_dir(fcvm), "/run/example/state")
+
+    def test_the_binary_gets_the_clones_environment(self):
+        fcvm = self.fake('printf \'{"state_dir": "%s/state", "data_dir": "%s"}\\n\' '
+                         '"$FCVM_DATA_DIR" "$FCVM_DATA_DIR"\n')
+        env = dict(os.environ, FCVM_DATA_DIR="/data/one")
+        self.assertEqual(reqbench.fcvm_state_dir(fcvm, env), "/data/one/state")
+        # Another data directory is another answer, not the cached one.
+        env["FCVM_DATA_DIR"] = "/data/two"
+        self.assertEqual(reqbench.fcvm_state_dir(fcvm, env), "/data/two/state")
+
+    def test_the_answer_is_asked_once_per_run(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(
+                argv, 0, '{"state_dir": "/s", "data_dir": "/d", "later": 1}\n', "")
+
+        self.assertEqual(reqbench.fcvm_state_dir("/x/fcvm", {}, run), "/s")
+        self.assertEqual(reqbench.fcvm_state_dir("/x/fcvm", {}, run), "/s")
+        self.assertEqual(calls, [["/x/fcvm", "paths", "--json"]])
+
+    def test_a_failed_call_names_the_command_and_its_stderr(self):
+        fcvm = self.fake("echo 'Failed to load config' >&2\nexit 1\n")
+        with self.assertRaises(RuntimeError) as raised:
+            reqbench.fcvm_state_dir(fcvm)
+        text = str(raised.exception)
+        self.assertIn(f"{fcvm} paths --json", text)
+        self.assertIn("status 1", text)
+        self.assertIn("Failed to load config", text)
+        # A failure is not cached: the next call asks again.
+        self.assertEqual(reqbench._FCVM_PATHS, {})
+
+    def test_a_binary_that_cannot_run_is_named(self):
+        missing = os.path.join(self.dir, "no-such-fcvm")
+        with self.assertRaisesRegex(RuntimeError, "no-such-fcvm paths --json` could not run"):
+            reqbench.fcvm_state_dir(missing)
+
+    def test_an_answer_without_a_field_is_refused(self):
+        for printed, field in (('{"data_dir": "/d"}', "state_dir"),
+                               ('{"state_dir": "/s"}', "data_dir"),
+                               ('{"state_dir": "relative", "data_dir": "/d"}', "state_dir"),
+                               ('{"state_dir": 3, "data_dir": "/d"}', "state_dir")):
+            with self.subTest(printed=printed):
+                reqbench._FCVM_PATHS.clear()
+                fcvm = self.fake(f"echo '{printed}'\n")
+                with self.assertRaisesRegex(RuntimeError, f"printed no absolute {field}"):
+                    reqbench.fcvm_state_dir(fcvm)
+
+    def test_an_answer_that_is_not_an_object_is_refused(self):
+        for printed in ("not json", "[1, 2]"):
+            with self.subTest(printed=printed):
+                fcvm = self.fake(f"echo '{printed}'\n")
+                with self.assertRaises(RuntimeError):
+                    reqbench.fcvm_state_dir(fcvm)
+
+    def test_main_takes_the_state_directory_from_fcvm(self):
+        """No harness builds the state directory from its data root (main used to)."""
+        source = inspect.getsource(reqbench.main_with_resources)
+        self.assertIn("fcvm_state_dir(args.fcvm)", source)
+        self.assertNotIn('"--state-dir"', source)
+
+
+class StateLayoutReaders(unittest.TestCase):
+    """The harness reads fcvm state layout 2 (vms/<bucket>/, pids/<bucket>/)."""
+
+    VM = "vm-0123456789abcdef0123456789abcdef"
+
+    def store(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return state_fixture.make_store(os.path.join(tmp.name, "state"))
+
+    def test_bucket_examples_from_the_contract(self):
+        self.assertEqual(reqbench.bucket_of(self.VM), "a")
+        self.assertEqual(reqbench.bucket_of("vm-1"), "2")
+        self.assertEqual(reqbench.bucket_of(str(4242)), "0")
+        self.assertEqual(reqbench.bucket_of("web"), "4")
+
+    def test_paths_follow_the_contract(self):
+        self.assertEqual(reqbench.vm_state_path("/s", self.VM), f"/s/vms/a/{self.VM}.json")
+        self.assertEqual(reqbench.pid_bucket_dir("/s", 4242), "/s/pids/0")
+
+    def test_store_without_layout_file_and_flat_states_is_refused(self):
+        d = self.store()
+        os.remove(os.path.join(d, "layout"))
+        open(os.path.join(d, f"{self.VM}.json"), "w").close()
+        with self.assertRaisesRegex(RuntimeError, "layout 1.*need an fcvm that writes it"):
+            reqbench.require_state_layout(d)
+        for call in (
+            lambda: reqbench.state_path_baseline(d),
+            lambda: reqbench.scan_state(d, 1, "n"),
+            lambda: reqbench.find_state(d, 1, time.monotonic() + 1),
+            lambda: reqbench.serve_uffd_mode(d, os.getpid(), "snap"),
+        ):
+            with self.assertRaises(RuntimeError):
+                call()
+
+    def test_other_layout_number_is_refused_and_empty_or_absent_store_is_not(self):
+        d = self.store()
+        with open(os.path.join(d, "layout"), "w") as f:
+            f.write("3\n")
+        with self.assertRaisesRegex(RuntimeError, "layout '3'"):
+            reqbench.require_state_layout(d)
+        os.remove(os.path.join(d, "layout"))
+        reqbench.require_state_layout(d)
+        reqbench.require_state_layout(os.path.join(d, "absent"))
+
+    def test_listing_skips_temp_files_and_names_lock_only_vms(self):
+        d = self.store()
+        done = state_fixture.write_vm_state(d, self.VM, {"vm_id": self.VM, "pid": 7})
+        starting = reqbench.vm_state_path(d, "vm-1")
+        os.makedirs(os.path.dirname(starting))
+        open(starting + ".lock", "w").close()
+        open(starting + ".tmp", "w").close()
+        os.makedirs(os.path.join(d, "vms", "not-a-bucket"))
+        self.assertEqual(sorted(reqbench.list_state_paths(d)), sorted([done, starting]))
+        self.assertIsNone(reqbench.read_state_file(starting))
+
+    def test_missing_vms_directory_and_buckets_list_nothing(self):
+        d = self.store()
+        self.assertEqual(reqbench.list_state_paths(d), [])
+        self.assertEqual(reqbench.pid_state_paths(d, 4242), [])
+        self.assertEqual(reqbench.state_path_baseline(d), frozenset())
+        self.assertEqual(reqbench.scan_state(d, 4242, "n"), (None, None))
+
+    def test_scan_finds_a_state_with_or_without_its_pid_entry(self):
+        d = self.store()
+        me = os.getpid()
+        start = reqbench.proc_stat_fields(me)[3]
+        state = {"vm_id": self.VM, "name": "n", "pid": me, "pid_start_time": start}
+        path = state_fixture.write_vm_state(d, self.VM, state, pid_entry=False)
+        self.assertEqual(reqbench.scan_state(d, me, fcvm_start_time=start), (path, state))
+        state_fixture.write_vm_state(d, self.VM, state)
+        self.assertEqual(reqbench.pid_state_paths(d, me), [path])
+        self.assertEqual(reqbench.scan_state(d, me, "n", start), (path, state))
+        self.assertEqual(reqbench.scan_state(d, me, "n", start + 1), (None, None))
+
+    def test_stale_pid_entries_are_not_a_match(self):
+        d = self.store()
+        pid = 4242
+        entry_dir = reqbench.pid_bucket_dir(d, pid)
+        os.makedirs(entry_dir)
+        open(os.path.join(entry_dir, f"{pid}.vm-gone"), "w").close()
+        self.assertEqual(reqbench.scan_state(d, pid, fcvm_start_time=1), (None, None))
+        other = {"vm_id": "vm-other", "pid": 99, "pid_start_time": 1}
+        state_fixture.write_vm_state(d, "vm-other", other)
+        open(os.path.join(entry_dir, f"{pid}.vm-other"), "w").close()
+        self.assertEqual(reqbench.scan_state(d, pid, fcvm_start_time=1), (None, None))
+
+    def test_state_that_vanishes_between_listing_and_read_is_skipped(self):
+        d = self.store()
+        path = state_fixture.write_vm_state(d, self.VM, {"vm_id": self.VM, "pid": 5})
+        real = reqbench.read_state_file
+
+        def vanish(p):
+            os.remove(p)
+            return real(p)
+
+        with _subreaper_mock.patch.object(reqbench, "read_state_file", vanish):
+            self.assertEqual(reqbench.scan_state(d, 5, "n"), (None, None))
+        self.assertFalse(os.path.exists(path))
+
+    def test_baseline_excludes_states_present_before_the_spawn(self):
+        d = self.store()
+        old = state_fixture.write_vm_state(
+            d, self.VM, {"vm_id": self.VM, "name": "n", "pid": None}, pid_entry=False)
+        base = reqbench.state_path_baseline(d)
+        self.assertEqual(base, frozenset([old]))
+        self.assertEqual(reqbench.scan_state(d, 0, "n", excluded_paths=base), (None, None))
+        self.assertEqual(reqbench.scan_state(d, 0, "n")[0], old)
+
+    def test_find_state_with_a_watch_started_before_any_bucket_exists(self):
+        d = self.store()
+        watch = reqbench.StateWatch(d)
+        self.addCleanup(watch.close)
+        me = os.getpid()
+        start = reqbench.proc_stat_fields(me)[3]
+        state = {"vm_id": self.VM, "name": "n", "pid": me, "pid_start_time": start}
+        writer = threading.Timer(0.3, state_fixture.write_vm_state, (d, self.VM, state))
+        writer.start()
+        self.addCleanup(writer.join)
+        began = time.monotonic()
+        path, found = reqbench.find_state(
+            d, me, time.monotonic() + 10, watch, "n", fcvm_start_time=start)
+        self.assertEqual(found, state)
+        self.assertEqual(path, reqbench.vm_state_path(d, self.VM))
+        self.assertLess(time.monotonic() - began, 5)
+
+    def test_watch_sees_a_rename_into_a_bucket_made_after_the_watch(self):
+        d = self.store()
+        watch = reqbench.StateWatch(d)
+        self.addCleanup(watch.close)
+        watch.drain()
+        os.makedirs(os.path.join(d, "vms", reqbench.bucket_of(self.VM)))
+        watch.drain()  # adds the new bucket's watch
+        state_fixture.write_vm_state(d, self.VM, {"vm_id": self.VM, "pid": None}, lock=False)
+        self.assertTrue(watch.wait(2.0))
+
+    def test_exchange_publish_events_on_the_temp_name_do_not_hide_the_state(self):
+        d = self.store()
+        me = os.getpid()
+        start = reqbench.proc_stat_fields(me)[3]
+        watch = reqbench.StateWatch(d)
+        self.addCleanup(watch.close)
+        state = {"vm_id": self.VM, "name": "n", "pid": me, "pid_start_time": start}
+        path = state_fixture.write_vm_state(d, self.VM, state)
+        # A replace publishes by exchange: the old state is left in .json.tmp, then unlinked.
+        with open(path + ".tmp", "w") as f:
+            json.dump(state, f)
+        os.rename(path + ".tmp", path + ".x")
+        os.rename(path + ".x", path)
+        open(path + ".tmp", "w").close()
+        os.unlink(path + ".tmp")
+        watch.drain()
+        self.assertEqual(reqbench.list_state_paths(d), [path])
+        self.assertEqual(reqbench.scan_state(d, me, fcvm_start_time=start), (path, state))
+
+    def test_serve_mode_ignores_a_stale_entry_and_finds_the_serve(self):
+        d = self.store()
+        me = os.getpid()
+        entry_dir = reqbench.pid_bucket_dir(d, me)
+        os.makedirs(entry_dir)
+        open(os.path.join(entry_dir, f"{me}.vm-gone"), "w").close()
+        state_fixture.write_vm_state(d, "vm-serve", {
+            "vm_id": "vm-serve", "pid": me,
+            "pid_start_time": reqbench.proc_stat_fields(me)[3],
+            "config": {"process_type": "serve", "snapshot_name": "snap", "uffd_mode": "minor"}})
+        self.assertEqual(reqbench.serve_uffd_mode(d, me, "snap"), "minor")
+
+class AssertVmArtifactsAbsent(unittest.TestCase):
+    """reqbench.sh's leak check must look where layout 2 keeps a VM's files."""
+
+    VM = "vm-0123456789abcdef0123456789abcdef"
+
+    def run_check(self, state_dir, data_root):
+        script = open(os.path.join(HERE, "reqbench.sh")).read()
+        start = script.index("assert_vm_artifacts_absent() {")
+        body = script[start:script.index("\n}\n", start) + 3]
+        return subprocess.run(
+            ["bash", "-c", f"log() {{ echo \"$*\" >&2; }}\n{body}\n"
+             f"assert_vm_artifacts_absent {self.VM}"],
+            env=dict(os.environ, STATE_DIR=state_dir, DATA_ROOT=data_root),
+            capture_output=True, text=True)
+
+    def test_each_leftover_is_reported_and_a_clean_store_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = state_fixture.make_store(os.path.join(d, "state"))
+            self.assertEqual(self.run_check(state_dir, d).returncode, 0)
+            path = reqbench.vm_state_path(state_dir, self.VM)
+            os.makedirs(os.path.dirname(path))
+            for suffix in ("", ".lock", ".tmp"):
+                with self.subTest(suffix=suffix):
+                    open(path + suffix, "w").close()
+                    result = self.run_check(state_dir, d)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(path + suffix, result.stderr)
+                    os.remove(path + suffix)
+            os.makedirs(reqbench.vm_runtime_dir(d, self.VM))
+            self.assertEqual(self.run_check(state_dir, d).returncode, 1)
 
 
 if __name__ == "__main__":
@@ -11073,7 +11392,10 @@ class HugepageGuards(unittest.TestCase):
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             TAG="tag-under-test",
-            STATE_DIR=os.path.join(d, "data", "state"),
+            DATA_ROOT=os.path.join(d, "data"),
+            # The phases ask fcvm for its state directory first.
+            FCVM=state_fixture.write_fake_fcvm(
+                os.path.join(d, "fcvm"), os.path.join(d, "data", "state")),
             HUGEPAGE_POOL_FILE=pool,
             MEM="1024",
             RESULTS=os.path.join(d, "results"),
@@ -11295,9 +11617,7 @@ class ExecArmIsOptional(unittest.TestCase):
             with open(manifest_path, "w") as target:
                 target.write("sealed runtime fixture\n")
             fcvm = os.path.join(runtime_bundle, "fcvm")
-            with open(fcvm, "w") as target:
-                target.write("#!/bin/sh\nexit 0\n")
-            os.chmod(fcvm, 0o755)
+            state_fixture.write_fake_fcvm(fcvm, os.path.join(data_root, "state"), data_root)
 
             def record(arm, rep):
                 return {
@@ -12081,9 +12401,7 @@ class RunMetaGuestDns(unittest.TestCase):
         with open(manifest_path, "w") as target:
             target.write("sealed runtime fixture\n")
         fcvm = os.path.join(runtime_bundle, "fcvm")
-        with open(fcvm, "w") as target:
-            target.write("#!/bin/sh\nexit 0\n")
-        os.chmod(fcvm, 0o755)
+        state_fixture.write_fake_fcvm(fcvm, os.path.join(data_root, "state"), data_root)
         exact_hashes = {
             os.path.realpath(fcvm): "c" * 64,
             os.path.realpath(manifest_path): "d" * 64,
@@ -13000,7 +13318,7 @@ class PublicationGateInvocation(unittest.TestCase):
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             TAG="tag-under-test",
-            STATE_DIR=os.path.join(d, "state"),
+            DATA_ROOT=d,
             RESULTS=results,
         )
         env.update(env_extra)

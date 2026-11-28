@@ -261,7 +261,7 @@ pub async fn create_podman_snapshot(
     // Snapshots stored in snapshot_dir with snapshot_key as name
     let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
 
-    tokio::fs::create_dir_all(paths::snapshot_dir())
+    crate::paths::ensure_dir_async(paths::snapshot_dir())
         .await
         .context("creating snapshot directory")?;
     let state_manager = crate::state::StateManager::new(paths::state_dir());
@@ -383,7 +383,7 @@ pub async fn create_podman_snapshot(
         snapshot_volumes,
         extra_disks,
         crate::commands::common::api_socket_peer_pid(
-            &paths::vm_runtime_dir(&vm_state.vm_id).join("firecracker.sock"),
+            &vm_state.vm_runtime_dir().join("firecracker.sock"),
         )
         .await,
     )?;
@@ -433,7 +433,7 @@ pub async fn create_podman_snapshot(
         None => {
             // Cloud Hypervisor: always a full snapshot, and the source resumes.
             let ch_client = crate::hypervisor::cloud_hypervisor::api::ChClient::new(
-                paths::vm_runtime_dir(&vm_state.vm_id).join("firecracker.sock"),
+                vm_state.vm_runtime_dir().join("firecracker.sock"),
             );
             crate::commands::common::create_snapshot_ch(
                 &ch_client,

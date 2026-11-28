@@ -104,6 +104,23 @@ impl DirEventSource for Option<DirWatch> {
     }
 }
 
+/// Open the lock file `path`, which many starts share (a snapshot's locks and reflink
+/// slots), for writing: an existing one without O_CREAT, and create it only when it is
+/// missing. An open with O_CREAT takes the directory's inode lock for writing even when the
+/// file exists (`lookup_open`), and on btrfs the holder of that lock can wait out a
+/// transaction commit, so every clone of a snapshot opening its locks that way took turns on
+/// the snapshot's directory (tests/test_start_dir_reads.rs). Never truncates.
+pub fn open_shared_lock_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    match std::fs::OpenOptions::new().write(true).open(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path),
+        opened => opened,
+    }
+}
+
 /// The host clock as time since the Unix epoch.
 pub fn host_clock_now() -> Duration {
     std::time::SystemTime::now()
@@ -898,9 +915,18 @@ impl MountRedirects {
                 }
             }
         }
+        // A kept directory inside the view gets its parents as well: one in a bucket the
+        // view holds a mountpoint in (`vm-disks/<bucket>/<vm_id>`) is two levels down.
         for dir in &self.keep {
-            if dir.parent() == Some(self.view.as_path()) && !dirs.contains(dir) {
-                dirs.push(dir.clone());
+            let Ok(relative) = dir.strip_prefix(&self.view) else {
+                continue;
+            };
+            let mut at = self.view.clone();
+            for component in relative.components() {
+                at.push(component);
+                if !dirs.contains(&at) {
+                    dirs.push(at.clone());
+                }
             }
         }
         dirs
@@ -986,7 +1012,7 @@ fn create_mount_targets(redirects: &MountRedirects) -> anyhow::Result<()> {
             continue;
         }
         if !mountpoint.exists() {
-            std::fs::create_dir_all(mountpoint)
+            crate::paths::ensure_dir(mountpoint)
                 .context("creating mountpoint directory for mount redirect")?;
         }
     }
@@ -1444,6 +1470,30 @@ impl TerminalInterrupt {
 }
 
 #[cfg(test)]
+mod shared_lock_file_tests {
+    use super::open_shared_lock_file;
+    use std::io::{Read, Write};
+
+    /// A missing lock file is made; an existing one is opened as it is, never truncated.
+    #[test]
+    fn a_shared_lock_file_is_made_when_missing_and_never_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slot.lock");
+        open_shared_lock_file(&path)
+            .unwrap()
+            .write_all(b"held")
+            .unwrap();
+        drop(open_shared_lock_file(&path).unwrap());
+        let mut text = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "held");
+    }
+}
+
+#[cfg(test)]
 mod tests {
 
     /// A writer that records each `write` call, as an unbuffered stderr would
@@ -1544,6 +1594,7 @@ mod tests {
                         landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
                         layers: vec![crate::confine::Layer::Process],
                         core_limit: 1,
+                        seccomp: None,
                     })),
                 )
             },

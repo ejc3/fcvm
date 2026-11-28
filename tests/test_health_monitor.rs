@@ -38,13 +38,17 @@ fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &st
         pid: Some(pid),
         pid_start_time: None,
         lifecycle_ready: false,
+        restore_acknowledged: false,
         holder_pid: None,
         netpool: None,
         confinement: None,
         vsock_epoch: 0,
+        network_gate_closed: false,
+        boundary_token: None,
         created_at: now,
         last_updated: now,
         config: VmConfig {
+            vm_runtime_dir: None,
             image: "test:latest".to_string(),
             vcpu: 1,
             memory_mib: 256,
@@ -208,8 +212,10 @@ async fn a_container_start_notification_makes_the_vm_healthy_without_asking_podm
         "unused",
     );
     state.config.health_check_url = None;
-    manager.save_state(&state).await.unwrap();
+    // What a start of this build records: the directory the status listener writes into.
     let runtime_dir = paths::vm_runtime_dir(vm_id);
+    state.config.vm_runtime_dir = Some(runtime_dir.clone());
+    manager.save_state(&state).await.unwrap();
     std::fs::create_dir_all(&runtime_dir).unwrap();
 
     let check = || {

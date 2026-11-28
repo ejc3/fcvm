@@ -670,9 +670,37 @@ async fn accept(listener: &AsyncFd<UnixStream>) -> std::io::Result<UnixStream> {
 /// Run a pool of `slots` namespaces for this user and data directory until SIGTERM or
 /// SIGINT, then destroy them one at a time. A second signal ends the process at once, and
 /// the kernel then kills every holder and pasta with it.
+/// The deepest Unix socket a pool of `slots` namespaces binds under its directory: the
+/// control socket of the last slot's pasta.
+fn deepest_socket(dir: &Path, slots: usize) -> PathBuf {
+    dir.join("slots")
+        .join(slots.saturating_sub(1).to_string())
+        .join("pasta.ctl")
+}
+
+/// Refuse a pool directory too deep for the pool's sockets, before anything starts. A
+/// slot's pasta cannot bind a control socket longer than `sockaddr_un` holds; it reports
+/// that as a startup failure it retries, the slot never becomes ready, and every claim
+/// waits for a pool that never answers.
+fn check_socket_budget(dir: &Path, slots: usize) -> Result<()> {
+    let deepest = deepest_socket(dir, slots);
+    let length = deepest.as_os_str().len();
+    anyhow::ensure!(
+        length <= crate::paths::SUN_PATH_MAX,
+        "the runtime directory is too deep for the namespace pool's sockets: {length} bytes, \
+         limit {} (sockaddr_un.sun_path)\n  {}\n\
+         Shorten the runtime directory's base (FCVM_RUNTIME_DIR or paths.runtime_dir), or \
+         the data directory when no base is set.",
+        crate::paths::SUN_PATH_MAX,
+        deepest.display()
+    );
+    Ok(())
+}
+
 pub async fn serve(slots: usize) -> Result<()> {
     anyhow::ensure!(slots > 0, "a pool needs at least one namespace");
     let dir = proto::dir()?;
+    check_socket_budget(&dir, slots)?;
     let lock_path = proto::lock_path(&dir);
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
@@ -762,6 +790,54 @@ pub async fn serve(slots: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pool directory whose last slot's control socket is one byte over `sockaddr_un`
+    /// is refused, with the path and the setting to shorten; one at the limit is not.
+    #[test]
+    fn a_pool_directory_too_deep_for_its_sockets_is_refused() {
+        let suffix = "/slots/9/pasta.ctl".len();
+        let at_limit = PathBuf::from(format!(
+            "/{}",
+            "d".repeat(crate::paths::SUN_PATH_MAX - suffix - 1)
+        ));
+        check_socket_budget(&at_limit, 10).expect("a socket of exactly the limit fits");
+        let over = PathBuf::from(format!(
+            "/{}",
+            "d".repeat(crate::paths::SUN_PATH_MAX - suffix)
+        ));
+        let error = check_socket_budget(&over, 10).expect_err("one byte over is refused");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("FCVM_RUNTIME_DIR") && text.contains("pasta.ctl"),
+            "{text}"
+        );
+        assert_eq!(
+            deepest_socket(Path::new("/p"), 10),
+            Path::new("/p/slots/9/pasta.ctl")
+        );
+    }
+
+    /// The check runs before the pool starts anything: before its lock, its socket and
+    /// its slots, so a too-deep directory ends `serve` instead of a pool nobody can reach.
+    #[test]
+    fn serve_checks_the_socket_budget_before_it_starts() {
+        let source = include_str!("server.rs");
+        let serve = source
+            .split_once("pub async fn serve(slots: usize) -> Result<()> {")
+            .expect("serve")
+            .1;
+        let check = serve
+            .find("check_socket_budget(&dir, slots)?")
+            .expect("serve checks the budget");
+        let lock = serve
+            .find("proto::lock_path(&dir)")
+            .expect("serve takes the lock");
+        let listen = serve.find("listen(&socket_path)").expect("serve listens");
+        assert!(
+            check < lock && check < listen,
+            "the budget is checked first"
+        );
+    }
 
     /// A claim that reaches a namespace's task together with the pool's stop is refused,
     /// not granted and then revoked: the claimer's connection closes with nothing sent on

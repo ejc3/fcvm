@@ -223,3 +223,23 @@ async fn wait_for_log_eof_ignores_a_child_line_that_quotes_the_marker() {
          line that merely quoted the marker:\n{text}"
     );
 }
+
+/// The nested chain's cgroup check is an absence check on the L1 fcvm's log (#2226: no
+/// "no cgroup of the VM's own" line), so it must read the log only after both capture tasks
+/// have drained it: the child's exit does not join them, and a read before then can miss
+/// the very line it looks for and pass (Codex on #2236). The test needs a nested-KVM arm64
+/// host, so this pins the order in its source.
+#[test]
+fn the_nested_cgroup_check_reads_the_log_after_the_capture_drains() {
+    let source = include_str!("test_vsock_integrity.rs");
+    let drained = source.find("common::wait_for_log_eof(&log_path").expect(
+        "test_vsock_integrity_nested reads its log without waiting for the capture to drain",
+    );
+    let read = source
+        .find("std::fs::read_to_string(&log_path)")
+        .expect("test_vsock_integrity_nested no longer reads its log");
+    assert!(
+        drained < read,
+        "test_vsock_integrity_nested reads its log before waiting for the capture to drain"
+    );
+}

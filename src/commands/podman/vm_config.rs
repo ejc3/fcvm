@@ -990,7 +990,7 @@ const NFS_EXPORTS_LOCK: &str = "/run/lock/fcvm-nfs-exports.lock";
 /// that (#1009).
 async fn lock_nfs_exports() -> Result<nix::fcntl::Flock<std::fs::File>> {
     tokio::task::spawn_blocking(|| {
-        std::fs::create_dir_all("/run/lock").ok();
+        crate::paths::ensure_dir("/run/lock").ok();
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -1039,7 +1039,7 @@ pub(crate) async fn setup_nfs_exports(
     }
 
     // Create exports directory if needed
-    tokio::fs::create_dir_all("/etc/exports.d").await.ok();
+    crate::paths::ensure_dir_async("/etc/exports.d").await.ok();
     let _exports = lock_nfs_exports().await?;
 
     // Self-heal: drop fcvm export files whose exported directories no longer

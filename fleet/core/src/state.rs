@@ -1185,15 +1185,25 @@ pub fn lambda_name(n: u32) -> String {
 /// be part of a DNS label: lowercase letters, digits and inner hyphens, at most 40
 /// characters (an EC2 instance id is 19), and not `ec2`, kept for the EC2 half's aggregator.
 pub fn aggregate_id(host: &str) -> Option<String> {
-    let ok = !host.is_empty()
+    (host != "ec2" && host_label(host)).then(|| format!("agg-{host}"))
+}
+
+/// Whether a host's name can be part of a DNS label: lowercase letters, digits and inner
+/// hyphens, at most 40 characters (an EC2 instance id is 19).
+fn host_label(host: &str) -> bool {
+    !host.is_empty()
         && host.len() <= 40
-        && host != "ec2"
         && !host.starts_with('-')
         && !host.ends_with('-')
         && host
             .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    ok.then(|| format!("agg-{host}"))
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The id pages mode's host's frame socket is named under in DNS, `renders-<host>`, when the
+/// host's name can be part of a DNS label (as for [`aggregate_id`]).
+pub fn renders_id(host: &str) -> Option<String> {
+    host_label(host).then(|| format!("renders-{host}"))
 }
 
 /// The id the EC2 half's aggregator is named under in DNS.

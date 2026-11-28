@@ -395,6 +395,8 @@ impl Helper {
                         network: fcvm::confine::Network::Rootless,
                         firecracker_args: None,
                         unsupported: None,
+                        kernel_profile: None,
+                        passthrough_devices: 0,
                     })
                     .expect("deciding the stand-in VMM's confinement"),
                 )
@@ -471,8 +473,10 @@ impl Pool {
     /// [`Self::start`] with `env` in the pool's environment.
     async fn start_with(slots: usize, env: &[(&str, &str)]) -> Self {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        // Short: a VM's deepest socket is <data>/vm-disks/<bucket>/vm-<32 hex>/vsock.sock_inode_tables,
+        // 72 bytes below the data directory, and AF_UNIX paths stop at 107.
         let data_dir = PathBuf::from(format!(
-            "/mnt/fcvm-btrfs/netpool-test-{}-{}",
+            "/mnt/fcvm-btrfs/np-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
@@ -502,8 +506,13 @@ impl Pool {
                 pool.child.try_wait().unwrap().is_none(),
                 "the pool exited while starting"
             );
-            let sockets: Vec<PathBuf> = std::fs::read_dir(pool.data_dir.join("netpool"))
+            // The pool is in the runtime directory its data directory is bound to, which
+            // fcvm is asked for: under /run or on the store, per host.
+            let runtime_dir = fcvm::runtime_dir::bound_to(&pool.data_dir)
+                .expect("reading where the pool's data directory keeps its runtime files");
+            let sockets: Vec<PathBuf> = runtime_dir
                 .into_iter()
+                .flat_map(|dir| std::fs::read_dir(dir.join("netpool")))
                 .flatten()
                 .flatten()
                 .map(|owner| owner.path().join("pool.sock"))
@@ -1006,15 +1015,18 @@ async fn a_killed_pool_leaves_no_process_and_ends_every_lease() {
 
 /// The state of the VM named `name` in `data_dir`, once it has one.
 fn vm_state(data_dir: &std::path::Path, name: &str) -> Option<serde_json::Value> {
-    for entry in std::fs::read_dir(data_dir.join("state")).ok()?.flatten() {
-        if entry.path().extension().is_some_and(|ext| ext == "json") {
-            let Ok(text) = std::fs::read_to_string(entry.path()) else {
-                continue;
-            };
-            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&text) {
-                if state["name"] == name {
-                    return Some(state);
-                }
+    let runtime_dir = fcvm::runtime_dir::bound_to(data_dir)
+        .expect("reading where the data directory keeps its VM states")?;
+    for path in fcvm::state::StateManager::new(runtime_dir.join("state"))
+        .state_files()
+        .expect("listing the state files")
+    {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if let Ok(state) = serde_json::from_str::<serde_json::Value>(&text) {
+            if state["name"] == name {
+                return Some(state);
             }
         }
     }

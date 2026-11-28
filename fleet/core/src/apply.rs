@@ -342,6 +342,23 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 return None;
             }
             let f = &mut state.fleet;
+            // Pages mode's host's frame socket, for the addresses its hello gave.
+            if let Some(h) = f
+                .renders
+                .hosts
+                .iter_mut()
+                .find(|(name, _)| crate::state::renders_id(name).as_deref() == Some(slot.as_str()))
+                .map(|(_, h)| h)
+            {
+                if names.names(
+                    h.hello.ipv6.as_deref(),
+                    h.hello.ipv4.as_deref(),
+                    h.hello.v4_port,
+                ) {
+                    h.published = Some(names.clone());
+                }
+                return None;
+            }
             // A host aggregator's names, for the addresses it reports now.
             if let Some(h) = f
                 .hosts
@@ -507,6 +524,14 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     if named == host {
                         state.fleet.registrations.registered(host, at);
                         state.fleet.renders.agent_hello(host, renders.as_ref());
+                        if renders.is_some() {
+                            // Pages mode's host is no host of the wall: not in `hosts` (the
+                            // count the other modes' pages read), no slot, no place in the
+                            // potato ring or a wake's record. A name that was a wall host
+                            // leaves the wall.
+                            leave_wall(state, host, at);
+                            return None;
+                        }
                         let cfg = state.config.potato.clone();
                         state.fleet.potato.agent_hello(
                             host,
@@ -566,6 +591,11 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 }
                 AgentMsg::Health(h) => health(&mut state.fleet, Some(host), h, at),
                 AgentMsg::Draining { .. } => {
+                    // Pages mode's host: its own state only, never the wall's reclaimed list.
+                    if let Some(h) = state.fleet.renders.hosts.get_mut(host) {
+                        h.draining = true;
+                        return None;
+                    }
                     if let Some(h) = state.fleet.hosts.get_mut(host) {
                         h.draining = true;
                     }
@@ -630,6 +660,12 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             None
         }
         Event::AgentGone { host, .. } => {
+            // Pages mode's host leaves pages mode's state only: it was never a wall host, so
+            // it is not a reclaimed one.
+            if state.fleet.renders.hosts.contains_key(host) {
+                state.fleet.renders.agent_gone(host);
+                return None;
+            }
             let cfg = state.config.potato.clone();
             state.fleet.potato.agent_gone(host, at, &cfg);
             state.fleet.renders.agent_gone(host);
@@ -1863,6 +1899,23 @@ fn tick(state: &mut State, at: u64) {
     {
         f.counters.restores_by_minute.pop_front();
     }
+}
+
+/// A host that said hello as pages mode's host: whatever it held of the wall as a GPU host
+/// under the same name goes (its place among the hosts, slots, phones, sandboxes, servers and
+/// potato players), as when its agent is gone, but it is not counted as reclaimed.
+fn leave_wall(state: &mut State, host: &str, at: u64) {
+    let cfg = state.config.potato.clone();
+    state.fleet.potato.agent_hello(host, 0, 0, false, at, &cfg);
+    let f = &mut state.fleet;
+    if f.hosts.remove(host).is_none() {
+        return;
+    }
+    f.slots.retain(|_, s| s.host.as_deref() != Some(host));
+    f.phones.retain(|_, s| s.host.as_deref() != Some(host));
+    forget_windows(f, |s| s.host.as_deref() == Some(host), at);
+    forget_minecraft(f, |s| s.host.as_deref() == Some(host), at);
+    drop_missing_from_races(f, at);
 }
 
 fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, at: u64) {

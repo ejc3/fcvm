@@ -33,7 +33,7 @@ name = "gate-breaks"
 root = "GateSearch"
 
 # `lake exe gate-seq`: each rule book's boundary sequence, in the names fc-agent's own model
-# tests log, for gate-drift.sh to compare with the Rust source.
+# tests log, for `gate-seq check` to compare with the Rust source.
 [[lean_exe]]
 name = "gate-seq"
 root = "GateSeq"

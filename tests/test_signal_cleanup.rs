@@ -2375,11 +2375,7 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         let artifacts_for =
             |want_pid: u32| -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>> {
                 let dir = fcvm::paths::state_dir();
-                for entry in std::fs::read_dir(&dir).context("reading state dir")? {
-                    let path = entry?.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                        continue;
-                    }
+                for path in fcvm::state::StateManager::new(dir).state_files()? {
                     let Ok(text) = std::fs::read_to_string(&path) else {
                         continue;
                     };
@@ -2387,10 +2383,10 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
                         continue;
                     };
                     if v.get("pid").and_then(|p| p.as_u64()) == Some(want_pid as u64) {
-                        // NEVER default this. `vm_runtime_dir("")` is `<data_dir>/vm-disks`
-                        // ITSELF, and this test later calls `remove_dir_all` on that path — so
-                        // a state file missing `vm_id` would delete every VM's disks on the
-                        // machine, including those of tests running concurrently in CI. A
+                        // NEVER default this. `vm_runtime_dir("")` is a bucket of
+                        // `<data_dir>/vm-disks` ITSELF, and this test later calls
+                        // `remove_dir_all` on that path — so a state file missing `vm_id`
+                        // would delete every disk in that bucket on the machine, including those of tests running concurrently in CI. A
                         // missing id means the state file is not what we think it is; fail
                         // loudly instead of computing a path that is catastrophic when wrong.
                         let vm_id = v
@@ -2408,8 +2404,8 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
                             .to_string();
                         let dir = fcvm::paths::vm_runtime_dir(&vm_id);
                         anyhow::ensure!(
-                            dir.starts_with(fcvm::paths::data_dir().join("vm-disks"))
-                                && dir != fcvm::paths::data_dir().join("vm-disks"),
+                            dir.parent().and_then(|bucket| bucket.parent())
+                                == Some(fcvm::paths::vm_disks_dir().as_path()),
                             "refusing to treat {} as a per-VM runtime directory",
                             dir.display()
                         );
@@ -2424,7 +2420,10 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         // The BASELINE's pair, captured now so the fixture's own teardown can be
         // held to the same standard. It is torn down gracefully, so fcvm's
         // `cleanup_vm` runs and BOTH of these must be GONE afterwards.
-        let base_artifacts = artifacts_for(base_pid)?;
+        // Required, and asserted after the teardown below with the other verdicts: an
+        // early return here would skip the baseline's and the serve's shutdown.
+        let base_artifacts = artifacts_for(base_pid)
+            .and_then(|found| found.context("no state file recorded for the baseline"));
 
         // THE FAST TEARDOWN: one signal to fcvm. Nothing else is signalled by us.
         send_signal(clone_pid, "KILL").context("SIGKILL to clone fcvm")?;
@@ -2519,8 +2518,9 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
 
         let base_leak = base_artifacts
             .as_ref()
+            .ok()
             .map(|(s, d)| (s.exists(), d.is_dir()));
-        if let Some((s, d)) = &base_artifacts {
+        if let Ok((s, d)) = &base_artifacts {
             std::fs::remove_file(s).ok();
             std::fs::remove_dir_all(d).ok();
         }
@@ -2607,7 +2607,11 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         // its artifacts must be gone. With the old `Child::kill()` teardown they
         // both survived — by this test's own state_survived/data_survived logic —
         // and every run leaked a state file plus a multi-GB reflinked rootfs.
-        if let (Some((s, d)), Some((s_left, d_left))) = (&base_artifacts, base_leak) {
+        {
+            let (s, d) = base_artifacts
+                .as_ref()
+                .unwrap_or_else(|error| panic!("the baseline's artifacts: {error:#}"));
+            let (s_left, d_left) = base_leak.expect("measured whenever the artifacts were found");
             assert!(
                 !s_left && !d_left,
                 "the BASELINE VM's teardown leaked: state_file_left={} ({}) \
@@ -2657,30 +2661,33 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
     })
 }
 
-/// `vm_runtime_dir("")` is the shared `vm-disks` directory, not a per-VM one.
+/// `vm_runtime_dir("")` is a shared bucket of `vm-disks`, not a per-VM directory.
 ///
 /// A test that derives a runtime directory from a state file and then `remove_dir_all`s it
-/// must never accept an empty id: doing so deletes EVERY VM's disks on the machine,
+/// must never accept an empty id: doing so deletes every VM's disks in that bucket,
 /// including those of tests running concurrently in CI. This pins the arithmetic so the
 /// guard above cannot be simplified away by someone who has not thought about it.
 #[test]
-fn an_empty_vm_id_resolves_to_the_shared_disk_root_and_must_be_rejected() {
-    let shared = fcvm::paths::data_dir().join("vm-disks");
+fn an_empty_vm_id_resolves_to_a_shared_bucket_and_must_be_rejected() {
+    let shared = fcvm::paths::vm_disks_dir();
+    let bucket = shared.join(fcvm::paths::vm_bucket(""));
 
     assert_eq!(
         fcvm::paths::vm_runtime_dir(""),
-        shared,
-        "an empty vm_id collapses to the SHARED vm-disks root. Any caller that deletes its \
-         computed runtime directory would wipe every VM on the host — which is why the \
-         lookup rejects an empty id rather than defaulting it."
+        bucket,
+        "an empty vm_id collapses to a SHARED bucket of vm-disks, not a VM directory. Any \
+         caller that deletes its computed runtime directory would wipe every VM in that \
+         bucket, which is why the lookup rejects an empty id rather than defaulting it."
     );
+    assert_eq!(bucket.parent(), Some(shared.as_path()));
+    let dir = fcvm::paths::vm_runtime_dir("vm-abc123");
     assert_ne!(
-        fcvm::paths::vm_runtime_dir("vm-abc123"),
-        shared,
-        "a real vm_id must resolve BELOW the shared root, never to it"
+        dir, bucket,
+        "a real vm_id must resolve BELOW its bucket, never to the shared bucket"
     );
-    assert!(
-        fcvm::paths::vm_runtime_dir("vm-abc123").starts_with(&shared),
-        "a per-VM directory must still live under the shared root"
+    assert_eq!(
+        dir.parent().and_then(|b| b.parent()),
+        Some(shared.as_path()),
+        "a per-VM directory lives one bucket below the shared root"
     );
 }

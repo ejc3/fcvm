@@ -237,9 +237,19 @@ namespace, and each acts on the agent's own. That is where every listener of
 the workload is: the container runs with `--network=host`. A namespace a
 privileged workload makes for itself is outside all three, as it was outside
 the gate before (its traffic is forwarded, and the gate hooks INPUT and
-OUTPUT). A snapshot of a clone cannot capture the 0: the prepare takes the
-boundary lock, which the restore holds until publication, and a clone whose
-restore or publication failed keeps the 0 and is powered off by the agent.
+OUTPUT). What keeps the 0 out of a snapshot of a clone is two intervals, not
+one. From the restore's dispatch to its publication the guest refuses a
+snapshot's prepare (`restore-under-way`, below). The boundary lock is taken
+later: the restore does its early work first (the exec re-register request, the
+neighbour pin, the `restore.pre_boundary` failpoint) and holds the lock from
+`restore_snapshot_network` to publication, so the lock does not cover the
+pre-boundary work and the mark does. A restore that fails keeps the 0, drops
+the lock and leaves the mark, so the prepare stays refused until the agent's
+power-off lands. The guest cannot refuse a prepare that returned before the
+dispatch. `fcvm` sends none: a restore is dispatched only into a VM that was
+just loaded from an image, and `snapshot create` refuses such a VM, under the
+per-VM snapshot lock, until its restore is acknowledged (#2151). A one-shot run
+by hand in that VM before the dispatch is not covered.
 
 A socket the clone opens after that list is in neither list and is never
 retired, whatever tuple it reuses. `ModelDiag` fails if a socket made after the
@@ -248,6 +258,166 @@ list is retired, or if the list is taken while cookies are still accepted;
 `a_syn_cookie_handshake_does_not_reach_a_restored_clone` and
 `a_loopback_ports_client_connection_does_not_outlive_a_restore`
 (`tests/test_snapshot_gate_tcp.rs`) hold these in a routed VM.
+
+### A closed gate is somebody's: a source's boundary is owed until its host's resume opens it
+
+**A source's gate is closed only while a snapshot create is in flight on the host. Every
+exit from that opens it, or leaves the source running, gated and reported failed.** The
+prepare closes the gate and freezes the container;
+the resume one-shot undoes both. Three things used to break that, each a way to leave a
+source refusing new TCP for good or a clone open before its restore (#2142, #2140, #2138,
+and the model's F2):
+
+- a resume whose gate removal failed removed the manifest and thawed the container
+  anyway, and nothing tried again;
+- an fc-agent that died between the prepare and the resume took the exec server with it,
+  so no resume could run, and on Firecracker its successor waited for ever for a boot
+  plan that comes through the closed egress half;
+- the one-shots and the freeze watchdog acted on a restoring clone as on a source.
+
+**A `/loopback` port's client is outside the guest whatever the list holds**
+(#2152). The rewrite gives it a source port of a reserved range
+(`network::LOOPBACK_CLIENT_PORTS`, 61000 to 65535, above the guest's ephemeral
+ports), and the agent records which guest ports are published with `/loopback`
+(`/run/fcvm/loopback-client-ports`). The socket at 127.0.0.1 and one of those
+ports whose peer is 127.0.0.1 at a port of the range never stays. With the
+client's own port kept, a client from source port P to guest port P was its own
+mirror image. Both halves are needed: by the peer's port alone, a connection
+inside the guest to a service that listens in 61000 to 65535 would be reset at
+every restore.
+
+**The guest never opens an owed gate by itself.** A clone whose restore has not been
+dispatched is, byte for byte, its source after the resume, so a rule in the guest that
+opens a source's gate also opens that clone's. Only the host knows which a guest is, and
+it says "a source, and its snapshot is over" by running `--resume-snapshot-network`. The
+guest's part is that the request can always be served and that a served request either
+opens the gate or leaves the boundary owed.
+
+Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
+`fc-agent/src/snapshot_network.rs`); they are in guest memory, so in the image:
+
+| mark | written | removed | while it is there |
+|---|---|---|---|
+| `snapshot-boundary-owed` | by the prepare, under the boundary lock, before the freeze and the gate | by the resume that opened the gate; by a restore when it is dispatched | a resume that fails leaves it, the manifest and the freeze; an fc-agent that starts and finds it opens exec at once, for the resume one-shot alone (`exec::serve_only_the_boundary_resume`) |
+| `restore-under-way` | when a restore's epoch is dispatched, before anything else of the restore | at publication, before the acknowledgement | both one-shots refuse with exit 3, before they wait for the boundary lock, and change nothing; the freeze watchdog does not count its looks |
+
+- **The host asks until the gate is open** (`reopen_source_network`,
+  `src/commands/common.rs`): for 150 s in all, 2 s between tries, every try cut off at
+  what is left (the exec's connect is tried for about 54 s, and the one-shot's run is
+  limited too). The create holds the per-VM snapshot lock and the global permit for that
+  long. An agent that died is back about a second later (`RestartSec=1`), so the first
+  ask usually lands; the bound also covers systemd's 90 s stop timeout. A guest that
+  refuses with exit 3 is not asked again.
+- **A source still gated then is left running and reported failed.** The host does not
+  end it: the connections it has go on working behind the gate. (A source whose agent
+  died is another matter today: see #2158 below.) The create fails with
+  `source VM <id> is LEFT WITH ITS NETWORK GATE CLOSED`. The VM's state records
+  `network_gate_closed` before the first ask, so a create interrupted while it asks, in
+  its first try as in any later one, leaves the record, and the try that opens the gate
+  clears it. A reopen that needs one try leaves the state as it found it. The next
+  `snapshot create` of that VM asks once more, as its first step, and is refused while
+  the gate stays closed (`refuse_a_source_left_gated`).
+- **An agent that starts in the middle of a boundary serves exec first and starts no
+  container.** It opens exec before its boot plan, for the resume alone, and holds the
+  container's start (`hold_the_container_start_through_a_boundary`) while a restore is
+  under way, or while the `owed` mark is there and the gate is installed. The mark alone
+  does not hold: it can outlive its gate. On Cloud Hypervisor the plan comes over vsock,
+  outside the gate, and the restarted agent used to go on to its container start while
+  the prepare believed the guest frozen.
+- **The agent's death still ends the VM** (#2158). systemd kills the container with the
+  agent, the next agent's `podman start` of it fails with 125, and the VM powers off
+  about a second after its boot plan arrives, with or without a snapshot in sight. On
+  Cloud Hypervisor the plan comes at once, so the same happens when the hold on the
+  container's start ends. For a death in the middle of a boundary this section buys a
+  gate that is reopened and no source left running behind a closed gate. It does not
+  keep the source; #2158 is to change that.
+- **A create whose source's agent died in the boundary fails and discards its image.**
+  The agent that starts with the boundary owed writes that into the `owed` mark
+  (`note_the_agent_restarted_in_a_boundary`), the resume reports it on its stderr, and
+  the host fails the create on the report once the gate is open
+  (`resume_paused_source`). An agent that died between the prepare's reply and the pause
+  is in the image, dead or starting, with the container systemd killed; on Firecracker a
+  clone of that image would wait for a boot plan behind its closed gate until the host
+  ended it, and the image can be a cached startup snapshot. The host cannot tell that
+  death from one after the pause, so both fail.
+- **The hold gives up after 300 looks, one a second, that find the gate closed and
+  nobody at work on the boundary, and the agent then goes on to its container start
+  behind the closed gate.** A look that finds someone holding the boundary lock is not
+  counted and starts the count again, so a count begun under one create cannot run out
+  inside a later one's boundary; at most 900 looks go uncounted, as for the watchdog, so
+  a one-shot hung under the lock cannot hold the start for good. 300 looks is twice the
+  host's 150 s, so no create is in flight any more: it has
+  failed and recorded the source gated, or its host is gone, and nothing believes the
+  guest frozen. A create that comes later freezes the container like any running one.
+  The freeze watchdog thaws a frozen container in the same state for the same reason.
+- **The watchdog's deadline is for a boundary nobody is working on.** A look while the
+  boundary lock is held or a restore is under way is not counted
+  (`snapshot_network::boundary_in_progress`), so a restore or a prepare that takes over a
+  minute keeps its container frozen. While a source's boundary is owed and its gate is
+  still installed (`snapshot_network::source_gate_is_owed`; asked before the freeze lock
+  is taken, each listing given two seconds for the xtables lock and killed after five),
+  150 more looks are not counted (`payload_freeze::SOURCE_REOPEN_LOOKS`, the host's whole
+  bound on asking for the resume): nobody holds the lock between two of the host's tries, and those looks
+  used to count, so the thaw could land with the create still in flight. Looks, not the
+  mark's age: the guest takes none while its VM is paused. A source whose host died, or
+  whose gate cannot be opened, is still thawed, 60 counted looks after those. At most 900 looks at one freeze go
+  uncounted (15 minutes, the host's bound on a restore's acknowledgement), so a one-shot
+  hung under the lock cannot keep a container frozen for good. A lock that cannot be
+  opened is not "held".
+- **A resume acts only on the boundary it was sent for** (#2159). A resume the host gave
+  up on can still be delivered later: its exec runs on a blocking thread that goes on
+  connecting after the try is cut off, and a delivered one-shot can wait in the guest for
+  the boundary lock. Landing between a later create's prepare and its pause, it would open
+  the gate and the pause would save an image with the gate open and no manifest. So every
+  create's boundary has a token: `run_snapshot_network_command` writes it on the VM's
+  state (`boundary_token`) and sends it to the prepare, which puts it into the `owed`
+  mark; every resume reads it from the state at each try (`resume_args`) and sends it;
+  the guest runs a resume only when its token is the mark's
+  (`BoundaryMarks::resume_is_for_the_owed_boundary`), and refuses any other with exit 5.
+  Exit 3 is the restore's refusal alone. On 5 the host asks no more, keeps the record and
+  the token, and reports the source as possibly left gated (`ReopenFailure::Stale`): the
+  refusal says nothing of the gate, which can be this source's own and closed (a prepare
+  that failed before it wrote its mark, over the mark of a create whose host died). The
+  state keeps the token while the gate is recorded closed, for the later create's one
+  ask, and loses it when the gate is reported open. A state that is there and cannot be
+  read is a failed try, and one that cannot be written fails the create before its
+  prepare is sent (`PrepareNotSent`), with no reopen asked of a guest that was sent
+  nothing: neither is "no token". The token orders resumes. It is not a secret:
+  the one-shot runs as root in the guest, and whatever can run it can read the mark.
+  Both failures begin with the command to run by hand (`with_the_resume_by_hand`): the
+  resume with the state's token, or, when the guest refused that as stale, the resume
+  with the mark's token, which the refusal itself reports on its stderr
+  (`owed-boundary-token=`). An operator cannot read the mark with `cat` from a guest whose
+  restarted agent serves the resume alone. The mark is written whole or not at all:
+  staged under a name of the writer's own, renamed over, the staged file removed when
+  either fails. The restarted agent's note is a read and a write of the mark, so it takes
+  the boundary lock (`note_agent_restart_under_the_lock`) and looks at the mark again
+  under it; with the default kill mode no one-shot of the dead agent is alive to hold
+  that lock, and with `KillMode=process` (#2158) one can be, for which the note waits up
+  to ten seconds. A resume that opens the gate
+  and cannot remove the manifest or the mark after three tries exits 4, which the host
+  reads as an open gate (`reopen_try_of`), and still does what follows an open gate (the
+  output reconnect). The resume's second look for a restore, right before it touches the
+  gate, narrows the window in which the two meet and does not close it; no path of fcvm
+  sends a resume to a VM whose restore it has yet to dispatch. A clone inherits its
+  source's mark, token included, until its restore is dispatched and clears it; no path
+  sends a clone its source's token, and a create of the clone carries its own.
+- **`rcu_expedited` is put back after a kill** (#2141). The barrier records the switch's
+  value in `/run/fcvm/rcu-expedited-before` before it turns it on; the next barrier, the
+  next resume and the next start of the agent put it back from the record. The resume
+  does it before it tries the gate and whatever comes of that, so a reopen that never
+  lands does not leave the switch on for the next snapshot to capture. The undo writes
+  the recorded 0 even if someone set the switch to 1 on purpose meanwhile, and a guest
+  whose host died keeps the 1 until its agent restarts or its next snapshot.
+- Not covered: the host's `snapshot create` dying as well (#1936, #1941), and a stray
+  one-shot on a clone before its restore is dispatched, which only the host can refuse
+  (#2138's host half).
+
+`a_sources_gate_is_reopened_after_its_agent_dies_between_the_prepare_and_the_resume` and
+`a_restoring_clone_refuses_a_prepare_and_stays_frozen_past_the_watchdogs_deadline`
+(`tests/test_snapshot_gate_tcp.rs`) hold these in a VM. The first reads the host's logs
+only (the one-shot's report, and the new agent's boot plan arriving through the egress
+half): the guest is gone too soon after the restart to be asked anything.
 
 ### On restore, the gate's egress half opens before the stale sockets are retired
 
@@ -259,9 +429,12 @@ system configs. With the restore hook inside that window (4 to 35 s, where the
 window had been about 0.1 s) a www clone served 500s for as long as it lived
 (2026-10-14, `Sitevar FBLOGGER_CONFIG could not be loaded from Configerator` on
 every request, with a no-op hook as well as the real one). So the OUTPUT half
-of the gate is removed as soon as the receive barrier has drained, before the
-first socket is retired (a socket opened from then on is not in the manifest,
-so the cookie-bound retirement never touches it), the restore remounts NFS and
+of the gate is removed before the first socket is retired. Three steps come
+between the receive barrier and that: a routed clone's move to its own IPv6
+address, the load of the manifest, and the restore's own list of the guest's
+sockets. A socket opened after that list is in neither list, so the
+cookie-bound retirement never touches it; one opened before it with no mirror
+image in the list is retired as unlisted. Then the restore remounts NFS and
 waits for the exec server and the egress proxy, the hook runs last, and the
 INPUT half is removed after it: publication. `ModelDiag` fails if a socket is
 retired with egress closed, `ModelHook` if the hook runs with egress closed or
@@ -359,6 +532,71 @@ on the present, and the `default` profile keeps the clock running through a paus
 `test_source_clock_matches_the_host_after_snapshot_create` measures it;
 `every_reopen_after_a_pause_sets_the_sources_clock` pins the host side.
 
+### A clone is snapshotted only after its restore is acknowledged
+
+A restored clone resumes behind the gate, with its container frozen and the source's
+sockets in it, and its guest opens ingress only after it has retired those sockets and run
+the restore hook. The snapshot one-shots do not know whose gate they are handling. Run in a
+clone that has not got there, `--resume-snapshot-network` (or the reopen after a failed
+prepare) removes both halves of the gate and the manifest and thaws the container, and the
+prepare freezes a container a restore hook is running in. On main at 1df89a80e a `snapshot
+create` of a clone held before the boundary exited 0 in 0.2 s; after it a client outside got
+HTTP 200 from a clone `snapshot run` had not reported, with the source's connection still
+established in it, and the clone's restore then failed on the missing manifest (#2138).
+
+So `fcvm snapshot create` refuses a VM whose state says it was restored (`process_type:
+clone`) and not acknowledged (`restore_acknowledged` absent), before anything reaches its
+guest or its VMM (`ensure_restore_acknowledged`, `src/commands/common.rs`). `snapshot run`
+writes `restore_acknowledged` under the state lock when it has the guest's acknowledgement
+and BEFORE it prints the restored record, so the rule for a caller is: the record is
+printed, a create is taken. It is never written for a restore that failed (the state then
+says `failed`) or for `podman prepare`'s disposable VM. The check keys on the
+acknowledgement and not on `lifecycle_ready`, which is written later, after the output
+handshake and the port check: keyed on that, a create issued when the record appeared was
+refused. `lifecycle_ready` still admits a state from before the field existed.
+
+Acknowledged is not yet published. The owner still has its output handshake and its port
+check to do, and a snapshot pauses the guest: a pause longer than the port check's 5 s
+fails the check, and the owner then tears down the VM being saved. So the owner takes the
+per-VM snapshot lock before it records the acknowledgement and holds it until it has
+published `lifecycle_ready` or recorded the failure, and a create asked for at the record
+is taken and WAITS on that lock, then reads the state again. A clone whose state says
+`failed` is refused, acknowledged or not. The lock is an open file of the owner, so every
+exit gives it back. Lock order: snapshot generation locks, then the per-VM snapshot lock,
+then the state lock inside each state write; the owner holds no generation lock while it
+holds the per-VM one. The owner's output handshake has no bound of its own, so the create
+gives up after `RESTORE_PUBLICATION_LIMIT` (60 s; the stretch measured 7 ms) with an error
+that names what it waited for.
+
+The refusal itself needs no lock against the restore. `StateManager` never writes
+`restore_acknowledged` back to false for the same process (a save of a stale copy and an
+update both keep it), and every restore has a VM id of its own, so a state that reads
+acknowledged stays so; the create reads it under the per-VM snapshot lock after it has tied
+the state to the process it snapshots. `--stop` refuses before it arms the guard that
+stops the VM, so a refused clone is left running. A caller that learns a clone is up from
+the clone's own ports (the potato ring, a Minecraft fork) is a few milliseconds ahead of
+the record and passes `--await-restore SECONDS`, which waits on the state file's change
+and ends early when the restore fails. The owner's own snapshots (a startup snapshot,
+`podman prepare`) run in its task after it has given the lock back and are not checked.
+
+This covers `snapshot create`. `fcvm exec` can run the guest's one-shots directly, and the
+guest's own refusal of them during a restore is #2154.
+
+`a_snapshot_of_a_clone_is_refused_until_its_restore_is_acknowledged`
+(`tests/test_snapshot_clone.rs`) holds a clone at `restore.pre_gate_verify`, in its restore
+hook and after a failed restore, and requires the refusal and an unchanged guest each time;
+it also holds a clone's owner between its restored record and its port check and requires a
+create issued at the record to wait for the publication. The state in which main
+opened the gate is one step before that hold, with the boundary lock free, and fc-agent has
+no failpoint there; the test file says what holding it takes.
+`a_snapshot_is_refused_until_the_restore_is_acknowledged`,
+`snapshot_create_refuses_an_unacknowledged_restore_before_it_reaches_the_vm`,
+`the_acknowledgement_is_recorded_before_the_restored_record_is_printed`,
+`the_owner_holds_the_snapshot_lock_from_the_acknowledgement_to_publication`,
+`a_create_waits_for_the_owners_publication_and_no_longer_than_its_limit` and
+`an_acknowledged_restore_is_never_taken_back_by_a_later_write` pin the decision, where it
+sits and what it rests on.
+
 ## A FLEET MODE IS UP ONLY WHEN A VIEWER GETS ITS PIXELS
 
 A fleet mode (wall, phones, Windows, Minecraft, potato) counts as working only when the
@@ -379,6 +617,47 @@ evidence. Never report a mode "up", "deployed" or "working" on anything less.
   every tile was black. The security group dropped their IPv4 ports, Windows over IPv6 never
   answered the TLS handshake, and Minecraft published no IPv4 path. The deploy smoke checked
   only the wall's renderers, over IPv4, on ports it hardcoded.
+
+## A START LISTS NO DIRECTORY THAT GROWS WITH THE VMS ALIVE
+
+Six times a start listed a directory that holds an entry for every VM alive, under a lock
+every other start's create in that directory needs: the state directory under the name
+lock, the reclaim owner records, `vm-disks` for a mount view nothing used, the parent
+cgroup of the per-VM scopes (#2178), `/run/netns`, which `ip link show` lists in a bridged
+clone's start (#2194), and the routed IPv6 address leases (#2202). The first four each
+bound the start rate; the last two were found by the test below before anything hit them.
+
+**Rules:**
+
+1. **A start reads what it needs by name.** It never lists a directory that gains an entry
+   per VM, on any filesystem: the store, cgroupfs, the runtime directory, `/proc`.
+2. **Work that has to visit every VM is a sweep**, and every sweep goes through
+   `src/sweep.rs`: once an interval behind a stamp, by the one start that has the turn,
+   never once a start. A table whose entries are made in two steps is held shared by
+   starts and exclusively by the sweep (`sweep::table`). A new sweep is a `Sweep` constant
+   there, listed in `sweep::ALL`, with a caller that runs the matrix
+   (`sweep::testing::caller_matrix!`): do not write another stamp or another lock by hand.
+3. **A new instance is not waived.** One in a directory the test's own starts own (its data
+   directory, its scopes' parent cgroup) goes into `allowances` in the test below with its
+   issue number, and the test fails that entry as soon as its directory stops growing, so
+   the entry leaves with the fix. One in a host-wide directory (`/run/netns`, `/proc`)
+   cannot be allowed, because other tests' VMs change its entries: it is fixed first
+   (#2194 was, found by this test).
+
+**Enforcement:** `tests/test_start_dir_reads.rs` names no directory. It starts a clone under
+`strace -f -y` beside one clone and beside six, sums the entries each `getdents64` returned
+per directory, and fails a directory from which the second start read at least one entry
+more for each clone added. `a_start_lists_no_directory_that_grows_with_the_vms_alive_rootless`,
+`_bridged`, `_routed` and `_unprivileged` are the starts, all traced by root in `make test-root`: an
+unprivileged strace takes the setuid bit from `newuidmap`, so a rootless start traced by its
+own user writes the single-id map, and the test fails a traced start whose id map differs
+from an untraced one's. The test holds off the sweeps it knows by name
+(`FCVM_SWEEP_EVERY_MS`) and sets `*=0`, so a sweep added later runs in every start there
+and fails it until it is named. The `detector` tests in the same file prove that the tracer
+reports a known listing and that the comparison fails on one. The tests need `strace` and
+fail without it. It does not see a directory that gains less than one entry per VM (a hash
+bucket), processes the start did not create (`netpool serve`, `snapshot serve`), or per-VM
+work that is not a listing.
 
 ## MAXIMUM REUSE / CACHEABILITY
 
@@ -943,10 +1222,16 @@ cannot. The top PR's run tests every layer: its `changes` job classifies the who
 `main`, not only the top PR's files, so a docs-only top cannot skip the matrix for code changed
 lower down.
 
-When the top's `Summary` passes, the `Stack coverage` job posts a **`Stack CI`** success status
-on each lower PR's head, naming the run, but only on heads that are ancestors of the tested
-head (`scripts/ci-stack-coverage.sh`). A lower PR is tested when it carries `Summary` success or
-`Stack CI` success on its current head; `Summary (deferred)` alone means nothing ran for it.
+Every pull request run states what it showed as a **`ci/pool`** commit status (the `Pool status`
+job, `scripts/ci-pool/ci_pool.py mark`). A run that tested nothing puts `pending` on its head. A
+run that passed puts `success`, naming the run, on its head and on each lower PR's head that is
+an ancestor of the tested head. A run that failed puts `failure` on its own head only. A PR is
+tested when its current head carries `ci/pool` success; `Summary (deferred)` alone means nothing
+ran for it, and its `ci/pool` status then reads `pending`.
+
+When the top is red, `python3 scripts/ci-pool/ci_pool.py bisect --of <PR>` reads the runs on every
+layer's head and prints the next step (run the failed jobs again once, run the failing lanes on a
+lower layer, or the first failing prefix); `--go` takes it. See `docs/ci-pool.md`.
 
 A lower PR defers only to a child whose head already contains its new head. Push every
 updated layer of a stack in one command (`git push origin layer-1 layer-2 layer-3`): a lower
@@ -954,8 +1239,15 @@ layer pushed on its own starts its run before its child holds the new commit, an
 tests in full.
 
 To bisect a failure on the top, run one layer on its own:
-`gh workflow run ci.yml --ref <layer-branch>` (a dispatch run tests the full matrix). Also run it
+`gh workflow run ci.yml --ref <layer-branch>` (a dispatch run tests the full matrix), or only the
+lanes that failed: `-f lanes='Host-arm64 Container-arm64'`, by exact job name (a name that is not
+a lane fails the run's `Skip Check` job). Also run it
 when the top PR is closed and a lower PR becomes the top, since nothing re-triggers its CI.
+
+Which self-hosted lanes a run takes, and which lanes a push to `main` may skip because an
+earlier run proved them for the same tree, is decided by `scripts/ci-pool/ci_pool.py plan`
+(`docs/ci-pool.md`, "What main runs after a landing"). A landing that changes the workflow, the
+Makefile or a script runs every lane on `main`.
 
 Enforcement: `scripts/test-ci-stack-scope.py` (`make test-ci-scope`, run by the `actionlint`
 job) drives both scripts against a fake `gh` and evaluates every job's `if:` for a deferred run.
@@ -1023,11 +1315,13 @@ grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf || echo use
 #    /mnt/fcvm-btrfs when /tmp is on the root disk. iperf3 and nfs-kernel-server
 #    are the nested tests': the network ones start an iperf3 server on the host,
 #    the NFS ones export through the host's NFS server, and without them both
-#    fail in under 2 s with "No such file or directory".
+#    fail in under 2 s with "No such file or directory". strace is
+#    tests/test_start_dir_reads.rs's: it reads a start's directory listings from
+#    strace's log, and its tests fail without it.
 sudo apt-get install -y build-essential git jq qemu-utils busybox-static \
     pkg-config libssl-dev clang make podman skopeo uidmap slirp4netns fuse3 passt \
     btrfs-progs bc bison flex libelf-dev libseccomp-dev \
-    debhelper libdw-dev rsync kmod cpio patch iperf3 nfs-kernel-server
+    debhelper libdw-dev rsync kmod cpio patch iperf3 nfs-kernel-server strace
 
 # 3. Fast local storage. Instance-store NVMe is WIPED by a cloud stop/start —
 #    put /mnt/fcvm-btrfs on it (rebuildable cache), keep sources on the durable
@@ -1067,8 +1361,17 @@ git clone https://github.com/ejc3/fuser.git
 
 # 7. Build + full setup (downloads released kernels, builds pasta + the
 #    firecracker fork, creates the rootfs; ~10 min on 64 cores when the kernel
-#    releases exist, plus a local kernel build when one does not)
+#    releases exist, plus a local kernel build when one does not). Setup also
+#    builds the static libseccomp pinned in [libseccomp] for the Firecracker
+#    build to link, into the assets directory; nothing is installed on the host.
 cd ~/src/fcvm && make build && make setup-fcvm
+
+# 8. VM states on tmpfs. Without this step a user's VM states are kept in the data
+#    directory, which works and is slower. Makes /run/fcvm-<uid> and
+#    /etc/tmpfiles.d/fcvm-<uid>.conf, which makes it at every boot (remove that file to
+#    undo). Takes effect for a data directory at its first start after the next boot, or
+#    at once on a box that has started no VM yet.
+sudo ./target/release/fcvm setup --runtime-dir
 ```
 
 Run everything as the unprivileged user; `make` shells out to sudo exactly where
@@ -1438,9 +1741,39 @@ make test-root FILTER=kvm
 
 **Solution**: Use kernel's ID register override mechanism with `arm64.nv2` boot parameter.
 
-1. Added `arm64.nv2` alias for `id_aa64mmfr4.nv_frac=2` (NV2_ONLY)
+1. Added `arm64.nv2` alias for `id_aa64mmfr4.nv_frac=1` (NV2_ONLY)
 2. Changed `FTR_LOWER_SAFE` to `FTR_HIGHER_SAFE` for MMFR4 to allow upward overrides
-3. Kernel patch: `kernel/patches/mmfr4-override.patch`
+3. Kernel patch: `kernel/patches-arm64/mmfr4-override.vm.patch` (guest kernels only)
+
+**The value is 1, and 2 is a different feature.** ID_AA64MMFR4_EL1.NV_frac is 0 NV_NV2,
+1 NV2_ONLY, 2 NV2P1, 3 NV3 (`arch/arm64/tools/sysreg`, Linux 7.3.3). The alias set 2 until
+2026-11-28, which told every nested guest it had FEAT_NV2p1 on CPUs that have not.
+Measured on a c8gd.metal-24xl (#2249), reading CNTVCT_EL0 at EL0 against the kernel's
+`cycle_last` in the vDSO data page:
+
+| nested kernel | host | L1 | L2 | L3 |
+|---|---|---|---|---|
+| NV_frac = 2 (L1 logs `FEAT_NV2p1`) | +0.4 to +1.6 ms | +5 to +15 ms | -9 to -73 s | not read |
+| NV_frac = 1 | +0.3 to +1.6 ms | +0.8 to +15 ms | +5 to +15 ms | +13 ms |
+
+With 2, the counter L2's user space reads is behind the one its kernel keeps time with by
+L1's counter at L2's creation. The vDSO's difference wraps through the 56-bit clocksource
+mask and overflows, so every vDSO clock in L2 was up to 2^41 ns (2199 s) from the kernel's
+and jumped by multiples of 2^33 ns (8.59 s) whenever NTP moved the multiplier: 38 jumps in
+179 samples. Anything in L2 that waits for an absolute monotonic deadline taken from the
+vDSO waits out that gap (a Python `time.sleep(0.5)` took the test's whole 1140 s), and
+tokio's timers fire at once or not for half an hour: "Firecracker socket not ready after 5
+seconds", and #2246's restore watcher retrying 520 times a second. It needs no counter
+offset from the VMM: a Firecracker that never calls KVM_ARM_SET_COUNTER_OFFSET shows the
+same gap. Which FEAT_NV2p1-conditional path in L1's KVM does it has not been traced
+(candidates in 7.3.3: `timer_set_traps` writing CNTKCTL_EL1 instead of CNTHCTL_EL2, the
+save of a guest hypervisor's CNTHCTL_EL2, the CPACR_EL1 trap).
+
+An override may tell a guest about a feature the hypervisor below emulates, never about
+one it does not.
+`the_nv2_boot_parameter_claims_nv2_only` pins the value, and
+`test_nested_l2_user_space_reads_the_kernels_counter` reads the counters and each level's
+FEAT_NV2p1 detection.
 
 **Why it's safe**: The host KVM *does* provide NV2 emulation - we're just fixing the guest's
 view of this capability. We're not faking a feature, we're correcting a visibility issue.
@@ -1448,7 +1781,7 @@ view of this capability. We're not faking a feature, we're correcting a visibili
 **Verification**:
 ```
 $ dmesg | grep mmfr4
-CPU features: SYS_ID_AA64MMFR4_EL1[23:20]: forced to 2
+CPU features: SYS_ID_AA64MMFR4_EL1[23:20]: forced to 1
 
 $ check_kvm_caps
 KVM_CAP_ARM_EL2 (cap 240) = 1
@@ -1774,18 +2107,18 @@ The ubuntu user has KVM access (`kvm` group), so `fcvm podman run` works without
 # PREFERRED - Rootless mode (no sudo needed, use run_in_background: true)
 ./target/release/fcvm podman run --name test alpine:latest 2>&1 | tee /tmp/vm.log
 # Defaults to --network rootless
-# Get PID from state and use exec:
-ls -t /mnt/fcvm-btrfs/state/*.json | head -1 | xargs cat | jq -r '.pid'
-./target/release/fcvm exec --pid <PID> -- hostname
+# Get the PID of the VM named "test" (jq fails unless exactly one VM has that name):
+PID=$(./target/release/fcvm ls --json | jq -er '[.[] | select(.name == "test")] | if length == 1 then .[0].pid else error("VMs named test: \(length)") end')
+./target/release/fcvm exec --pid "$PID" -- hostname
 
 # ONLY WHEN NEEDED - Bridged mode (requires sudo)
 sudo ./target/release/fcvm podman run --name test --network bridged nginx:alpine 2>&1 | tee /tmp/vm.log
 # Then sleep and check logs:
 sleep 30
 grep healthy /tmp/vm.log
-# Get PID from state and use exec:
-sudo ls -t /mnt/fcvm-btrfs/state/*.json | head -1 | xargs sudo cat | jq -r '.pid'
-sudo ./target/release/fcvm exec --pid <PID> -- curl -s ifconfig.me
+# Get the PID of the VM named "test" (jq fails unless exactly one VM has that name):
+PID=$(sudo ./target/release/fcvm ls --json | jq -er '[.[] | select(.name == "test")] | if length == 1 then .[0].pid else error("VMs named test: \(length)") end')
+sudo ./target/release/fcvm exec --pid "$PID" -- curl -s ifconfig.me
 ```
 
 **Testing egress connectivity:**
@@ -1830,8 +2163,8 @@ sleep 60  # Wait for VM to boot and run commands
 
 **Inspecting namespace state for running VM:**
 ```bash
-# Get holder PID from state file
-HOLDER_PID=$(cat /mnt/fcvm-btrfs/state/*.json | jq -r '.holder_pid')
+# Get the holder PID of the VM named $NAME (jq fails unless exactly one VM has that name)
+HOLDER_PID=$(fcvm ls --json | jq -er --arg name "$NAME" '[.[] | select(.name == $name)] | if length == 1 then .[0].holder_pid else error("VMs named \($name): \(length)") end')
 # Check namespace network config
 sudo nsenter --net=/proc/$HOLDER_PID/ns/net ip addr
 sudo nsenter --net=/proc/$HOLDER_PID/ns/net bridge link  # Show bridge ports
@@ -2434,14 +2767,41 @@ and oomd killed a session scope holding 138 GB, VM included (#1028).
    allocates stays charged to the caller.
 2. **A harness that places fcvm in a cgroup of its own sets `FCVM_CGROUP_PARENT=none`**,
    or a root fcvm moves out of it (`bench/chromium/guardexec.py`, `corpus_mem.py`,
-   `bench.sh`). `--no-swap` is refused there, and for an unprivileged fcvm.
-3. **Scope identity is (pid, start time)**, and sweep and creation run under an `flock`
-   on the parent. Never remove a scope by pid alone. The name is the scope's owner record
+   `bench.sh`). `--no-swap` is refused there, and for an unprivileged fcvm outside a
+   cgroup delegated to its user.
+3. **Scope identity is (pid, start time)**. A start holds the parent's `flock` shared
+   while it makes and enters its scope, and the sweep, which a start runs at most once per
+   5 s and parent (`src/sweep.rs`), removes only under that lock held exclusively. Never
+   remove a scope by pid alone. The name is the scope's owner record
    and the sweep is its reclaim: a `reclaim::Resource` record is per data_dir and per
    user, and a cgroup is per kernel.
 
 `test_each_vm_and_memory_server_has_its_own_cgroup` (`tests/test_vm_cgroup.rs`) pins the
 placement, the charge, `--no-swap` and removal.
+
+### A SWEEP RUNS ONCE AN INTERVAL, AND THERE IS ONE GATE FOR ALL OF THEM
+
+Removing what killed fcvm processes left means visiting every entry of a table: the VM
+states, the owner records, a cgroup parent's scopes, the routed address leases. Each of the
+four once ran in every start under a lock the other starts needed, and each bound the start
+rate (#2077, #2126, #2178, #2202). `src/sweep.rs` is the one mechanism they share.
+
+1. **A start sweeps only when it has the turn** (`sweep::turn_if_due`): no sweep began
+   within the interval, in this boot, and no other process is sweeping. A start without
+   the turn reads one stamp by name. The stamp is `<boot id> <CLOCK_BOOTTIME ns>`, so one
+   kept on a disk never holds off the first sweep of the next boot.
+2. **A table whose entries are made in two steps is held shared by starts and exclusively
+   by the sweep** (`sweep::table`, `sweep::sweep_table`). The sweep asks for the lock only
+   when it found something and waits at most 100 ms; what it found then waits for the
+   next sweep.
+3. **A new sweep is a `Sweep` constant in `sweep.rs`, listed in `sweep::ALL`, with a caller
+   that runs the matrix** (`sweep::testing::caller_matrix!`, and `table_matrix!` for a
+   table). Never write another stamp or another sweep lock by hand:
+   `every_sweep_defined_here_is_listed` fails a sweep that is defined elsewhere or has no
+   matrix caller.
+4. **`FCVM_SWEEP_EVERY_MS` names sweeps** (`state=`, `reclaim=`, `cgroup-scopes=`,
+   `routed-leases=`, and `*` for the rest). A test that must not meet a sweep holds off the
+   ones it knows by name and sets `*=0`, so a sweep added later runs in every start there.
 
 ### Container Build Rules
 
@@ -2639,36 +2999,165 @@ On serve process exit (SIGTERM/SIGINT):
 2. **A periodic sweep, not one per start.** The fast path of a start reads no other VM's
    state, so its cost does not grow with the number of VMs (with every state read on every
    start, a start waited 25 s on the name lock with 800 VMs up, bench/start-rate). Once a
-   minute per state directory (`maybe_sweep`: `sweep.stamp` missing or expired, and
-   `sweep.lock` won), one launch runs `cleanup_stale_state()` after its claim has released
-   `names.lock`; that launch pays for the scan, and no other start waits for it. The sweep
-   removes the states of dead or replaced processes and the index entries that outlive
-   them. Until it runs a stale state holds nothing: its owner is not live.
+   minute per state directory (`maybe_sweep`: the turn of `sweep::STATE`, behind
+   `sweep.stamp` and `sweep.lock`), one launch runs `cleanup_stale_state()` after its claim; that launch
+   pays for the scan, and no other start waits for it. The sweep removes the states of dead
+   or replaced processes, and the PID entries, name tokens and claim directories that
+   outlive them. Until it runs a stale state holds nothing: its owner is not live.
 
-**Indexes** (`src/state/manager.rs`), so a start's fast path does not scan:
-- `name/<sha256 of name>.json` records which VM claimed the name last, written by
-  `claim_name()` under `names.lock`. That VM holds the name while its state exists, names
-  it, and its owner is live. A state written without a claim has no entry and holds no name.
-- `pid/<pid>.<vm_id>` (empty) is written by `save_state()` under the VM's state lock;
-  `load_state_by_pid()` reads the states it names and scans everything only on a miss.
-- Lock order: `names.lock` before a VM's `<vm_id>.json.lock`, never the reverse.
-  `delete_state()` removes both entries; the sweep removes any a crash left.
+**Where** (`src/runtime_dir.rs`). VM states and the namespace pool describe running
+processes and nothing else (a state names an fcvm process by PID and start time, and that
+process dies with the host), so they are not user state a reboot must keep, and they live
+in the runtime directory, apart from what does outlive a reboot: `vm-disks/<vm_id>`, the
+owner records that reclaim it (`reclaim/`), snapshots and their working sets, all in the
+data directory. A start rewrites its state five times, and on btrfs every rewrite is
+directory operations that join a transaction of the store's one tree: with state on the
+store a clone waited 1,667 ms of its 2,212 ms of lock wait on the state buckets'
+directory locks (512 clones at a time, 2026-11-25).
+
+The runtime directory is `<place>/boot-<16 characters of the boot id>`, and `<place>` is
+the first of:
+
+1. `<base>/<key>` when `FCVM_RUNTIME_DIR`, else `paths.runtime_dir`, names a base (`<key>`
+   is 16 hex digits of the SHA-256 of the data directory's canonical path);
+2. `/run/fcvm-<uid of the data directory's owner>/<key>` when that base exists or the
+   caller is root, who makes it for the owner (mode 0700). `sudo fcvm setup` (or `sudo
+   fcvm setup --runtime-dir` alone) makes it and installs
+   `/etc/tmpfiles.d/fcvm-<uid>.conf`, which makes it at every boot; removing that file
+   undoes it;
+3. `<data_dir>/runtime` otherwise: the default for a user with no root step, slower and
+   safe.
+
+- **Never `/dev/shm`, never `$XDG_RUNTIME_DIR`.** logind's `RemoveIPC` deletes a regular
+  user's files in `/dev/shm` when that user's last login session ends, also while a
+  service of that user runs. Measured on Ubuntu 24.04 (systemd 255), for a user without
+  lingering: a file a service of the user held in `/dev/shm` was gone 12 s after one
+  unrelated ssh login of that user ended, with the service still running; the same file
+  in a root-made `/run/fcvm-<uid>` stayed. A user with lingering, a system user and root
+  are exempt. `/run/user/<uid>` did not exist for the service before that login or after
+  it. `scripts/probe-runtime-dir-logout.sh` is that measurement; it needs two user
+  accounts and logind sessions, which no test lane has.
+- **The place is chosen once per boot and the store records it.** The first command of a
+  boot that writes a state chooses, and `<data_dir>/state/runtime` names the directory,
+  the place, a random id and the boot; the directory's `store` file holds the id and the
+  data directory. Every later command follows the store's record (`runtime_dir::locate`)
+  and compares the two (`runtime_dir::bind`), so a base made later in the boot does not
+  move a store whose VMs are running, and two first writers that located different
+  places (root, and a user with no base) end in the one the first recorded. A record of
+  another boot means a reboot: the first writer binds anew. A record of this boot whose
+  directory this process does not see, or that holds no such id, is refused: a container
+  has a `/run` of its own, and starting from an empty one would hand out names that are
+  taken. `make container-test*` therefore names a short base on the store
+  (`CONTAINER_RUNTIME_DIR`): the pool's pasta control sockets sit six levels under it and
+  must fit `sockaddr_un`, which the pool checks when it starts.
+- **The boot is in the path because two of the places can outlive a reboot** (the store,
+  and a base an operator names on a disk). A state from before the reboot names a process
+  of that boot; under another boot's directory nothing reads it, and the first writer
+  after the reboot removes those directories. So a reboot leaves, as it does on main with
+  state on btrfs, disks and owner records without a process, which reclaim collects, and
+  no state that could be taken for a running VM.
+- **Only the path functions know where it is.** A process's own: `paths::bind_runtime_dir`
+  and then `paths::runtime_dir()` / `paths::state_dir()`; before the bind those return
+  where this process would put it, which another first writer can change. Any other data
+  directory, and every test and tool: `runtime_dir::bound_to(data_dir)`; a script:
+  `fcvm ls --runtime-dir`, and `socket` in `fcvm netpool stats`. Nothing else builds a
+  path to a state, a name slot or the pool's socket.
+- **Ownership is checked on every command**: the directories fcvm made on the way to the
+  states must be real directories owned by the store's owner or root that nobody else can
+  write. What root makes there it hands to the owner.
+- **`<data_dir>/state` holds only markers now**: `layout` (`3`), `runtime`, `runtime.lock`.
+  Layouts 1 and 2 kept the states there. A VM of such a build that is still running
+  refuses the store, naming it; what dead ones left is removed by the first writer's bind
+  (layout 1's files under layout 1's `names.lock`), and a build that keeps states there
+  refuses a `layout` of 3.
+- A runtime directory under a base whose data directory no longer exists (tests make data
+  directories under temporary paths) is removed by the state sweep (`remove_orphans`).
+- **Clearing a runtime directory by hand** while the host stays up leaves its store bound
+  to a directory that is gone, and the store's next command refuses: remove
+  `<data_dir>/state/runtime` as well (`make clean-test-data` does both). To move a store
+  from `<data_dir>/runtime` to a base made since, without a reboot: stop its VMs and
+  remove `<data_dir>/runtime` and `<data_dir>/state/runtime`.
+- **Which place a lane runs in.** `make setup-fcvm` runs as the user and makes no base,
+  so the rootless lanes keep their states in `<data_dir>/runtime` and the root lanes
+  (fcvm as root) under `/run/fcvm-0`. Both places are covered by test whatever the host:
+  the unit tests of `src/runtime_dir.rs` bind each, and
+  `root_and_the_stores_owner_each_start_on_a_runtime_directory_the_other_made` runs root
+  and a store's owner through both, in both orders.
+
+**Layout** (`src/state/manager.rs`, layout 2). No directory takes every VM's writes and no
+lock is host-wide: a create or a rename holds its directory's lock exclusively, and with
+every state in one directory under one `names.lock`, clones starting together queued on
+both.
+
+```
+<runtime_dir>/state/                    # paths::state_dir(), in the runtime directory
+├── layout                              # "2"
+├── vms/<b>/vm-abc123.json             # { vm_id, pid, pid_start_time, name, ... }
+├── vms/<b>/vm-abc123.json.lock        # per-VM flock; .json.tmp while a write runs
+├── names/<b>/<sha256 of name>/        # a name slot: a directory with one token in it
+│   └── 5000.12345.vm-abc123            # the holder's <pid>.<start time>.<vm_id>
+├── names/<b>/.claim.<pid>.<start>.<vm_id>/   # a claim being built
+├── pids/<b>/5000.vm-abc123            # PID index entry (empty)
+└── sweep.lock, sweep.stamp
+```
+
+- `<b>` is the first hex digit of the SHA-256 of the key (vm_id, name, PID)
+  (`bucket_of`): the same in every process and build. Sixteen buckets: more would cut
+  the wait between starts further, but every listing opens every bucket, and with 256
+  an `fcvm ls` on an empty store spent more than half its time in 281 `openat` calls.
+- **A name is claimed by renaming a directory onto its slot** (`claim_name()`): the claim
+  directory holds the claimer's token, and the kernel replaces a directory only with one
+  that is absent or empty, so of any number of concurrent claims exactly one rename
+  succeeds, with no lock. A slot in use names its holder in the token's file name. A live
+  holder keeps the name; a dead one's state is deleted and its token unlinked by its own
+  name, then the rename is tried again. `delete_state()` unlinks the VM's token and removes
+  the slot if empty. Every step is conditional in the kernel, so it holds through a
+  fuse-pipe mount, where a flock would not
+  (`test_rename_directory_onto_directory_needs_an_empty_target`).
+- `pids/<b>/<pid>.<vm_id>` is written by `save_state()` under the VM's state lock;
+  `load_state_by_pid()` reads the states its bucket names and scans everything only on a
+  miss.
+- The only flock on the start path is the VM's own `<vm_id>.json.lock`.
+- **On a filesystem with blocks a state is published by exchange, not by a rename over the
+  old one** (`publish_state`): `RENAME_EXCHANGE` of `<vm_id>.json.tmp` with
+  `<vm_id>.json`, then the old state is unlinked. btrfs starts writing a file's data out
+  inside a rename that replaces another file, with the directory locked, and with many
+  clones starting together each such rename slept in the block layer. An exchange starts
+  no I/O. On tmpfs, where the state directory is under `/run/fcvm-<uid>`, there is nothing to write
+  out and the write is the rename alone (`rename_replaces`): two directory operations a
+  write, not three.
+- `list_vms()` opens and reads the buckets and the state files on up to 8 threads.
 - Root and the state directory's owner share one state directory (privileged tests run as
-  root beside unprivileged ones), so `name/` and `pid/` made by root are handed to the
-  state directory's owner before they appear (`index_dir`), and `sweep.stamp` is written
-  like a lock file (0666). Nothing is made world-writable.
+  root beside unprivileged ones), so a directory root makes (`shared_dir`, a claim
+  directory) is handed to the state directory's owner before it appears, and `sweep.stamp`
+  is written like a lock file (0666). Nothing is made world-writable.
+- **A store of layout 1** (`state/<vm_id>.json`, `name/`, `pid/`, `names.lock`) is refused
+  by every command while a VM of it is running: the error lists each one's name and PID,
+  and they are listed and stopped with the fcvm that started them (this build's `fcvm ls`
+  is refused too, so it shows nothing of them). A VM of it that was killed leaves a state
+  file that is not a running VM (its PID is gone, a zombie, or another process's by start
+  time): a reader lists nothing and a launch removes it. The layout check of a command
+  that only reads (`check_layout_for_read`) decides refuse or proceed and writes nothing,
+  so `fcvm ls`, which only lists, needs no write access and removes nothing of an older
+  launch in progress. A lookup by PID that misses still runs the sweep
+  (`load_state_by_pid`), which removes stale states. A launch
+  (`check_layout_for_write`) removes what layout 1 left with no VM running, under layout
+  1's own `names.lock`, held across a second scan and the removal, and writes the marker;
+  the lock file stays, so an older launch and a conversion always exclude each other.
+  The marker's content is read: anything but this layout's number is refused. An older
+  fcvm pointed at a layout 2 store sees no VMs and cannot tell, so do not run two fcvm
+  builds of different layouts on one store.
+- **Liveness is read from the caller's own /proc** (`process_liveness`): a state directory
+  is used from one PID namespace, which holds because each nesting level has its own data
+  directory. Only "no such process" (or a zombie, or another start time) is dead; a /proc
+  read that fails for another reason fails a name claim and removes nothing.
+- **A state file a host crash left empty or cut short** is removed by the sweep when it
+  was written before this boot (`/proc/stat` btime), and warned about once per process
+  otherwise. No state file is synced. The one synced file is the layout marker
+  (`write_layout_marker`), written once per store: an empty marker after a host crash
+  would have every command refuse the store.
 
-**State file layout**: Individual files per VM, keyed by `vm_id` (UUID):
-```
-/mnt/fcvm-btrfs/state/
-├── vm-abc123.json      # { vm_id: "vm-abc123", pid: 5000, pid_start_time: 12345, ... }
-├── vm-def456.json      # { vm_id: "vm-def456", pid: 5001, pid_start_time: 67890, ... }
-├── name/<sha256>.json  # { name, vm_id }: the VM that claimed the name last
-├── pid/5000.vm-abc123  # PID index entry
-└── names.lock          # Global lock for name claims
-```
-
-No master state file - `list_vms()` globs all `.json` files.
+No master state file: `list_vms()` reads every bucket of `vms/`.
 
 ## Architecture
 
@@ -2701,6 +3190,7 @@ tests/
 ├── test_fuse_in_vm_matrix.rs  # In-VM pjdfstest (17 categories, parallel via nextest)
 ├── test_localhost_image.rs    # Local image tests
 ├── test_snapshot_clone.rs     # Snapshot/clone workflow tests
+├── test_start_dir_reads.rs    # A start lists no directory that grows with the VMs alive
 ├── test_egress.rs             # Egress proxy tests (rootless + bridged, fresh + clone)
 ├── test_egress_stress.rs      # Egress proxy IPv4/IPv6 stress tests
 └── test_egress_proxy_bench.rs # 8000-connection concurrent benchmark
@@ -2733,7 +3223,7 @@ fuse-pipe/benches/
 1. **Core Implementation** (2025-11-09)
    - Pluggable `Hypervisor` trait (`src/hypervisor/mod.rs`) selecting the VMM behind the same orchestration, with two backends: **Firecracker (default)** and **Cloud Hypervisor**, chosen via `--hypervisor firecracker|cloud-hypervisor` (#632)
    - Firecracker backend: API client using hyper + hyperlocal (Unix sockets); boot plan via MMDS
-   - Cloud Hypervisor backend: cold boot + container run, snapshot/restore/clone via `--restore` + in-process UFFD; boot plan via vsock (no MMDS)
+   - Cloud Hypervisor backend: cold boot + container run, snapshot/restore/clone via `--restore` with the snapshot's memory file mapped copy-on-write (`memory_restore_mode=copyonwrite`); boot plan via vsock (no MMDS). Built from the upstream commit `[cloud_hypervisor]` pins, with no fork
    - Dual networking modes: bridged (iptables) + rootless (pasta)
    - Storage layer with btrfs CoW disk management
    - VM state persistence
@@ -2837,6 +3327,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 
 **Loopback IP Allocation** (`src/state/manager.rs`):
 - Leased host-wide with an abstract Unix socket (`fcvm-loopback-<address>`), which exactly one process wins and the kernel releases when that process dies, so VMs of other data directories and other users skip it (#1882)
+- The lease writes no state of its own, so a start writes its state five times, not six. A start leases before its name claim (`lease_loopback_ip_for_claim`), and the claim's write, the VM's first state, carries the address: a restore's published port listens on it before the restore writes the state again, and a VM is never listed without the address its ports are on. Until the claim has written the state the lease's guard gives the address back (a refused name, a dropped start); after it `delete_state` does
 - The search starts at an address picked from the vm_id (127.0.0.2 to 127.0.255.254), so it takes no lock and reads no other VM's state
 
 ### btrfs CoW Reflinks
@@ -2846,7 +3337,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 **Architecture:**
 - All data under `/mnt/fcvm-btrfs/` — native btrfs used directly if host is btrfs, otherwise a loopback image is created (size from `paths.btrfs_size` in rootfs-config.toml, default 60G)
 - Base rootfs: `/mnt/fcvm-btrfs/rootfs/layer2-{sha}.raw` (~10GB raw disk with Ubuntu 24.04 + Podman)
-- VM disks: `/mnt/fcvm-btrfs/vm-disks/{vm_id}/disks/rootfs.raw` (sparse, expanded per `--rootfs-size`)
+- VM disks: `/mnt/fcvm-btrfs/vm-disks/{bucket}/{vm_id}/disks/rootfs.raw` (sparse, expanded per `--rootfs-size`)
 - A snapshot keeps its disks (`disk.raw` and the extra disks) in `snapshots/{tag}/disk/`, a btrfs subvolume, and a
   clone's `disks/` directory is one `btrfs subvolume snapshot` of it with the disk renamed to `rootfs.raw`. A reflink
   copy of the disk is O(extents): 9 to 11 s per clone on a 154 GB www root disk with 860,177 extents, 11 of a 25 s
@@ -2867,7 +3358,20 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   reflink, so reflinks of one snapshot run one at a time, 4.6 ms each for an 871-extent disk, about 240 per second
   at any concurrency. With 8 queued the last waits about 8 x 4.6 = 37 ms, under the subvolume median, and the fleet
   relaunches 8 tiles of one snapshot at once, which stay on reflinks; deeper queues take subvolume snapshots, which
-  share no lock. On the disk piece (bench/start-rate/pieces RESULTS.md, c8g.metal-48xl, stock kernel 7.0.0-1013-aws,
+  share no lock. A slot that frees in the middle of a burst is not taken: a
+  clone that takes the subvolume snapshot holds a read lock (`F_OFD_SETLK`) on one byte, drawn at random among 64, of
+  `subvolume-snapshot.lock` beside the slots, for its snapshot and 100 ms after it (`SUBVOLUME_SNAPSHOT_LINGER`: the
+  snapshots that share a commit end together, and the clones that arrive next must still find the burst), and a clone
+  with a free slot takes the subvolume snapshot too while at least 4 of the 64 bytes are held (`SNAPSHOT_BURST`).
+  `subvolume_snapshot_burst` counts the held bytes with `F_OFD_GETLK`, which takes no lock. The kernel answers with
+  the first lock in the way in the order the locks were taken, not the lowest byte, so the count asks both sides of
+  every byte it finds. Clones that drew the same byte count as one: 4 clones hold 4 different bytes in 91 draws of
+  100, and 5 hold at least 4 in 99. A reflink joins a transaction for every
+  extent and waits out each commit that starts meanwhile, and the commits carry what the reflinks dirtied, so the two
+  paths running together slow each other. Fewer held bytes than 4 are a clone or two that found every slot held; the
+  clones after them reflink, as before the mark, which matters where a subvolume snapshot is the slower path (a host
+  writing snapshots at the same time). A burst lasts while about 4 clones arrive per snapshot duration plus 100 ms.
+  On the disk piece (bench/start-rate/pieces RESULTS.md, c8g.metal-48xl, stock kernel 7.0.0-1013-aws,
   none held), clones per second at C=1, 8, 128 and 512 were 286, 237, 1263 to 1689 and 1641 to 1977 with the slots,
   against 286, 236, 235 and 256 for reflinks only and 128 to 140, 561 to 640, 1287 to 1316 and 1779 to 1943 for
   subvolume snapshots only. The C=8 reflink p50 there was 47 ms, not the 37 ms the arithmetic gives. `rm -rf` removes
@@ -2884,6 +3388,16 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   make one) is reflinked as before. An unprivileged user may delete a subvolume only on a filesystem mounted with
   `user_subvol_rm_allowed`; fcvm's own loopback store is mounted with it, and on a btrfs store mounted without it a
   rootless delete falls back to removing the files one by one.
+- Each write into an in-place diff's memory file costs about the same whatever its length (0.2 to 0.4 ms on a
+  file shared with its parent), so the save time follows the number of writes, and a diff of a 128 GiB guest is
+  millions of runs of one or two pages. The Firecracker fork therefore writes clean gaps of up to 4 pages with the
+  runs around them (in a userfaultfd-restored VM every clean page; elsewhere only pages the VM has mapped or, for
+  file-backed memory, pages in the page cache). Measured on the v1.17.0-based pin and not repeated since: one
+  15.7 GB diff of 2,025,511 runs, replayed into a copy of its parent's memory file, took 810 s as written and
+  302 s bridged (839,660 writes, 25.5 GB), and a paused guest compared page by page with the file its diff wrote
+  matched in all 3,608,512 mapped pages. In a userfaultfd-restored VM a bridged page the guest never touched is
+  read through the memory server, so in copy mode it becomes private to the paused VM, and a save inside the
+  clone's recording window adds it to the snapshot's working set, which later clones then replay.
 - A snapshot's memory file is nodatacow (`chattr +C`, `create_memory_file_nodatacow`), so it is stored
   uncompressed even on a store mounted with `compress-force`: btrfs compresses only copy-on-write data. A
   compressed memory file makes every scattered 4 KiB read decompress its whole 128 KiB extent; replaying a
@@ -3613,13 +4127,18 @@ assets_dir (default: /mnt/fcvm-btrfs)
 └── cache/                        # Downloaded cloud images
 
 data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
-├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
-├── state/{vm_id}.json            # VM state files
-├── reclaim/{euid}/{id}.json       # what a live fcvm made on the host; the next launch reclaims a dead one's (src/reclaim.rs)
+├── vm-disks/{bucket}/{vm_id}/disks/  # CoW reflink copies per VM (bucket: first byte of sha256(vm_id), two hex digits)
+├── state/{layout,runtime}        # which runtime directory holds this store's VM states
+├── reclaim/{euid}/<b>/{id}.json   # what a live fcvm made on the host, in buckets; a dead one's is reclaimed by the first launch 1 s or more after the last sweep began, or the next setup, snapshot import or export (src/reclaim.rs)
 ├── pmem/{sha}.img                # --pmem copies, one per image content and owner, read-only
 ├── pmem/{sha}.source             # symlink from an image's path and file identity to its copy
 └── snapshots/{name}/             # Firecracker snapshots
     └── disk/                     # the snapshot's disks, a btrfs subvolume (clones snapshot it)
+
+runtime_dir (/run/fcvm-<uid>/<key of data_dir>/boot-<boot>, or <data_dir>/runtime/boot-<boot>)
+├── store                         # the data directory this serves, and the binding's id
+├── state/vms/<b>/{vm_id}.json    # VM state files, in buckets
+└── netpool/<user>/               # the namespace pool's socket and lock
 ```
 
 ## Key Learnings
