@@ -7,7 +7,7 @@ import { potatoColour } from "../core/potato.ts";
 import { admin, mockState } from "./helpers.ts";
 
 type MockRound = { id: number; size: number; started_at: number; hold_ms: number; pace_ms: number | null; holder: number | null };
-type MockPotato = { size: number; round: MockRound | null; next_round_at: number | null; ladder: { size: number; rounds: number; record_hold_ms: number | null }[] };
+type MockPotato = { size: number; round: MockRound | null; next_round_at: number | null; ladder: { size: number; rounds: number; record_pace: number | null }[] };
 const mockPotato = async () => ((await mockState()).state as unknown as { potato: MockPotato }).potato;
 
 const view = (page: Page) => page.evaluate(() => window.__potato!.view());
@@ -190,7 +190,7 @@ test("a drop: the card names the player and the late stage, the ladder fills in,
   await expect(page.getByTestId("potato-drop-next")).toHaveText(/^Next: a ring of 4 in \d s$/);
   await expect(page.getByTestId("potato-ball")).toHaveAttribute("data-dropped", "true");
   const row2 = page.getByTestId("potato-rung-2");
-  await expect(row2.getByTestId("potato-rung-record")).toHaveText(/^(\d+ ms|no lap completed)$/);
+  await expect(row2.getByTestId("potato-rung-record")).toHaveText(/^(\d+(\.\d+)? catches\/s|no lap completed)$/);
   await expect(row2.getByTestId("potato-rung-broke")).toHaveText(/^player [01] still (asleep|going to sleep|waking) \(\d+ ms\), lap \d+ at \d+ ms$/);
   await expect(page.getByTestId("potato-rung-4")).toHaveAttribute("aria-current", "true");
   await expect(page.getByTestId("potato-record-longest-round")).toContainText(/\d+ catch(es)? a ring of 2/);
